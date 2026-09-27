@@ -1,0 +1,20 @@
+# Сборочные артефакты (~1 ГБ, восстанавливаются через cargo build)
+/target
+/dist
+
+# Личные данные пользователя — НЕ в репозиторий:
+# config.json  — Steam API key, масштаб, позиции окон
+# known_games.json — личный список игр
+# sessions.db — история игровых сессий
+# shortcuts.json — пользовательские шорткаты
+/config.json
+/known_games.json
+/sessions.db
+/sessions.db-journal
+/shortcuts.json
+
+# Готовые сборки и бэкапы (десятки МБ, хранятся отдельно)
+/TraySession.exe
+/Tray_sesstion_setup.exe
+/*.7z
+

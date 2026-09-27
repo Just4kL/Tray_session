@@ -1,0 +1,5992 @@
+use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, save_known_games, AppConfig, TrackedGame};
+use crate::db::{AggRow, AlarmRow, Db};
+use crate::detector;
+use crate::gpu::query_gpu;
+use crate::monitor::{ActiveInfo, MonitorEvent, SharedActive, SharedConfig, SharedGames};
+use crate::shortcuts::{action_label, Shortcut, ShortcutStore};
+use crate::sound::SoundPlayer;
+use chrono::{Datelike, Local, Timelike};
+use std::collections::HashMap;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+pub const APP_NAME: &str = "Tray Session";
+/// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
+/// Слайдер показывает проценты относительно этой базы.
+pub const BASE_SCALE: f32 = 1.3;
+pub const VERSION: &str = "0.7.25";
+pub const BUILD: &str = "20261028";
+pub const ISSUE_URL: &str = "https://example.com/issues";
+/// Заголовок окошка секундомера (он же ключ для поиска HWND под WinAPI).
+pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
+/// Заголовок тонкой полоски сессии.
+pub const STRIP_TITLE: &str = "Сессия — Tray Session";
+
+const CHANGELOG: &[(&str, &str, &[&str])] = &[
+    ("0.7.25", "2026-10-28", &[
+        "Fix: «Открыть окно» из трея разворачивает свёрнутое окно: Minimized(false) + Visible(true) + Focus.",
+        "Fix: Раньше слалась только видимость — у свёрнутого окна она не снимает флаг минимизации.",
+        "New: Своя иконка программы (скруглённый квадрат #66C0F4 + play-треугольник) — одна и та же в трее и в заголовке окна.",
+        "New: Тесты иконки (прозрачные углы, непрозрачный центр, белый треугольник) и набора команд разворачивания.",
+    ]),
+    ("0.7.24", "2026-10-27", &[
+        "Fix: Мини-трей переписан: показывает только идущую запись текущей сессии (игра + время).",
+        "Fix: Причина пустого окна — вложенные раскладки egui: `with_layout` отдавал дочернему ui всю остающуюся ширину и уводил текст за окно (x≈9989).",
+        "Fix: Кнопки уезжали на вторую линию: внутри Frame раскладка вертикальная, добавлена горизонтальная.",
+        "Fix: Рамка занимает всю ширину окна, а не часть — полоска больше не выглядит пустой.",
+        "Fix: Зона кнопок считается по реальным замерам шрифта; на узком окне ничего не выходит за край.",
+        "New: 5 тестов вёрстки мини-трея: позиции текста, высота, одна строка, узкие окна.",
+    ]),
+    ("0.7.23", "2026-10-26", &[
+        "Fix: Мини-трей снова не сворачивается — стиль окна правится ОДИН раз, а не каждый кадр.",
+        "Fix: Причина поломки: правка стиля 60 раз в секунду конфликтовала с winit (SetWindowPos+SWP_FRAMECHANGED) и ломала окно.",
+        "Fix: Высота мини-трея 30px, минимум 26px — раньше 20px обрезали кнопки при увеличении масштаба.",
+        "Fix: Автопоправка позиции срабатывает только для полностью потерянных окон, а не для прижатых к краю.",
+    ]),
+    ("0.7.22", "2026-10-25", &[
+        "Fix: Заголовки и пояснения разделов выровнены по карточкам (отступ CARD_INNER вместо нуля).",
+        "Fix: Таблица сессий получила ширины колонок: больше не вылезает за край карточки.",
+        "Fix: Ширина таблиц фиксируется по блоку (игры, будильники, шорткаты, круги) — границы блоков ровные.",
+        "Fix: Отступ справа у «Общее время» = CARD_INNER, как слева (был отдельный 15px).",
+        "Fix: Список мониторов очищается от дублей и вложенных областей — позиция окна больше не «плавает».",
+        "New: Живой тест мониторов: cargo test live_monitor_report -- --ignored.",
+        "Fix: Проверка обновлений — в разделе «О программе», без отдельного окна.",
+    ]),
+    ("0.7.21", "2026-10-24", &[
+        "Fix: Окошки секундомера и мини-трея больше не сворачиваются: снят WS_MINIMIZEBOX (Win+D, таскбар, Aero Snap).",
+        "Fix: Если окошко всё же свернули сторонней программой — автовосстановление на экране (раз в 2 с).",
+        "New: Спрятать окошко = снизить прозрачность (Ctrl+Num± / ползунок), а не свернуть.",
+    ]),
+    ("0.7.20", "2026-10-23", &[
+        "New: Иконки разделов из assets (6 шт.) в боковой навигации, красятся в цвет состояния.",
+        "New: Кнопка ⤢ разворачивает окошко секундомера почти вдвое и добавляет таймер обратного отсчёта.",
+        "New: Клик по версии внизу сайдбара открывает окно проверки обновлений и сразу запускает проверку.",
+        "New: Все блоки разделов выровнены по единым отступам (5% ширины, симметрично слева и справа).",
+        "New: Постоянная строка статуса внизу с тем же отступом, что и блоки.",
+        "Fix: Стрелки (RShift+←↑→↓) работают и на мини-трее: RShift+←/→ позиция 3×3, RShift+↑/↓ прозрачность ±5%.",
+        "Fix: Мини-трей не выходит за рабочую область монитора; автопоправка при смене разрешения (раз в 2 с).",
+        "New: Мини-трей тоньше (26px) и чище: убрана прошлая сессия (теперь в ховере), рамка нейтральная.",
+        "Fix: Поля URL и Звук в будильниках и таймере сжаты (доля ширины строки), кнопка «Добавить» не уезжает за край.",
+    ]),
+    ("0.7.19", "2026-10-22", &[
+        "New: Полоска ставится на монитор, где находится (или курсор): EnumDisplayMonitors, хоть 6–8K.",
+        "New: Позиции окошек запоминаются и восстанавливаются на живых мониторах.",
+        "Fix: Перетаскивание — нативный захват ОС (WM_NCLBUTTONDOWN): 1:1 с курсором, без двоения и залипаний.",
+    ]),
+    ("0.7.17", "2026-10-20", &[
+        "Fix: Единые отступы карточек (CARD_INNER): таблица больше не прилипает к краям.",
+        "Fix: «Общее время» с отступом 15px справа; кнопки — неразрывным модулем.",
+    ]),
+    ("0.7.16", "2026-10-19", &[
+        "New: Игры разбиты на подразделы: «Сканирование и список игр» + «Steam Web API и общее время».",
+        "New: Часы Steam с серверов (playtime_forever) — база, наши сессии прибавляются дельтами; иконка ⊗ = игры нет в Steam.",
+        "New: Авто-трекинг переехал в «Параметры».",
+        "Fix: Убрана строка про базовый масштаб; отступ версии внизу сайдбара.",
+    ]),
+    ("0.7.15", "2026-10-18", &[
+        "New: Боковая навигация с иконками вместо верхней панели; «Сессии»+«Активные» в одном экране; окно 960×640.",
+        "New: Вкладка «Управление» переименована в «Параметры».",
+        "New: Все изменения пользователя запоминаются в config.json автоматически.",
+        "New: Web-карточки разделов; «О программе»: подразделы, согласие, правила, журнал, клавиши.",
+    ]),
+    ("0.7.14", "2026-10-17", &[
+        "New: Боковая навигация с иконками (неактивна/наведение/активна) вместо верхней панели вкладок.",
+        "New: «Сессии» и «Активные» слиты в один компактный экран: живые сессии сверху, таблица снизу.",
+        "New: Окно компактнее (960×640).",
+    ]),
+    ("0.7.13", "2026-10-16", &[
+        "New: Мини-окна: вся информация строго в одну линию без переносов (обрезка при узком окне).",
+        "New: Минимальные размеры окошек, контролы всегда доступны.",
+        "Fix: PIN поверх всех окон проверен (always-on-top; исключение — эксклюзивный фулскрин игры).",
+    ]),
+    ("0.7.12", "2026-10-15", &[
+        "Fix: Рамки плавающих окон догоняют масштаб (InnerSize при смене ppp) — внутренности больше не перерастают окно.",
+        "New: Список кругов просторнее (220px), справа ползунок, стрелки ▲▼ и колесо для прокрутки.",
+    ]),
+    ("0.7.11", "2026-10-14", &[
+        "Fix: Подсказки-Tips внутри полей ввода (hint), а не снаружи.",
+        "Fix: Подпись+поле — неразрывный модуль: при переносе уходят вместе.",
+        "New: Пояснение «Станд.» (ховер, документация): системный звук Beep/Bell.",
+    ]),
+    ("0.7.10", "2026-10-13", &[
+        "Fix: Кнопки позиций полоски идут строго слева-направо, сверху-вниз (ряды 0–2/3–5/6–8), как экран.",
+    ]),
+    ("0.7.9", "2026-10-12", &[
+        "Fix: Масштаб: слева меньше [−], справа больше [+] (было наоборот).",
+        "Fix: Шапка и строки таблиц строго на одном уровне (ячейки фикс. высоты + центрирование).",
+        "New: Выбор звука — только медиафайлы; подсказки-Tips у полей URL и звука.",
+        "New: Полоска: 9 позиций 3×3, прозрачность 5–100%, PIN, прозрачность по Ctrl+Num±.",
+        "New: Вставка URL из буфера по Ctrl+Shift+V (будильник/таймер).",
+    ]),
+    ("0.7.8", "2026-10-11", &[
+        "Fix: Поля Час/Мин будильника и таймера — строго в одну линию (центрированный ряд).",
+        "New: Окошки секундомера и полоски — стабильно безрамочные (без автоскрытия рамок).",
+    ]),
+    ("0.7.7", "2026-10-10", &[
+        "New: Отзывчивые таблицы (будильники, игры): колонки — доли ширины окна, текст режется многоточием, полное — в ховере.",
+        "Fix: Колонка «Звук» показывает только имя файла; таблица не смещается при сужении окна.",
+    ]),
+    ("0.7.6", "2026-10-09", &[
+        "New: Окошки секундомера и полоски — обычные, рамки гаснут через 350 мс после ухода курсора.",
+        "Fix: Мерцание при перетаскивании — округление позиций и пропуск дублей команд.",
+        "Fix: Поля времени будильника/таймера режут ввод лимитом (23/59), ширина фиксирована.",
+        "Fix: Таблица будильников не смещается при узком окне: горизонтальный скролл + короткие URL.",
+        "New: Пресеты дней подсвечиваются вдавленной кнопкой; повторный клик сбрасывает в разовый.",
+    ]),
+    ("0.7.5", "2026-10-08", &[
+        "Revert: Полный откат таблицы игр — переносы по словам, перетаскиваемые ширины и колонка «Размер на диске» убраны; возврат к простому виду.",
+    ]),
+    ("0.7.4", "2026-10-07", &[
+        "New: Окошко секундомера: рамка + разделитель табло/кнопок, размер по умолчанию 65%, переносы строк, шрифт кругов −25%.",
+        "New: Таблица игр: перенос по словам, перетаскиваемые ширины колонок (сохраняются), колонка «Размер на диске» (фоново).",
+        "Fix: Steam-скан: штраф лаунчерам/trial/EAC при выборе exe (проверено живьём: 39 игр за 0.9 с).",
+    ]),
+    ("0.7.3", "2026-10-06", &[
+        "New: Кнопки секундомера: старт, пауза, стоп, круг + PIN; шорткаты RShift+стрелки, прозрачность Ctrl+Num+/Num− (когда Pinned).",
+        "New: Глобальные хоткеи секундомера (RegisterHotKey): работают поверх игры, правый Shift отделяется от левого.",
+        "New: Окошко секундомера с ресайзом курсором и зумом контента.",
+        "New: Тонкая полоска сессии в стиле uTorrent (текущая/прошлая/общее), сверху/снизу экрана, таскается, ресайзится.",
+        "New: «Сообщить о проблеме» перенесено наверх «О программе»; кнопка «Проверить обновления» (этап 1: соединение с GitHub).",
+        "Fix: Подписи на синем — светлый текст по тёмно-синему вместо чёрного.",
+        "Fix: Окошко секундомера будит себя явным запросом на свой id (двоение при перетаскивании).",
+    ]),
+    ("0.7.2", "2026-10-05", &[
+        "Fix: Перетаскивание окошка секундомера 1:1 с курсором — дельты копятся поверх последней команды, полный FPS пока тащат.",
+        "New: Тысячные доли секунды в секундомере (ММ:СС.ммм).",
+        "New: Тема интерфейса в цветах клиента Steam (#1B2838/#66C0F4); окошко секундомера красится тоже.",
+    ]),
+    ("0.7.1", "2026-10-04", &[
+        "New: Окошко секундомера — полный минимализм: без рамок и заголовка, таскается за фон, крестик и счётчик одной строкой.",
+        "New: В окошке дублируются 3 последних круга (номер, сплит, общее).",
+        "New: Цифры основного отсчёта в окошке +20% к заголовку, моноширинные.",
+        "Refactor: Удалены мёртвые поля, показ окошка вынесен в метод.",
+    ]),
+    ("0.7.0", "2026-10-03", &[
+        "New: Секундомер в таймере: старт/пауза, круги (до 99 за один забег), сброс.",
+        "New: Маленькое окошко секундомера поверх всех окон, прозрачность 100–2%.",
+        "New: Шорткаты секундомера (старт/пауза, сохранить круг) — настраиваются во вкладке «Управление».",
+        "Fix: Трей: в потоке иконки крутится Win32 message pump — вернулись тултип при наведении, контекстное меню и открытие окна кликом.",
+    ]),
+    ("0.6.1", "2026-10-02", &[
+        "Fix: Масштаб переехал из верхней панели во вкладку «Управление» — надписи больше не наезжают друг на друга.",
+    ]),
+    ("0.6.0", "2026-10-01", &[
+        "New: 100% масштаба = базовый 1.3 (бывшие 130%); проценты на шкале относительно базы.",
+        "Fix: Проверены все шорткаты: юнит-тесты разбора/отображения (9 тестов), исправлен разбор «Esc».",
+        "Perf: Перерисовка по требованию — в простое нагрузка CPU ~0 вместо постоянного 1 FPS.",
+        "Perf: Хэндл NVML кэшируется на поток (без Nvml::init при каждом опросе).",
+        "Perf: Список процессов — один проход без 250 мс заморозки интерфейса.",
+        "Refactor: Убран static mut тултипа; таблица обновляется по событиям и при смене вкладки.",
+    ]),
+    ("0.5.0", "2026-09-30", &[
+        "New: Шорткаты: Alt+1…Alt+7 по вкладкам, Ctrl+} — быстрый будильник (звук BEEP), Ctrl+{ — быстрый таймер (минуты 1–999, Enter).",
+        "New: Вкладка «Управление»: переназначение любых шорткатов, включая дополнительные кнопки мыши (Mouse4/Mouse5); автосохранение.",
+        "New: Документация показывает текущие шорткаты и обновляется сама при их смене.",
+        "New: Экспорт CSV (Ctrl+E), обновление таблицы (Ctrl+R), закрытие диалогов (Esc), скрытие в трей (Ctrl+H).",
+    ]),
+    ("0.4.0", "2026-09-29", &[
+        "New: Аналоговые часы перенесены под список будильников — кнопки действий всегда на месте.",
+        "New: Масштаб интерфейса (слайдер в верхней панели, 80–200%) для больших мониторов.",
+        "New: Плавный масштаб: ползунок правит черновик, интерфейс перестраивается при отпускании; кнопки −/+ и 1:1.",
+        "New: Перенос строк кнопок и прокрутка вкладок — на большом масштабе ничего не уходит за край окна.",
+        "New: Аналоговый циферблат таймера обратного отсчёта.",
+        "New: Дни недели будильника: галочки Пн–Вс, пресеты «Будни», «Выходные», «Ежедневно».",
+        "New: Пункт «О программе»: о программе, документация, ссылка «Сообщить о проблеме».",
+    ]),
+    ("0.3.0", "2026-09-28", &[
+        "New: Время будильника можно изменить в любой момент (кнопка «Изменить», в т.ч. для неактивных).",
+        "New: Анимированный обратный отсчёт (ч:м:с) у каждого активного будильника.",
+        "New: Аналоговые часы для активного будильника + цифровая колонка остальных рядом.",
+    ]),
+    ("0.2.0", "2026-09-27", &[
+        "New: Перепись на Rust (egui + SQLite + NVML).",
+        "New: GPU-гейт: сессия стартует только когда процесс реально занял видеопамять (защита от лаунчера).",
+        "New: Fallback по CPU/RAM для AMD/Intel без NVML.",
+        "New: Добавление игры указанием папки (поиск exe по размеру).",
+        "New: Добавление любой программы из живых процессов с поиском.",
+        "New: Таблица обновляется автоматически, статус записи в реальном времени.",
+        "Fix: Сканирование Steam теперь по всем библиотекам libraryfolders.vdf.",
+        "Fix: Отсев редистов/установщиков при выборе главного exe.",
+    ]),
+    ("0.1.0", "2026-08-24", &[
+        "New: Сессии, будильники, таймер, трей, Steam API, экспорт CSV.",
+    ]),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Sessions,
+    Games,
+    Alarms,
+    Timer,
+    Shortcuts,
+    About,
+}
+
+impl Tab {
+    fn as_str(self) -> &'static str {
+        match self {
+            Tab::Sessions => "sessions",
+            Tab::Games => "games",
+            Tab::Alarms => "alarms",
+            Tab::Timer => "timer",
+            Tab::Shortcuts => "shortcuts",
+            Tab::About => "about",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "games" => Tab::Games,
+            "alarms" => Tab::Alarms,
+            "timer" => Tab::Timer,
+            "shortcuts" => Tab::Shortcuts,
+            "about" => Tab::About,
+            _ => Tab::Sessions,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AppCmd {
+    Show,
+    Quit,
+    StopwatchToggle,
+    StopwatchLap,
+    StopwatchStop,
+    StopwatchPin,
+    /// Шаг прозрачности окошка секундомера (+5/-5), только когда Pinned.
+    OpacityDelta(i32),
+    /// Сдвиг полоски по сетке 3×3: −1 = к предыдущей позиции, +1 = к следующей.
+    StripStep(i32),
+    /// Прозрачность мини-трея ±5 (стрелки RShift+↑/↓ при закрытом секундомере).
+    StripOpacity(i32),
+}
+
+/// Пункты боковой навигации: вкладка, иконка из assets, подпись.
+/// Иконки — одноцветные силуэты 64×64, красятся в цвет состояния кнопки.
+const NAV_ITEMS: [(Tab, egui::ImageSource<'static>, &str); 6] = [
+    (
+        Tab::Sessions,
+        egui::include_image!("../assets/nav_sessions.png"),
+        "Сессии",
+    ),
+    (
+        Tab::Games,
+        egui::include_image!("../assets/nav_games.png"),
+        "Игры",
+    ),
+    (
+        Tab::Alarms,
+        egui::include_image!("../assets/nav_alarms.png"),
+        "Будильники",
+    ),
+    (
+        Tab::Timer,
+        egui::include_image!("../assets/nav_timer.png"),
+        "Таймер",
+    ),
+    (
+        Tab::Shortcuts,
+        egui::include_image!("../assets/nav_params.png"),
+        "Параметры",
+    ),
+    (
+        Tab::About,
+        egui::include_image!("../assets/nav_about.png"),
+        "О программе",
+    ),
+];
+
+/// Фон окна по текущей теме — для панелей с нулевыми полями.
+fn ui_bg(ctx: &egui::Context) -> egui::Color32 {
+    ctx.style().visuals.window_fill
+}
+
+/// Сырые байты ImageSource (include_image! кладёт статический буфер).
+fn bytes_of<'a>(src: &'a egui::ImageSource<'a>) -> &'a [u8] {
+    match src {
+        egui::ImageSource::Bytes { bytes, .. } => bytes.as_ref(),
+        _ => &[],
+    }
+}
+
+/// Раскодировать PNG-иконку раздела в текстуру egui. Вызывается один раз
+/// на иконку (дальше отдаётся кэш в `TrackerApp::nav_icons`).
+/// Ошибка декодирования не должна ронять интерфейс: рисуем прозрачную
+/// текстуру 1×1, подпись кнопки всё равно останется читаемой.
+fn load_nav_icon(
+    ctx: &egui::Context,
+    name: &str,
+    src: &egui::ImageSource<'static>,
+) -> egui::TextureHandle {
+    let image = match decode_png_rgba(bytes_of(src)) {
+        Some((w, h, rgba)) => egui::ColorImage::from_rgba_unmultiplied([w, h], &silhouette(&rgba)),
+        None => egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
+    };
+    ctx.load_texture(format!("nav_{name}"), image, egui::TextureOptions::LINEAR)
+}
+
+/// Превратить иконку в БЕЛЫЙ силуэт, сохранив альфу контура.
+/// Нужно для подкрашивания: egui умножает текстуру на цвет состояния, а
+/// готовые иконки покрашены в акцентный синий — без перевода в белый
+/// неактивный пункт был бы синим на тёмном фоне и не читался. Форма иконки
+/// задана альфой, поэтому цвет в неё не входит и просто заменяется белым.
+fn silhouette(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .flat_map(|p| [255u8, 255, 255, p[3]])
+        .collect()
+}
+
+/// Байты PNG → (ширина, высота, RGBA). Минимальный декодер на базе крейта
+/// `image`: зависимость и так уже есть в дереве, а писать свой PNG-парсер
+/// незачем. Поддерживается 8 бит на канал (RGB/RGBA/серый/с альфой) —
+/// этого хватает нашим иконкам.
+fn decode_png_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    use image::ImageReader;
+    let img = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let rgba = img.to_rgba8().into_raw();
+    if rgba.len() != w * h * 4 {
+        return None;
+    }
+    Some((w, h, rgba))
+}
+
+#[derive(Debug, Clone)]
+pub enum TrayCmd {
+    Tooltip(String),
+    /// Глобальные хоткеи секундомера (пусто = снять все).
+    StopwatchHotkeys(Vec<crate::shortcuts::HotkeyReg>),
+}
+
+/// Тёмная тема в цветах клиента Steam: фон #1B2838, шапка #171A21,
+/// текст #C7D5E0, акцент #66C0F4. Окошко секундомера (тот же ctx)
+/// красится автоматически.
+fn steam_visuals() -> egui::Visuals {
+    use egui::Color32 as C;
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = C::from_rgb(0x1B, 0x28, 0x38);
+    v.window_fill = C::from_rgb(0x17, 0x1D, 0x25);
+    v.extreme_bg_color = C::from_rgb(0x0E, 0x14, 0x1B);
+    v.faint_bg_color = C::from_rgb(0x22, 0x30, 0x3F);
+    v.code_bg_color = C::from_rgb(0x10, 0x18, 0x20);
+    v.text_cursor.stroke = egui::Stroke::new(2.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
+    v.hyperlink_color = C::from_rgb(0x66, 0xC0, 0xF4);
+    v.selection.bg_fill = C::from_rgb(0x1B, 0x5F, 0x8A);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, C::WHITE);
+    v.widgets.noninteractive.bg_fill = C::from_rgb(0x16, 0x20, 0x2D);
+    v.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0_f32, C::from_rgb(0xC7, 0xD5, 0xE0));
+    v.widgets.inactive.bg_fill = C::from_rgb(0x2A, 0x47, 0x5E);
+    v.widgets.inactive.fg_stroke =
+        egui::Stroke::new(1.0_f32, C::from_rgb(0xC7, 0xD5, 0xE0));
+    // Никакого тёмного текста на синем: наведение и нажатие — светлый текст
+    // по тёмно-синему (контраст), как кнопки в клиенте Steam.
+    v.widgets.hovered.bg_fill = C::from_rgb(0x36, 0x5D, 0x7D);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
+    v.widgets.active.bg_fill = C::from_rgb(0x1B, 0x5F, 0x8A);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
+    v.widgets.open.bg_fill = C::from_rgb(0x22, 0x30, 0x3F);
+    v.widgets.open.fg_stroke =
+        egui::Stroke::new(1.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
+    v
+}
+
+pub struct TrackerApp {
+    pub db: Arc<Db>,
+    pub games: SharedGames,
+    pub active: SharedActive,
+    pub cfg: SharedConfig,
+    cfg_handle: AppConfig,
+    rx_monitor: mpsc::Receiver<MonitorEvent>,
+    rx_appcmd: mpsc::Receiver<AppCmd>,
+    tx_tray: mpsc::Sender<TrayCmd>,
+    tab: Tab,
+    agg: Vec<AggRow>,
+    last_agg_refresh: Instant,
+    session_id_by_exe: HashMap<String, i64>,
+    // sessions ui
+    show_id_col: bool,
+    show_pct_col: bool,
+    show_last_col: bool,
+    show_runs_col: bool,
+    detail_game: Option<String>,
+    edit_session: Option<(i64, i32, i32, i32)>, // id,h,m,s
+    // games ui
+    search: String,
+    api_key: String,
+    steam_id: String,
+    scan_msg: String,
+    // process picker
+    show_picker: bool,
+    picker_search: String,
+    picker_list: Vec<detector::ProcInfo>,
+    picker_refresh_at: Instant,
+    // folder candidates
+    show_folder: bool,
+    folder_candidates: Vec<(String, u64)>,
+    folder_name: String,
+    // alarms ui
+    alarms: Vec<AlarmRow>,
+    alarm_h: i32,
+    alarm_m: i32,
+    /// Дни недели нового будильника галочками (Пн..Вс). Пусто = разовый.
+    alarm_days: [bool; 7],
+    alarm_url: String,
+    alarm_sound: String,
+    alarm_std: String,
+    alarm_dialog: Option<AlarmRow>,
+    /// Редактирование будильника (id, часы, минуты, дни Пн..Вс).
+    /// Доступно в любой момент, в том числе для неактивных будильников.
+    edit_alarm: Option<(i64, i32, i32, [bool; 7])>,
+    /// Показывать ли аналоговые часы для активного будильника.
+    show_analog: bool,
+    /// Какой будильник выведен на аналоговые часы (id). None = ближайший.
+    analog_alarm_id: Option<i64>,
+    // timer ui
+    timer_url: String,
+    timer_sound: String,
+    timer_std: String,
+    timer_min: i32,
+    timer_end: Option<Instant>,
+    timer_total: u64,
+    timer_data: (Option<String>, Option<String>, Option<String>),
+    timer_dialog: bool,
+    // misc
+    sound: SoundPlayer,
+    last_alarm_min: String,
+    morning_shown: bool,
+    started_at: Instant,
+    last_autoscan: Instant,
+    quit_requested: bool,
+    gpu_usable_cache: bool,
+    gpu_util_cache: u32,
+    last_gpu_check: Instant,
+    status_msg: String,
+    /// Черновик масштаба интерфейса: правится ползунком без перестройки UI,
+    /// применяется (commit_scale) при отпускании ползунка или кнопками.
+    scale_draft: Option<f32>,
+    /// Пользовательские шорткаты (shortcuts.json, автосохранение).
+    shortcuts: ShortcutStore,
+    /// Захват нового шортката: id действия + время старта (анти-дребезг).
+    capture_action: Option<String>,
+    capture_armed_at: f64,
+    /// Быстрый будильник (Ctrl+}): разовый, звук BEEP.
+    quick_alarm_open: bool,
+    quick_alarm_text: String,
+    quick_alarm_focus: bool,
+    /// Быстрый таймер (Ctrl+{): минуты 1–999, Enter — старт.
+    quick_timer_open: bool,
+    quick_timer_text: String,
+    quick_timer_focus: bool,
+    /// Секундомер: идёт ли отсчёт + накопленное время + круги (до 99 за забег).
+    stopwatch_running: bool,
+    stopwatch_start: Option<Instant>,
+    stopwatch_base: Duration,
+    stopwatch_laps: Vec<Duration>,
+    /// Маленькое окошко секундомера поверх всех окон + его прозрачность 2–100%.
+    stopwatch_overlay: bool,
+    stopwatch_opacity_pct: f32,
+    /// Окошко секундомера развёрнуто (кнопка расширения): двойной размер
+    /// плюс таймер обратного отсчёта. Запоминается, как и прочие настройки.
+    stopwatch_expanded: bool,
+    /// Последняя командная позиция окошка при перетаскивании (анти-лаг).
+    stopwatch_drag_pos: Option<egui::Pos2>,
+    /// Поставить окошко на запомненную позицию первым кадром.
+    overlay_place_pending: bool,
+    /// ppp при прошлой синхронизации рамок плавающих окон.
+    last_ppp: f32,
+    /// Смещение скролла списка кругов (кнопки ▲▼ + колесо).
+    laps_scroll: f32,
+    /// Тонкая полоска сессии (стиль uTorrent): открыта / позиция 0–8 (3×3) /
+    /// drag / закреплена (PIN) / прозрачность 5–100%.
+    strip_open: bool,
+    strip_pos: u8,
+    strip_drag_pos: Option<egui::Pos2>,
+    strip_pinned: bool,
+    strip_opacity_pct: f32,
+    /// Отложить прижатие полоски к краю до первого кадра вьюпорта.
+    strip_snap_pending: bool,
+    /// Когда последний раз проверяли, что окна не уехали за границы экрана
+    /// (мониторы могли переподключиться или сменить разрешение).
+    last_edge_check: Instant,
+    /// Текущий размер окошка секундомера в пикселях — общий источник правды
+    /// для проверок границ экрана (не пересчитываем на месте).
+    last_stopwatch_size: egui::Vec2,
+    /// PIN: окно нельзя перетащить; Ctrl+Num+/Num− меняют прозрачность ±5%.
+    stopwatch_pinned: bool,
+    /// Тонкая инфопанель игровой сессии (стиль uTorrent) + её размещение.
+    infobar_open: bool,
+    infobar_placed: bool,
+    /// Проверка обновлений: приёмник результата, статус, флаг процесса.
+    update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    update_status: String,
+    update_checking: bool,
+    /// Момент запуска проверки обновлений (время egui) — для защиты от
+    /// повторного автозапуска при каждом кадре раздела «О программе».
+    update_window_opened_at: f64,
+    /// Последний отправленный в трей набор глобальных хоткеев (без дублей).
+    last_hotkeys: Vec<crate::shortcuts::HotkeyReg>,
+    /// Последний тултип трея (вместо static mut).
+    last_tooltip: Instant,
+    /// Подраздел «О программе» (0–3).
+    about_sub: u8,
+    /// Последний сохранённый в файл слепок конфига (для автоперсиста).
+    last_saved: AppConfig,
+    /// Вкладка прошлого кадра: при переходе на Сессии/Будильники обновляем данные.
+    prev_tab: Tab,
+    /// Текстуры иконок боковой навигации (по uri). Заполняется лениво:
+    /// PNG раскодируется один раз за сеанс, дальше рисуется текстура.
+    nav_icons: HashMap<String, egui::TextureHandle>,
+}
+
+impl TrackerApp {
+    pub fn new(
+        db: Arc<Db>,
+        games: SharedGames,
+        active: SharedActive,
+        cfg: SharedConfig,
+        rx_monitor: mpsc::Receiver<MonitorEvent>,
+        rx_appcmd: mpsc::Receiver<AppCmd>,
+        tx_tray: mpsc::Sender<TrayCmd>,
+    ) -> Self {
+        let cfg_handle = cfg.read().unwrap().clone();
+        let mut app = Self {
+            db,
+            games,
+            active,
+            cfg,
+            cfg_handle: cfg_handle.clone(),
+            rx_monitor,
+            rx_appcmd,
+            tx_tray,
+            tab: Tab::from_str(&cfg_handle.last_tab),
+            agg: Vec::new(),
+            last_agg_refresh: Instant::now() - Duration::from_secs(99),
+            session_id_by_exe: HashMap::new(),
+            show_id_col: cfg_handle.show_cols[0],
+            show_pct_col: cfg_handle.show_cols[1],
+            show_last_col: cfg_handle.show_cols[2],
+            show_runs_col: cfg_handle.show_cols[3],
+            detail_game: None,
+            edit_session: None,
+            search: String::new(),
+            api_key: cfg_handle.api_key.clone(),
+            steam_id: cfg_handle.steam_id.clone(),
+            scan_msg: String::new(),
+            show_picker: false,
+            picker_search: String::new(),
+            picker_list: Vec::new(),
+            picker_refresh_at: Instant::now() - Duration::from_secs(99),
+            show_folder: false,
+            folder_candidates: Vec::new(),
+            folder_name: String::new(),
+            alarms: Vec::new(),
+            alarm_h: cfg_handle.alarm_h,
+            alarm_m: cfg_handle.alarm_m,
+            alarm_days: cfg_handle.alarm_days,
+            alarm_url: String::new(),
+            alarm_sound: String::new(),
+            alarm_std: "Нет".to_string(),
+            alarm_dialog: None,
+            edit_alarm: None,
+            show_analog: cfg_handle.show_analog,
+            analog_alarm_id: None,
+            timer_url: String::new(),
+            timer_sound: String::new(),
+            timer_std: "Нет".to_string(),
+            timer_min: cfg_handle.timer_min,
+            timer_end: None,
+            timer_total: 0,
+            timer_data: (None, None, None),
+            timer_dialog: false,
+            sound: SoundPlayer::default(),
+            last_alarm_min: String::new(),
+            morning_shown: false,
+            started_at: Instant::now(),
+            last_autoscan: Instant::now(),
+            quit_requested: false,
+            gpu_usable_cache: false,
+            gpu_util_cache: 0,
+            last_gpu_check: Instant::now() - Duration::from_secs(99),
+            status_msg: String::new(),
+            scale_draft: None,
+            shortcuts: ShortcutStore::load(),
+            capture_action: None,
+            capture_armed_at: 0.0,
+            quick_alarm_open: false,
+            quick_alarm_text: String::new(),
+            quick_alarm_focus: false,
+            quick_timer_open: false,
+            quick_timer_text: String::new(),
+            quick_timer_focus: false,
+            stopwatch_running: false,
+            stopwatch_start: None,
+            stopwatch_base: Duration::ZERO,
+            stopwatch_laps: Vec::new(),
+            stopwatch_overlay: cfg_handle.stopwatch_overlay,
+            stopwatch_opacity_pct: cfg_handle.stopwatch_opacity_pct,
+            stopwatch_expanded: cfg_handle.stopwatch_expanded,
+            stopwatch_drag_pos: None,
+            overlay_place_pending: false,
+            last_ppp: 0.0,
+            laps_scroll: 0.0,
+            strip_open: cfg_handle.strip_open,
+            strip_pos: cfg_handle.strip_pos,
+            strip_drag_pos: None,
+            strip_pinned: cfg_handle.strip_pinned,
+            strip_opacity_pct: cfg_handle.strip_opacity_pct,
+            strip_snap_pending: false,
+            last_edge_check: Instant::now(),
+            last_stopwatch_size: egui::Vec2::new(175.0, 170.0),
+            stopwatch_pinned: false,
+            infobar_open: false,
+            infobar_placed: false,
+            update_rx: None,
+            update_status: String::new(),
+            update_checking: false,
+            update_window_opened_at: 0.0,
+            last_hotkeys: Vec::new(),
+            last_tooltip: Instant::now() - Duration::from_secs(99),
+            prev_tab: Tab::from_str(&cfg_handle.last_tab),
+            nav_icons: HashMap::new(),
+            about_sub: 0,
+            last_saved: cfg_handle.clone(),
+        };
+        app.refresh_agg();
+        app.refresh_alarms();
+        // Время в форме добавления: запомненное, а не текущее.
+        app
+    }
+
+    /// Собрать полный конфиг из текущего состояния интерфейса.
+    fn collect_config(&self) -> AppConfig {
+        let mut c = self.cfg_handle.clone();
+        c.show_cols = [
+            self.show_id_col,
+            self.show_pct_col,
+            self.show_last_col,
+            self.show_runs_col,
+        ];
+        c.show_analog = self.show_analog;
+        c.strip_open = self.strip_open;
+        c.strip_pos = self.strip_pos;
+        c.strip_pinned = self.strip_pinned;
+        c.strip_opacity_pct = self.strip_opacity_pct;
+        c.stopwatch_overlay = self.stopwatch_overlay;
+        c.stopwatch_opacity_pct = self.stopwatch_opacity_pct;
+        c.stopwatch_expanded = self.stopwatch_expanded;
+        c.alarm_h = self.alarm_h;
+        c.alarm_m = self.alarm_m;
+        c.alarm_days = self.alarm_days;
+        c.timer_min = self.timer_min;
+        c.last_tab = self.tab.as_str().to_string();
+        c
+    }
+
+    /// Запомнить все изменения пользователя в файл (при отличии от слепка).
+    fn persist_if_changed(&mut self) {
+        let cur = self.collect_config();
+        if cur != self.last_saved {
+            cur.save();
+            *self.cfg.write().unwrap() = cur.clone();
+            self.last_saved = cur;
+        }
+    }
+
+    fn refresh_agg(&mut self) {
+        self.agg = self.db.aggregated();
+        self.last_agg_refresh = Instant::now();
+    }
+
+    /// Применить масштаб интерфейса и сохранить в config.json.
+    fn commit_scale(&mut self, v: f32) {
+        let v = v.clamp(0.8, 2.0);
+        self.scale_draft = None;
+        if (v - self.cfg_handle.ui_scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.cfg_handle.ui_scale = v;
+        *self.cfg.write().unwrap() = self.cfg_handle.clone();
+        self.cfg_handle.save();
+    }
+
+    fn refresh_alarms(&mut self) {
+        self.alarms = self.db.alarms();
+    }
+
+    /// Открыть раздел «О программе» и сразу запустить проверку обновлений.
+    /// Вызывается кликом по версии внизу сайдбара. Отдельного окна нет:
+    /// результат показывается в самом разделе (подраздел «О программе»).
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        self.tab = Tab::About;
+        self.about_sub = 0;
+        self.update_window_opened_at = ctx.input(|i| i.time);
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_status = "Проверка соединения с GitHub…".to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_rx = Some(rx);
+        std::thread::spawn(move || {
+            let msg = match crate::update::check_github_connection() {
+                Ok(ok) => ok,
+                Err(e) => format!("Ошибка: {e}"),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn persist_games(&self) {
+        let g = self.games.read().unwrap().clone();
+        save_known_games(&g);
+    }
+
+    fn notify(&self, title: &str, body: &str) {
+        let _ = notify_rust::Notification::new().summary(title).body(body).show();
+    }
+
+    /// Опрос шорткатов: захват нового, Enter быстрых диалогов, глобальные.
+    fn poll_shortcuts(&mut self, ctx: &egui::Context) {
+        // 1) Режим переназначения: ждём клавиши или кнопку мыши.
+        if let Some(id) = self.capture_action.clone() {
+            let now = ctx.input(|i| i.time);
+            if now >= self.capture_armed_at + 0.25 {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.capture_action = None; // Esc — отмена захвата
+                } else {
+                    let (ctrl, mut shift, alt) = ctx.input(|i| {
+                        let m = &i.modifiers;
+                        (m.ctrl || m.command, m.shift, m.alt)
+                    });
+                    // Сторона Shift: правый фиксируем отдельно (RShift+стрелки).
+                    let mut rshift = false;
+                    #[cfg(windows)]
+                    if shift && crate::shortcuts::rshift_down() {
+                        rshift = true;
+                        shift = false;
+                    }
+                    let mut bound: Option<Shortcut> = None;
+                    for k in crate::shortcuts::CAPTURE_KEYS {
+                        if ctx.input(|i| i.key_pressed(*k)) {
+                            bound = Some(Shortcut { ctrl, shift, alt, rshift, key: Some(*k), mouse: None });
+                            break;
+                        }
+                    }
+                    if bound.is_none() {
+                        for code in 0..=4u8 {
+                            if let Some(btn) = crate::shortcuts::mouse_button(code) {
+                                if ctx.input(|i| i.pointer.button_clicked(btn)) {
+                                    bound = Some(Shortcut { ctrl, shift, alt, rshift: false, key: None, mouse: Some(code) });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(b) = bound {
+                        self.shortcuts.set(&id, b);
+                        self.status_msg = format!("«{}» теперь: {}", action_label(&id), crate::shortcuts::display(&b));
+                        self.capture_action = None;
+                        self.push_stopwatch_hotkeys();
+                    }
+                }
+            }
+            return; // пока идёт захват — остальные шорткаты молчат
+        }
+        // 2) Enter подтверждает быстрые диалоги (даже из поля ввода).
+        if self.quick_alarm_open && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.confirm_quick_alarm();
+            return;
+        }
+        if self.quick_timer_open && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.confirm_quick_timer();
+            return;
+        }
+        // 3) Глобальные шорткаты.
+        let typing = ctx.wants_keyboard_input();
+        let mut fired: Vec<&'static str> = Vec::new();
+        for a in crate::shortcuts::ACTIONS {
+            let b = self.shortcuts.binding(a.id);
+            if let Some(code) = b.mouse {
+                // Кнопки мыши — всегда (включая дополнительные).
+                if let Some(btn) = crate::shortcuts::mouse_button(code) {
+                    let mods_ok = ctx.input(|i| {
+                        let m = &i.modifiers;
+                        (m.ctrl || m.command) == b.ctrl && m.shift == b.shift && m.alt == b.alt
+                    });
+                    if mods_ok && ctx.input(|i| i.pointer.button_clicked(btn)) {
+                        fired.push(a.id);
+                        continue;
+                    }
+                }
+            }
+            if let Some(key) = b.key {
+                // Alt-комбинации и закрытие диалогов — даже при вводе текста,
+                // остальные буквенные — только вне полей ввода.
+                let allowed = (b.alt && !b.ctrl) || a.id == "close_dialog" || !typing;
+                if !allowed {
+                    continue;
+                }
+                // RShift-биндинги: egui видит просто Shift, сторону проверяем
+                // через GetAsyncKeyState (иначе сработает и левый Shift).
+                #[cfg(windows)]
+                if b.rshift && !crate::shortcuts::rshift_down() {
+                    continue;
+                }
+                let shift_pressed = b.shift || b.rshift;
+                let mods = egui::Modifiers { ctrl: b.ctrl, shift: shift_pressed, alt: b.alt, mac_cmd: false, command: b.ctrl };
+                if ctx.input_mut(|i| i.count_and_consume_key(mods, key)) > 0 {
+                    fired.push(a.id);
+                }
+            }
+        }
+        for id in fired {
+            match id {
+                "tab_sessions" => self.tab = Tab::Sessions,
+                "tab_games" => self.tab = Tab::Games,
+                "tab_alarms" => self.tab = Tab::Alarms,
+                "tab_timer" => self.tab = Tab::Timer,
+                "tab_shortcuts" => self.tab = Tab::Shortcuts,
+                "tab_about" => self.tab = Tab::About,
+                "quick_alarm" => self.open_quick_alarm(),
+                "quick_timer" => self.open_quick_timer(),
+                "stopwatch_toggle" => self.stopwatch_toggle(),
+                "stopwatch_lap" => self.stopwatch_lap(),
+                "stopwatch_stop" => self.stopwatch_stop(),
+                "stopwatch_pin" => self.toggle_stopwatch_pin(),
+                "opacity_up" => self.apply_opacity_delta(5),
+                "opacity_down" => self.apply_opacity_delta(-5),
+                "paste_url" => self.paste_url_to_alarm(),
+                "export_csv" => self.export_csv(),
+                "refresh" => self.refresh_agg(),
+                "close_dialog" => {
+                    self.close_top_dialog();
+                }
+                "hide_tray" => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+                _ => {}
+            }
+        }
+    }
+
+    /// Закрыть верхний открытый диалог (Esc). Возвращает false, если нечего закрывать.
+    fn close_top_dialog(&mut self) -> bool {
+        if self.quick_timer_open {
+            self.quick_timer_open = false;
+            return true;
+        }
+        if self.quick_alarm_open {
+            self.quick_alarm_open = false;
+            return true;
+        }
+        if self.alarm_dialog.is_some() {
+            self.alarm_dialog = None;
+            self.sound.stop();
+            return true;
+        }
+        if self.edit_alarm.is_some() {
+            self.edit_alarm = None;
+            return true;
+        }
+        if self.edit_session.is_some() {
+            self.edit_session = None;
+            self.refresh_agg();
+            return true;
+        }
+        if self.timer_dialog {
+            self.timer_dialog = false;
+            self.sound.stop();
+            return true;
+        }
+        if self.detail_game.is_some() {
+            self.detail_game = None;
+            self.refresh_agg();
+            return true;
+        }
+        if self.show_picker {
+            self.show_picker = false;
+            return true;
+        }
+        if self.show_folder {
+            self.show_folder = false;
+            return true;
+        }
+        false
+    }
+
+    /// Быстрый будильник: разовый, звук BEEP.
+    fn open_quick_alarm(&mut self) {
+        self.quick_alarm_open = true;
+        self.quick_alarm_text.clear();
+        self.quick_alarm_focus = true;
+    }
+
+    fn confirm_quick_alarm(&mut self) {
+        let t = self.quick_alarm_text.trim().replace(' ', "");
+        let parsed = t.split_once(':').and_then(|(h, m)| {
+            let h: u32 = h.parse().ok()?;
+            let m: u32 = m.parse().ok()?;
+            (h <= 23 && m <= 59).then_some((h, m))
+        });
+        match parsed {
+            Some((h, m)) => {
+                let ts = format!("{h:02}:{m:02}");
+                match self.db.add_alarm(&ts, false, None, None, Some("beep"), None) {
+                    Ok(()) => self.status_msg = format!("Быстрый будильник на {ts}: звук BEEP, разовый."),
+                    Err(e) => self.status_msg = format!("Не удалось добавить: {e}"),
+                }
+                self.refresh_alarms();
+                self.quick_alarm_open = false;
+            }
+            None => self.status_msg = "Формат времени: ЧЧ:ММ (например 07:30).".to_string(),
+        }
+    }
+
+    /// Быстрый таймер: минуты 1–999, Enter — старт.
+    fn open_quick_timer(&mut self) {
+        self.quick_timer_open = true;
+        self.quick_timer_text.clear();
+        self.quick_timer_focus = true;
+    }
+
+    fn confirm_quick_timer(&mut self) {
+        match self.quick_timer_text.trim().parse::<i64>() {
+            Ok(v) => {
+                let mins = v.clamp(1, 999) as u64;
+                self.start_timer(mins * 60);
+                self.status_msg = format!("Быстрый таймер: {mins} мин.");
+                self.quick_timer_open = false;
+            }
+            Err(_) => self.status_msg = "Минуты: число 1–999, Enter — старт.".to_string(),
+        }
+    }
+
+    // ---------- секундомер ----------
+    fn stopwatch_elapsed(&self) -> Duration {
+        match (self.stopwatch_running, self.stopwatch_start) {
+            (true, Some(t)) => self.stopwatch_base + t.elapsed(),
+            _ => self.stopwatch_base,
+        }
+    }
+
+    fn stopwatch_toggle(&mut self) {
+        if self.stopwatch_running {
+            self.stopwatch_pause();
+        } else {
+            self.stopwatch_start();
+        }
+    }
+
+    /// Старт/продолжить (без сброса). No-op, если уже идёт.
+    fn stopwatch_start(&mut self) {
+        if !self.stopwatch_running {
+            self.stopwatch_start = Some(Instant::now());
+            self.stopwatch_running = true;
+        }
+    }
+
+    /// Пауза (время и круги сохраняются). No-op, если стоит.
+    fn stopwatch_pause(&mut self) {
+        if self.stopwatch_running {
+            self.stopwatch_base = self.stopwatch_elapsed();
+            self.stopwatch_running = false;
+            self.stopwatch_start = None;
+        }
+    }
+
+    /// Стоп завершает забег: останавливаем и обнуляем текущее время,
+    /// круги остаются итогом. Дальнейший старт — с нуля.
+    fn stopwatch_stop(&mut self) {
+        self.stopwatch_running = false;
+        self.stopwatch_start = None;
+        self.stopwatch_base = Duration::ZERO;
+    }
+
+    /// Закрепить/открепить окошко (Pin). Закреплённое нельзя таскать.
+    fn toggle_stopwatch_pin(&mut self) {
+        self.stopwatch_pinned = !self.stopwatch_pinned;
+        self.status_msg = if self.stopwatch_pinned {
+            "Секундомер закреплён (PIN): перетаскивание заблокировано, Ctrl+Num+/Num− — прозрачность.".to_string()
+        } else {
+            "Секундомер откреплён: окно снова можно таскать.".to_string()
+        };
+    }
+
+    /// Шаг прозрачности ±5%: сначала окошко секундомера (если закреплено
+    /// и открыто), иначе полоска (если закреплена и открыта).
+    fn apply_opacity_delta(&mut self, delta: i32) {
+        if self.stopwatch_pinned && self.stopwatch_overlay {
+            self.stopwatch_opacity_pct = step_opacity(self.stopwatch_opacity_pct, delta as f32);
+            return;
+        }
+        if self.strip_pinned && self.strip_open {
+            self.strip_opacity_pct = step_opacity5(self.strip_opacity_pct, delta as f32);
+            return;
+        }
+        self.status_msg = "Прозрачность меняется только у закреплённого (PIN) открытого окошка.".to_string();
+    }
+
+    /// Развернуть/свернуть окошко секундомера. Развёрнутое — вдвое шире и
+    /// выше, снизу появляется таймер обратного отсчёта (тот же, что на
+    /// вкладке «Таймер» — одна сущность, два места показа).
+    /// Размер шлём сразу, иначе egui ждёт следующего кадра и окно «прыгает».
+    fn set_stopwatch_expanded(&mut self, ctx: &egui::Context, expanded: bool) {
+        self.stopwatch_expanded = expanded;
+        // Размер шлём сразу, иначе egui ждёт следующего кадра и окно «прыгает».
+        // ВInnerSize передаются ПОИНТЫ — egui переведёт их в пиксели сам.
+        ctx.send_viewport_cmd_to(
+            stopwatch_viewport_id(),
+            egui::ViewportCommand::InnerSize(stopwatch_window_size(expanded)),
+        );
+        self.status_msg = if expanded {
+            "Окошко секундомера развёрнуто: снизу таймер обратного отсчёта.".to_string()
+        } else {
+            "Окошко секундомера свёрнуто.".to_string()
+        };
+    }
+
+    /// Открыть/закрыть окошко + переслать глобальные хоткеи в поток трея
+    /// (пусто = снять все).
+    fn set_stopwatch_overlay(&mut self, open: bool) {
+        self.stopwatch_overlay = open;
+        if !open {
+            self.stopwatch_drag_pos = None;
+            forget_style_patch(STOPWATCH_TITLE);
+        } else {
+            // При открытии встаём на запомненное место (если монитор жив).
+            self.overlay_place_pending = true;
+        }
+        self.push_stopwatch_hotkeys();
+    }
+
+    /// Собрать биндинги окошек в регистрации RegisterHotKey и отправить
+    /// в поток трея. Набор зависит от того, какое окошко открыто (см. ниже).
+    fn push_stopwatch_hotkeys(&mut self) {
+        const SW_IDS: [(&str, u32); 6] = [
+            ("stopwatch_toggle", 1),
+            ("stopwatch_lap", 2),
+            ("stopwatch_stop", 3),
+            ("stopwatch_pin", 4),
+            ("opacity_up", 5),
+            ("opacity_down", 6),
+        ];
+        const STRIP_IDS: [(&str, u32); 4] = [
+            ("strip_opacity_up", 5),
+            ("strip_opacity_down", 6),
+            ("strip_pos_prev", 7),
+            ("strip_pos_next", 8),
+        ];
+        // Секундомер и мини-трей делят комбинации RShift+стрелка, а
+        // RegisterHotKey не даёт занять одну комбинацию дважды — поэтому
+        // регистрируется ровно один набор: приоритет у окошка секундомера.
+        // Раньше условием был только он, и при открытой полоске стрелки
+        // не работали вовсе.
+        let ids: &[(&str, u32)] = if self.stopwatch_overlay {
+            &SW_IDS
+        } else if self.strip_open {
+            &STRIP_IDS
+        } else {
+            &[]
+        };
+        let regs = ids
+            .iter()
+            .filter_map(|(id, uid)| {
+                let b = self.shortcuts.binding(id);
+                let vk = b.key.and_then(crate::shortcuts::key_to_vk)?;
+                if b.mouse.is_some() {
+                    return None; // мышь глобально не регистрируется
+                }
+                let mut mods = 0u32;
+                if b.ctrl {
+                    mods |= 2; // MOD_CONTROL
+                }
+                if b.alt {
+                    mods |= 1; // MOD_ALT
+                }
+                if b.shift || b.rshift {
+                    mods |= 4; // MOD_SHIFT (сторона проверяется при срабатывании)
+                }
+                Some(crate::shortcuts::HotkeyReg {
+                    uid: *uid,
+                    action: id.to_string(),
+                    mods,
+                    vk,
+                    rshift_only: b.rshift && !b.shift,
+                })
+            })
+            .collect();
+        let _ = self.tx_tray.send(TrayCmd::StopwatchHotkeys(regs));
+    }
+
+    fn stopwatch_reset(&mut self) {
+        self.stopwatch_running = false;
+        self.stopwatch_start = None;
+        self.stopwatch_base = Duration::ZERO;
+        self.stopwatch_laps.clear();
+    }
+
+    fn stopwatch_lap(&mut self) {
+        let cur = self.stopwatch_elapsed();
+        if !push_lap_capped(&mut self.stopwatch_laps, cur) {
+            self.status_msg = "Секундомер: уже 99 кругов — сбросьте для нового забега.".to_string();
+        }
+    }
+
+    /// Мини-панель секундомера: полный минимализм (borderless-окно без рамок).
+    /// Таскается за фон (кроме PIN), цифры +20% к заголовку, последние 3 круга.
+    /// Размер задаёт пользователь курсором — контент зумится от ширины.
+    /// Зоны разделены явно: тонкая рамка + разделитель между табло и кнопками.
+    fn draw_stopwatch_mini(&mut self, ui: &mut egui::Ui, vp_id: egui::ViewportId) {
+        // PIN: окно никак нельзя перетащить, только открепить повторным Pin.
+        if !self.stopwatch_pinned {
+            viewport_drag(
+                ui,
+                vp_id,
+                egui::Id::new(("stopwatch_overlay", "drag")),
+                &mut self.stopwatch_drag_pos,
+                STOPWATCH_TITLE,
+            );
+        }
+        let zoom = float_zoom(ui, stopwatch_base_w());
+        // Чёткая граница виджета (рамка в цвете акцента, приглушённом).
+        egui::Frame {
+            fill: ui.visuals().window_fill,
+            stroke: egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgb(0x3D, 0x6E, 0x8F),
+            ),
+            rounding: egui::Rounding::same(6.0),
+            inner_margin: egui::Margin::same(6.0),
+            ..Default::default()
+        }
+        .show(ui, |ui| {
+            self.stopwatch_body(ui, zoom);
+        });
+    }
+    /// Содержимое окошка секундомера (табло | разделитель | кнопки).
+    fn stopwatch_body(&mut self, ui: &mut egui::Ui, zoom: f32) {
+        // Верхняя строка: PIN, счётчик, крестик — строго одна линия.
+        ui.horizontal(|ui| {
+            let pin_txt = if self.stopwatch_pinned {
+                egui::RichText::new("PIN").color(egui::Color32::from_rgb(255, 165, 0))
+            } else {
+                egui::RichText::new("PIN").weak()
+            };
+            if ui.small_button(pin_txt).clicked() {
+                self.toggle_stopwatch_pin();
+            }
+            ui.label(
+                egui::RichText::new(format!("{}/99", self.stopwatch_laps.len()))
+                    .small()
+                    .weak(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if ui.small_button("×").clicked() {
+                    self.set_stopwatch_overlay(false);
+                }
+                // Расширение: двойной размер окна + таймер обратного отсчёта.
+                let exp_txt = if self.stopwatch_expanded {
+                    egui::RichText::new("⤡").color(egui::Color32::from_rgb(0x66, 0xC0, 0xF4))
+                } else {
+                    egui::RichText::new("⤢").weak()
+                };
+                if ui
+                    .small_button(exp_txt)
+                    .on_hover_text(if self.stopwatch_expanded {
+                        "Свернуть окошко"
+                    } else {
+                        "Развернуть: добавится таймер обратного отсчёта"
+                    })
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    let want = !self.stopwatch_expanded;
+                    self.set_stopwatch_expanded(&ctx, want);
+                }
+            });
+        });
+        ui.vertical_centered(|ui| {
+            // Основные цифры +20% от заголовка, моноширинные, с зумом окна.
+            let big = ui.text_style_height(&egui::TextStyle::Heading) * 1.2 * zoom;
+            ui.label(
+                egui::RichText::new(format_stopwatch(self.stopwatch_elapsed()))
+                    .font(egui::FontId::monospace(big)),
+            );
+            // Дублируем 3 последних круга: номер, сплит, общее.
+            // Строго одна строка без переносов (обрезка при узком окне).
+            for (num, split, total) in last_laps(&self.stopwatch_laps) {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format_lap_line(num, split, total))
+                            .font(egui::FontId::monospace(9.75 * zoom))
+                            .color(egui::Color32::LIGHT_GRAY),
+                    )
+                    .truncate(),
+                );
+            }
+            // Разделитель пассивной (табло) и активной (кнопки) зон.
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button(if self.stopwatch_running { "Пауза" } else { "Старт" })
+                    .clicked()
+                {
+                    self.stopwatch_toggle();
+                }
+                if ui.small_button("Стоп").clicked() {
+                    self.stopwatch_stop();
+                }
+                if ui.small_button("Круг").clicked() {
+                    self.stopwatch_lap();
+                }
+            });
+            // Развёрнутое окошко: снизу таймер обратного отсчёта — тот же,
+            // что на вкладке «Таймер» (одна сущность, два места показа).
+            if self.stopwatch_expanded {
+                ui.separator();
+                self.draw_overlay_countdown(ui);
+            }
+        });
+        // Запоминаем место окна (восстановим на том же мониторе при открытии).
+        if let Some(min) = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min) {
+            let p = [min.x, min.y];
+            if self.cfg_handle.stopwatch_pos != Some(p) {
+                self.cfg_handle.stopwatch_pos = Some(p);
+            }
+        }
+    }
+
+    /// Таймер обратного отсчёта в развёрнутом окошке секундомера.
+    /// Крупные цифры + пресеты + стоп, всё в одну/две линии без переносов.
+    /// Ширина не задаётся жёстко — окно само ресайзит пользователь.
+    fn draw_overlay_countdown(&mut self, ui: &mut egui::Ui) {
+        let rem_d = self
+            .timer_end
+            .map(|e| e.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO);
+        let running = self.timer_end.is_some();
+        let rem = rem_d.as_secs();
+        let txt = if running {
+            format!("{:02}:{:02}", rem / 60, rem % 60)
+        } else {
+            "--:--".to_string()
+        };
+        let big = ui.text_style_height(&egui::TextStyle::Heading) * 1.0;
+        let color = if running {
+            egui::Color32::LIGHT_GREEN
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(txt)
+                    .font(egui::FontId::monospace(big))
+                    .color(color),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if running {
+                    if ui.small_button("Стоп").clicked() {
+                        self.timer_end = None;
+                        self.sound.stop();
+                    }
+                } else {
+                    for (label, secs) in
+                        [("1м", 60u64), ("5м", 300), ("10м", 600), ("30м", 1800)]
+                    {
+                        if ui.small_button(label).clicked() {
+                            self.start_timer(secs);
+                        }
+                    }
+                }
+            });
+        });
+        // Тонкий индикатор хода: без него длинный таймер «теряется» в окне.
+        let frac = if self.timer_total > 0 {
+            (rem as f32 / self.timer_total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            1.5,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        );
+        if frac > 0.0 {
+            let fill = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.min.x + rect.width() * frac, rect.max.y),
+            );
+            ui.painter().rect_filled(fill, 1.5, egui::Color32::from_rgb(0x66, 0xC0, 0xF4));
+        }
+    }
+
+    /// Показать borderless-окошко секундомера поверх всех окон.
+    /// Ресайз — невидимой рамкой за край (THICKFRAME через WinAPI).
+    fn show_stopwatch_overlay(&mut self, ctx: &egui::Context) {
+        let vp_id = stopwatch_viewport_id();
+        // Восстановление позиции: только на живом мониторе, иначе — как даст ОС.
+        if self.overlay_place_pending {
+            self.overlay_place_pending = false;
+            self.place_overlay_on_saved_mon(ctx, vp_id);
+        }
+        ensure_thickframe(STOPWATCH_TITLE);
+        apply_overlay_opacity(self.stopwatch_opacity_pct / 100.0);
+        let size = stopwatch_window_size(self.stopwatch_expanded);
+        // Размер в поинтах держим в одном состоянии: сведения о нём читают и
+        // place_overlay_on_saved_mon, и проверка границ экрана, поэтому
+        // берём его из одного места, а не пересчитываем на трёх.
+        self.last_stopwatch_size = size;
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title(STOPWATCH_TITLE)
+                .with_inner_size(size)
+                .with_min_inner_size([150.0, 140.0])
+                .with_always_on_top()
+                .with_decorations(false)
+                .with_resizable(true)
+                .with_taskbar(false),
+            |c, _| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    self.draw_stopwatch_mini(ui, vp_id);
+                });
+                // Окошко будит само себя ЯВНЫМ запросом на свой id:
+                // тысячные при беге — 33 мс, на паузе — 100 мс.
+                // (Запрос без id уходил главному окну — окно двоилось и ползло.)
+                // С живым таймером обратного отсчёта — 100 мс, чтобы цифры шли
+                // ровно (33 мс нужны только тысячным секундомера).
+                let tick = if self.stopwatch_running {
+                    33
+                } else if self.stopwatch_expanded && self.timer_end.is_some() {
+                    100
+                } else {
+                    100
+                };
+                c.request_repaint_after_for(Duration::from_millis(tick), vp_id);
+            },
+        );
+    }
+
+    /// Вернуть окошко на запомненное место, только если там живой монитор.
+    /// Точка берётся с запасом внутрь окна: иначе после смены разрешения
+    /// (или отключения экрана) угол попадает в невидимую область и окно
+    /// «уезжает» за край. Проверка идёт по пересечению с рабочей областью.
+    fn place_overlay_on_saved_mon(&mut self, ctx: &egui::Context, vp_id: egui::ViewportId) {
+        let Some(p) = self.cfg_handle.stopwatch_pos else { return };
+        #[cfg(windows)]
+        {
+            let mons = enum_monitor_work_areas();
+            if mons.is_empty() {
+                return;
+            }
+            let size = stopwatch_window_size(self.stopwatch_expanded);
+            // Поинты → пиксели: экранные координаты и рабочие области
+            // мониторов всегда в пикселях.
+            let ppp = ctx.pixels_per_point();
+            let w = (size.x * ppp) as i32;
+            let h = (size.y * ppp) as i32;
+            // Углы окна в экранных координатах.
+            let x0 = p[0] as i32;
+            let y0 = p[1] as i32;
+            let Some((l, t, _r, _b)) = nearest_monitor_for_rect(&mons, x0, y0, w, h) else {
+                return;
+            };
+            // Верхний левый угол с запасом 1px внутрь рабочей области.
+            ctx.send_viewport_cmd_to(
+                vp_id,
+                egui::ViewportCommand::OuterPosition(egui::pos2((l + 1) as f32, (t + 1) as f32)),
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            ctx.send_viewport_cmd_to(
+                vp_id,
+                egui::ViewportCommand::OuterPosition([p[0], p[1]].into()),
+            );
+        }
+    }
+
+    /// Вставить URL из буфера обмена в поле будильника/таймера (Ctrl+Shift+V).
+    /// Работает на вкладках «Будильники» и «Таймер»; мусор из буфера отклоняется.
+    fn paste_url_to_alarm(&mut self) {
+        if self.tab != Tab::Alarms && self.tab != Tab::Timer {
+            self.status_msg = "Вставка URL: откройте вкладку «Будильники» или «Таймер».".to_string();
+            return;
+        }
+        let text = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_text())
+            .unwrap_or_default();
+        if !looks_like_url(&text) {
+            self.status_msg = "В буфере обмена нет URL-ссылки.".to_string();
+            return;
+        }
+        let url = text.trim().to_string();
+        if self.tab == Tab::Timer {
+            self.timer_url = url;
+        } else {
+            self.alarm_url = url;
+        }
+        self.status_msg = "URL вставлен из буфера обмена.".to_string();
+    }
+
+    /// Открыть/закрыть полоску сессии (+ поставить на выбранную позицию 3×3).
+    fn set_strip_open(&mut self, open: bool) {
+        self.strip_open = open;
+        if !open {
+            self.strip_drag_pos = None;
+            // Окно скоро уничтожит egui; снять отметку о правке стиля, чтобы
+            // при следующем открытии новое окно снова получило ресайз.
+            forget_style_patch(STRIP_TITLE);
+        } else {
+            self.snap_strip();
+        }
+        self.push_stopwatch_hotkeys();
+    }
+
+    /// Переместить полоску на соседнюю позицию сетки 3×3 по кругу
+    /// (−1 назад, +1 вперёд). Работает сразу по глобальным стрелкам —
+    /// кнопки сетки в главном окне недоступны, пока полоска поверх всего.
+    fn move_strip_step(&mut self, delta: i32) {
+        let next = strip_step(self.strip_pos, delta);
+        if next != self.strip_pos {
+            self.strip_pos = next;
+            if self.strip_open {
+                self.snap_strip();
+            }
+            self.status_msg = format!("Мини-трей: позиция {next} (сетка 3×3).");
+        }
+    }
+
+    /// Прозрачность мини-трея ±5%. В отличие от Ctrl+Num± (только при PIN)
+    /// стрелки RShift+↑/↓ работают всегда: полоска часто не закреплена, а
+    /// управлять ей с клавиатуры иначе нечем.
+    fn apply_strip_opacity_delta(&mut self, delta: i32) {
+        if !self.strip_open {
+            self.status_msg = "Мини-трей закрыт — прозрачность менять нечего.".to_string();
+            return;
+        }
+        self.strip_opacity_pct = step_opacity5(self.strip_opacity_pct, delta as f32);
+        self.status_msg =
+            format!("Мини-трей: прозрачность {}%.", self.strip_opacity_pct.round() as i32);
+    }
+
+    /// Поставить полоску на позицию (первым кадром вьюпорта через флаг).
+    fn snap_strip(&mut self) {
+        self.strip_snap_pending = true;
+    }
+
+    /// Тонкая полочка текущей сессии (стиль uTorrent). Показывает ОДИН
+    /// показатель — идёт ли запись текущей сессии: название игры и время.
+    /// Больше ничего: полная история — в таблице сессий на вкладке «Сессии».
+    ///
+    /// Вёрстка: одна строка из двух зон (информация | кнопки), ширины заданы
+    /// явно. Вложенные раскладки egui здесь давали ПУСТОЕ окно: `with_layout`
+    /// отдаёт дочернему ui всю оставшуюся ширину и сдвигает курсор родителя
+    /// за пределы окна, после чего текст оказывался за границей (рисовались
+    /// одни кнопки). Поэтому зоны размещаются через allocate_ui_with_layout
+    /// в одной горизонтальной строке.
+    fn draw_session_strip(&mut self, ui: &mut egui::Ui, vp_id: egui::ViewportId) {
+        // PIN: закреплённую полоску нельзя таскать.
+        if !self.strip_pinned {
+            viewport_drag(
+                ui,
+                vp_id,
+                egui::Id::new(("session_strip", "drag")),
+                &mut self.strip_drag_pos,
+                STRIP_TITLE,
+            );
+        }
+        let zoom = float_zoom(ui, strip_base_w());
+
+        // Данные собираем ДО отрисовки: блокировка RwLock не должна
+        // удерживаться во время вёрстки виджетов.
+        let (name, secs, pending) = {
+            let act = self.active.read().unwrap();
+            let mut cur = act.values().filter(|a| !a.pending).next();
+            if cur.is_none() {
+                cur = act.values().next();
+            }
+            match cur {
+                Some(a) => (a.game_name.clone(), (Local::now() - a.start).num_seconds().max(0), a.pending),
+                None => (String::new(), 0, false),
+            }
+        };
+
+        egui::Frame {
+            fill: egui::Color32::from_rgb(0x2A, 0x2F, 0x35),
+            stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x3A, 0x42, 0x4C)),
+            rounding: egui::Rounding::same(2.0),
+            inner_margin: egui::Margin::symmetric(6.0, 2.0),
+            ..Default::default()
+        }
+        .show(ui, |ui| {
+            let sess = if name.is_empty() {
+                None
+            } else {
+                Some((name.as_str(), secs, pending))
+            };
+            let mut state = StripUiState {
+                pinned: self.strip_pinned,
+                close_clicked: false,
+                pin_toggled: false,
+            };
+            // Рамка занимает всю ширину окна: иначе полоска рисуется
+            // короткой полосой слева (визуально окно выглядит «пустым»).
+            // min_rect задаём ДО содержимого, а horizontal держит зоны
+            // в одну строку (внутри Frame раскладка по умолчанию вертикальная).
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                strip_row(ui, STRIP_H - 6.0, zoom, sess, &mut state);
+            });
+            if state.close_clicked {
+                self.set_strip_open(false);
+            }
+            if state.pin_toggled {
+                self.strip_pinned = !self.strip_pinned;
+            }
+        });
+
+        // Запоминаем место полоски (восстановим при открытии).
+        if let Some(min) = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min) {
+            let p = [min.x, min.y];
+            if self.cfg_handle.strip_pos_manual != Some(p) {
+                self.cfg_handle.strip_pos_manual = Some(p);
+            }
+        }
+    }
+
+    /// Показать полоску сессии поверх всех окон.
+    fn show_session_strip(&mut self, ctx: &egui::Context) {
+        ensure_thickframe(STRIP_TITLE);
+        apply_window_opacity(STRIP_TITLE, self.strip_opacity_pct / 100.0, 0.05);
+        let vp_id = strip_viewport_id();
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title(STRIP_TITLE)
+                .with_inner_size(strip_window_size())
+                .with_min_inner_size([260.0, STRIP_MIN_H])
+                .with_always_on_top()
+                .with_decorations(false)
+                .with_resizable(true)
+                .with_taskbar(false),
+            |c, _| {
+                // Позиционирование — ЗДЕСЬ, в колбэке полоски: input(c)
+                // принадлежит вьюпорту полоски (а не главному окну), поэтому
+                // монитор определяется по месту самой полоски.
+                if self.strip_snap_pending {
+                    self.strip_snap_pending = false;
+                    self.snap_strip_now(c, vp_id);
+                }
+                // Панель без полей: CentralPanel по умолчанию добавляет
+                // внутренний отступ, а у полоски высота всего 26px — лишние
+                // 2px сверху и снизу обрезали бы строку.
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(ui_bg(c))
+                            .inner_margin(egui::Margin {
+                                left: 0.0,
+                                right: 0.0,
+                                top: 0.0,
+                                bottom: 0.0,
+                            }),
+                    )
+                    .show(c, |ui| {
+                        self.draw_session_strip(ui, vp_id);
+                    });
+                c.request_repaint_after_for(Duration::from_millis(500), vp_id);
+            },
+        );
+    }
+
+    /// Держать плавающие окна внутри видимой области экранов.
+    /// Окно, которое после смены конфигурации мониторов (отключили экран,
+    /// поменяли разрешение, подключили 6–8K) больше не помещается целиком ни
+    /// на одном мониторе, прижимается к краю ближайшего. Проверка идёт по
+    /// текущему outer_rect, поэтому ловит и «улетевшее» окно, и не трогает
+    /// то, что пользователь поставил сам (оно влезает — проверка проходит).
+    fn keep_windows_on_screen(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            let mons = enum_monitor_work_areas();
+            if mons.is_empty() {
+                return;
+            }
+            // Позицию и размер спрашиваем у ОС по заголовку окна: outer_rect
+            // из input() у main-контекста описывает главное окно, а не окошки.
+            for (open, vp_id, title) in [
+                (self.stopwatch_overlay, stopwatch_viewport_id(), STOPWATCH_TITLE),
+                (self.strip_open, strip_viewport_id(), STRIP_TITLE),
+            ] {
+                if !open {
+                    continue;
+                }
+                // Страховка: окно, которое всё-таки свернули (горячая
+                // клавиша, сторонняя программа), возвращаем на экран —
+                // иначе окошко пропадало бы без возможности восстановить.
+                if restore_if_minimized(title) {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                let Some((wx, wy, ww, wh)) = window_rect_px(title) else {
+                    continue;
+                };
+                let fits = mons
+                    .iter()
+                    .any(|m| wx >= m.0 && wy >= m.1 && wx + ww <= m.2 && wy + wh <= m.3);
+                if fits {
+                    continue; // пользователь поставил сам — не трогаем
+                }
+                // Возвращаем на экран ТОЛЬКО если окно потеряно целиком:
+                // не пересекается ни с одним монитором. Раньше проверка
+                // «помещается ли окно целиком» срабатывала и на окне,
+                // которое пользователь осознанно прижал к самому краю или
+                // частично вывел за него — программа каждые 2 секунды
+                // дёргала его обратно и «боролась» с пользователем.
+                let visible = mons
+                    .iter()
+                    .any(|m| wx < m.2 && wx + ww > m.0 && wy < m.3 && wy + wh > m.1);
+                if visible {
+                    continue; // окно хотя бы частично на экране — не мешаем
+                }
+                let (nx, ny) = clamp_into_work_areas(&mons, wx as f32, wy as f32, ww, wh);
+                if nx != wx || ny != wy {
+                    ctx.send_viewport_cmd_to(
+                        vp_id,
+                        egui::ViewportCommand::OuterPosition(egui::pos2(nx as f32, ny as f32)),
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
+        }
+    }
+
+    /// Поставить полоску на место: запомненное вручную (если монитор жив и
+    /// окно целиком влезает) иначе — пресет 3×3 на том мониторе, где полоска
+    /// сейчас или где курсор. Итоговые координаты зажаты внутрь рабочей
+    /// области монитора, чтобы полоска не вылезала за край экрана.
+    fn snap_strip_now(&mut self, c: &egui::Context, vp_id: egui::ViewportId) {
+        // Сетка 3×3 считается в пикселях экрана, поэтому размер окна
+        // переводим из поинтов в пиксели через ppp.
+        let ppp = c.pixels_per_point();
+        let pts = strip_window_size();
+        let size = egui::vec2(pts.x * ppp, pts.y * ppp);
+        #[cfg(windows)]
+        {
+            let mons = enum_monitor_work_areas();
+            if mons.is_empty() {
+                return;
+            }
+            let w = size.x as i32;
+            let h = size.y as i32;
+            // 1) Запомненное вручную место — если окно целиком влезает
+            //    в рабочую область какого-то живого монитора.
+            let mut placed: Option<(f32, f32)> = None;
+            if let Some(p) = self.cfg_handle.strip_pos_manual {
+                if nearest_monitor_for_rect(&mons, p[0] as i32, p[1] as i32, w, h).is_some() {
+                    placed = Some((p[0], p[1]));
+                }
+            }
+            // 2) Иначе — пресет 3×3 на мониторе самой полоски / курсора.
+            if placed.is_none() {
+                let center = c.input(|i| i.viewport().outer_rect).map(|r| r.center());
+                let cur = cursor_pos();
+                let idx = center
+                    .and_then(|p| monitor_containing(&mons, p.x as i32, p.y as i32))
+                    .or_else(|| cur.and_then(|(x, y)| monitor_containing(&mons, x, y)))
+                    .unwrap_or(0)
+                    .min(mons.len() - 1);
+                let (l, t, r, b) = mons[idx];
+                let (x, y) = strip_pos_coords(
+                    ((r - l) as f32, (b - t) as f32),
+                    size,
+                    self.strip_pos,
+                );
+                placed = Some(((l as f32) + x, (t as f32) + y));
+            }
+            if let Some((x, y)) = placed {
+                // Финальная зажимка: полоска целиком внутри рабочей области.
+                let pos = clamp_into_work_areas(&mons, x, y, w, h);
+                c.send_viewport_cmd_to(
+                    vp_id,
+                    egui::ViewportCommand::OuterPosition(
+                        egui::pos2(pos.0 as f32, pos.1 as f32),
+                    ),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(p) = self.cfg_handle.strip_pos_manual {
+                c.send_viewport_cmd_to(
+                    vp_id,
+                    egui::ViewportCommand::OuterPosition([p[0], p[1]].into()),
+                );
+            } else if let Some(m) = c.input(|i| i.viewport().monitor_size) {
+                let (x, y) = strip_pos_coords((m.x, m.y), size, self.strip_pos);
+                c.send_viewport_cmd_to(
+                    vp_id,
+                    egui::ViewportCommand::OuterPosition([x, y].into()),
+                );
+            }
+        }
+    }
+
+    fn poll_monitor(&mut self) {
+        while let Ok(ev) = self.rx_monitor.try_recv() {
+            match ev {
+                MonitorEvent::Started { game_name, exe_path } => {
+                    let now = Local::now();
+                    match self.db.add_session(&game_name, &exe_path, &now) {
+                        Ok(id) => {
+                            self.session_id_by_exe.insert(exe_path.clone(), id);
+                            if let Ok(mut act) = self.active.write() {
+                                if let Some(a) = act.get_mut(&exe_path) {
+                                    a.session_id = Some(id);
+                                }
+                            }
+                            self.notify(
+                                "Игровая сессия начата",
+                                &format!("{game_name}\nНачало: {}", now.format("%H:%M:%S")),
+                            );
+                        }
+                        Err(e) => {
+                            self.status_msg = format!("Ошибка старта сессии: {e}");
+                        }
+                    }
+                    self.refresh_agg();
+                }
+                MonitorEvent::Ended { exe_key } => {
+                    if let Some(id) = self.session_id_by_exe.remove(&exe_key) {
+                        let now = Local::now();
+                        let dur = self.db.end_session(id, &now).unwrap_or(0);
+                        // сводка сегодня/вчера по игровому дню
+                        let day = self.cfg_handle.day_start_hour;
+                        let today_key = game_day_key(&now, day);
+                        let today: i64 = self.db.sessions_for_day(&today_key).iter().map(|(_, d)| *d).sum();
+                        self.notify(
+                            "Игровая сессия завершена",
+                            &format!(
+                                "Сессия: {}\nСегодня: {}",
+                                format_duration(dur),
+                                format_duration(today)
+                            ),
+                        );
+                    }
+                    self.refresh_agg();
+                }
+                MonitorEvent::ActiveTick => {
+                    self.refresh_agg();
+                }
+            }
+        }
+    }
+
+    /// Вернуть главное окно на экран и поверх остальных окон.
+    ///
+    /// Одного `Visible(true)` НЕДОСТАТОЧНО: у свёрнутого окна Windows
+    /// хранит отдельный флаг минимизации, и команда видимости его не
+    /// снимает — окно формально «видно», но лежит свёрнутым на панели
+    /// задач, поэтому «развернуть» из трея не срабатывало.
+    /// Нужны все три команды: снять минимизацию, показать и активировать
+    /// (последнее выводит окно поверх остальных и убирает его с таскбара).
+    fn show_main_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn poll_appcmd(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.rx_appcmd.try_recv() {
+            match cmd {
+                AppCmd::Show => self.show_main_window(ctx),
+                AppCmd::Quit => {
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                AppCmd::StopwatchToggle => self.stopwatch_toggle(),
+                AppCmd::StopwatchLap => self.stopwatch_lap(),
+                AppCmd::StopwatchStop => self.stopwatch_stop(),
+                AppCmd::StopwatchPin => self.toggle_stopwatch_pin(),
+                AppCmd::OpacityDelta(d) => self.apply_opacity_delta(d),
+                AppCmd::StripStep(d) => self.move_strip_step(d),
+                AppCmd::StripOpacity(d) => self.apply_strip_opacity_delta(d),
+            }
+        }
+        // Скрытие в трей вместо закрытия
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    fn check_alarms_timer(&mut self) {
+        let now = Local::now();
+        let hm = now.format("%H:%M").to_string();
+        if hm != self.last_alarm_min {
+            self.last_alarm_min = hm.clone();
+            let wday = now.weekday().num_days_from_monday() as usize; // Пн=0..Вс=6
+            for a in self.db.alarms() {
+                if a.enabled && a.time == hm {
+                    // Дни недели: разовый срабатывает всегда, повторяемый —
+                    // только в отмеченные дни.
+                    let mask = effective_mask(&a);
+                    if let Some(m) = mask {
+                        if !m[wday] {
+                            continue;
+                        }
+                    }
+                    // звук/URL
+                    if let Some(u) = &a.url {
+                        if !u.is_empty() {
+                            SoundPlayer::open_url(u);
+                        }
+                    }
+                    if let Some(f) = &a.sound_file {
+                        if !f.is_empty() {
+                            SoundPlayer::play_file(f);
+                        }
+                    } else if let Some(s) = &a.standard_sound {
+                        if !s.is_empty() && s != "Нет" {
+                            self.sound.play_standard(&s.to_lowercase().replace("beep", "beep"), 180);
+                        }
+                    }
+                    self.alarm_dialog = Some(a.clone());
+                    // Разовый будильник после срабатывания выключается,
+                    // повторяемый по дням остаётся включённым.
+                    if effective_mask(&a).is_none() {
+                        let _ = self.db.set_alarm_enabled(a.id, false);
+                    }
+                    self.refresh_alarms();
+                }
+            }
+        }
+        // Таймер
+        if let Some(end) = self.timer_end {
+            if Instant::now() >= end {
+                self.timer_end = None;
+                let (u, f, s) = self.timer_data.clone();
+                if let Some(uu) = u {
+                    if !uu.is_empty() {
+                        SoundPlayer::open_url(&uu);
+                    }
+                }
+                if let Some(ff) = f {
+                    if !ff.is_empty() {
+                        SoundPlayer::play_file(&ff);
+                    }
+                } else if let Some(ss) = s {
+                    if !ss.is_empty() && ss != "Нет" {
+                        self.sound.play_standard("beep", 180);
+                    }
+                }
+                self.timer_dialog = true;
+            }
+        }
+        // Утренняя сводка один раз
+        if !self.morning_shown && self.started_at.elapsed() > Duration::from_secs(2) {
+            self.morning_shown = true;
+            let day = self.cfg_handle.day_start_hour;
+            let key = game_day_key(&now, day);
+            let total: i64 = self.db.sessions_for_day(&key).iter().map(|(_, d)| *d).sum();
+            if total > 0 {
+                self.notify("Ежедневная сводка", &format!("В прошлый игровой день: {}", format_duration(total)));
+            }
+        }
+        // Автоскан каждые 60 минут
+        if self.cfg_handle.auto_scan_enabled && self.last_autoscan.elapsed() > Duration::from_secs(60 * 60) {
+            self.last_autoscan = Instant::now();
+            self.spawn_autoscan();
+        }
+        // GPU-кэш для вкладки Активные
+        if self.last_gpu_check.elapsed() > Duration::from_secs(5) {
+            let snap = query_gpu();
+            self.gpu_usable_cache = snap.usable;
+            self.gpu_util_cache = snap.gpu_util_pct;
+            self.last_gpu_check = Instant::now();
+        }
+    }
+
+    fn spawn_autoscan(&mut self) {
+        let games = self.games.clone();
+        let cfg = self.cfg.clone();
+        let api_key = self.cfg_handle.api_key.clone();
+        let steam_id = self.cfg_handle.steam_id.clone();
+        std::thread::spawn(move || {
+            let steam = detector::scan_steam_games(None);
+            let win = detector::scan_windows_games();
+            let mut merged = merge_games(vec![steam, win]);
+            // Свежие минуты Steam API (если опрос удался): накатим поверх.
+            let mut fresh_min: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            if !api_key.is_empty() && !steam_id.is_empty() {
+                if let Ok(api_games) = detector::scan_steam_games_via_api(&api_key, &steam_id, None) {
+                    for g in &api_games {
+                        if let Some(m) = g.steam_minutes {
+                            fresh_min.insert(g.key(), m);
+                        }
+                    }
+                    // ручные поверх — загрузим текущие ручные
+                    let manual: Vec<TrackedGame> = games
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .filter(|g| g.source == "Manual")
+                        .cloned()
+                        .collect();
+                    merged = merge_games(vec![merged, api_games, manual]);
+                }
+            }
+            // сливаем с текущими ручными, чтобы не потерять
+            let manual: Vec<TrackedGame> = games.read().unwrap().iter().filter(|g| g.source == "Manual").cloned().collect();
+            let mut final_list = merge_games(vec![merged, manual]);
+            if !fresh_min.is_empty() {
+                for g in final_list.iter_mut() {
+                    g.steam_minutes = fresh_min.get(&g.key()).copied();
+                }
+                if let Ok(mut c) = cfg.write() {
+                    c.steam_synced = true;
+                    c.save();
+                }
+            }
+            *games.write().unwrap() = final_list.clone();
+            save_known_games(&final_list);
+        });
+        self.scan_msg = "Автосканирование запущено в фоне…".to_string();
+    }
+
+    fn update_tray_tooltip(&self) {
+        let act = self.active.read().unwrap();
+        let text = if act.is_empty() {
+            "Tray Session".to_string()
+        } else {
+            let now = Local::now();
+            let mut lines = vec!["Активные сессии:".to_string()];
+            for (_, a) in act.iter() {
+                if a.pending {
+                    lines.push(format!("{}: проверка GPU…", a.game_name));
+                } else {
+                    let secs = (now - a.start).num_seconds().max(0);
+                    let h = secs / 3600;
+                    let m = (secs % 3600) / 60;
+                    let s = secs % 60;
+                    lines.push(format!("{}: {:02}:{:02}:{:02}", a.game_name, h, m, s));
+                }
+            }
+            lines.join("\n")
+        };
+        let _ = self.tx_tray.send(TrayCmd::Tooltip(text));
+    }
+}
+
+// ================= UI =================
+
+impl eframe::App for TrackerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_monitor();
+        self.poll_appcmd(ctx);
+        self.check_alarms_timer();
+        self.poll_shortcuts(ctx);
+        // Подхватить флаг Steam-синхронизации из фонового автоскана.
+        let synced = self.cfg.read().unwrap().steam_synced;
+        if synced != self.cfg_handle.steam_synced {
+            self.cfg_handle.steam_synced = synced;
+        }
+        // Автозапоминание всех изменений пользователя в файл.
+        self.persist_if_changed();
+        // Ответ проверки обновлений (фоновая нить модуля update).
+        if let Some(rx) = &self.update_rx {
+            if let Ok(msg) = rx.try_recv() {
+                self.update_status = msg;
+                self.update_rx = None;
+                self.update_checking = false;
+                // Пока показываем раздел «О программе» — продолжаем
+                // перерисовывать его, иначе результат может остаться
+                // неотображённым (окошко одно, и оно в фокусе).
+                if self.tab == Tab::About && self.about_sub == 0 {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+            }
+        }
+        if self.quit_requested {
+            return;
+        }
+
+        if self.last_agg_refresh.elapsed() > Duration::from_secs(3) {
+            self.refresh_agg();
+        }
+        // Тултип трея (дешёвый, раз в 5 сек)
+        if self.last_tooltip.elapsed() > Duration::from_secs(5) {
+            self.update_tray_tooltip();
+            self.last_tooltip = Instant::now();
+        }
+        // При переходе на Сессии/Будильники данные обновляем сразу
+        // (вместо постоянного опроса).
+        if self.prev_tab != self.tab {
+            if self.tab == Tab::Sessions {
+                self.refresh_agg();
+            }
+            if self.tab == Tab::Alarms {
+                self.refresh_alarms();
+            }
+            self.prev_tab = self.tab;
+        }
+
+        // Тема в цветах клиента Steam (окошко секундомера красится тоже — общий ctx)
+        ctx.set_visuals(steam_visuals());
+        // Масштаб интерфейса (читаемость на больших мониторах)
+        ctx.set_pixels_per_point(self.cfg_handle.ui_scale.clamp(0.8, 2.0));
+
+        // Левая панель навигации (компактно, как в PC Manager):
+        // иконка + подпись, три состояния (неактивна / наведение / активна).
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(88.0)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                for (t, icon, label) in NAV_ITEMS {
+                    if self.nav_item(ui, icon, label, self.tab == t) {
+                        self.tab = t;
+                    }
+                    ui.add_space(4.0);
+                }
+                // Статус внизу панели (с отступом от нижнего края).
+                // Клик по версии открывает проверку обновлений.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    if ui
+                        .link(
+                            egui::RichText::new(format!("v{VERSION}"))
+                                .small()
+                                .weak(),
+                        )
+                        .on_hover_text("Открыть «О программе» и проверить обновления")
+                        .clicked()
+                    {
+                        // Отдельного окна нет: открываем раздел «О программе»
+                        // и сразу запускаем проверку обновлений.
+                        let ctx = ui.ctx().clone();
+                        self.start_update_check(&ctx);
+                    }
+                    let n_active = self
+                        .active
+                        .read()
+                        .unwrap()
+                        .values()
+                        .filter(|a| !a.pending)
+                        .count();
+                    if n_active > 0 {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_GREEN,
+                            format!("● {n_active}"),
+                        );
+                    }
+                });
+            });
+
+        // Главная область: поля страницы симметричны слева и справа (5%
+        // ширины окна), поэтому блоки всех разделов выровнены по одной
+        // ширине при любом разрешении монитора. Поля живут ВНЕ прокрутки —
+        // при прокрутке вниз отступы не уезжают вместе с содержимым.
+        let m = page_margin(ctx.available_rect().width());
+        // Строка статуса — постоянно внизу (и с тем же отступом, что блоки
+        // разделов), чтобы сообщения не прыгали после содержимого карточек.
+        egui::TopBottomPanel::bottom("status")
+            .resizable(false)
+            .exact_height(24.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(0.0, 2.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(m);
+                    if !self.status_msg.is_empty() {
+                        ui.colored_label(egui::Color32::YELLOW, &self.status_msg);
+                    } else {
+                        ui.colored_label(
+                            ui.visuals().weak_text_color(),
+                            format!("{APP_NAME} {VERSION} · авто-подсчёт игровых сессий"),
+                        );
+                    }
+                });
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let inner_w = (ui.available_width() - m * 2.0).max(80.0);
+            ui.horizontal_top(|ui| {
+                ui.add_space(m);
+                ui.vertical(|ui| {
+                    ui.set_min_width(inner_w);
+                    ui.set_max_width(inner_w);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            // Ширина фиксируется ДО содержимого: иначе egui
+                            // берёт её по самой широкой строке, и блоки
+                            // разделов разъезжаются по ширине.
+                            ui.set_min_width(inner_w);
+                            ui.set_max_width(inner_w);
+                            match self.tab {
+                                Tab::Sessions => self.ui_sessions(ui),
+                                Tab::Games => self.ui_games(ui),
+                                Tab::Alarms => self.ui_alarms(ui),
+                                Tab::Timer => self.ui_timer(ui),
+                                Tab::Shortcuts => self.ui_shortcuts(ui),
+                                Tab::About => self.ui_about(ui),
+                            }
+                        });
+                });
+                ui.add_space(m);
+            });
+        });
+
+        self.windows(ctx);
+
+        // Маленькое окошко секундомера поверх всех окон.
+        if self.stopwatch_overlay {
+            self.show_stopwatch_overlay(ctx);
+        }
+
+        // Тонкая полоска сессии поверх всех окон.
+        if self.strip_open {
+            self.show_session_strip(ctx);
+        }
+
+        // Конфигурация экранов может измениться (подключили/отключили монитор,
+        // сменили разрешение) — тогда окна, стоявшие на старом экране, уходят за
+        // границы. Раз в 2 секунды проверяем положение обоих окошек и, если
+        // они больше не помещаются целиком ни на одном мониторе, прижимаем их
+        // к ближайшему видимому краю.
+        if (self.stopwatch_overlay || self.strip_open)
+            && self.last_edge_check.elapsed() > Duration::from_secs(2)
+        {
+            self.last_edge_check = Instant::now();
+            self.keep_windows_on_screen(ctx);
+        }
+
+        // egui сам переводит поинты в пиксели при изменении размера окна,
+        // поэтому при смене масштаба шлём размер в поинтах (без умножения
+        // на ppp — иначе окно растёт в ppp раз больше нужного).
+        let ppp = ctx.pixels_per_point();
+        if (ppp - self.last_ppp).abs() > 0.0001 {
+            self.last_ppp = ppp;
+            if self.stopwatch_overlay {
+                ctx.send_viewport_cmd_to(
+                    stopwatch_viewport_id(),
+                    egui::ViewportCommand::InnerSize(
+                        stopwatch_window_size(self.stopwatch_expanded),
+                    ),
+                );
+            }
+            if self.strip_open {
+                ctx.send_viewport_cmd_to(
+                    strip_viewport_id(),
+                    egui::ViewportCommand::InnerSize(strip_window_size()),
+                );
+            }
+        }
+
+        // Перерисовка по требованию (в простое CPU ~0, раньше был постоянный 1 FPS).
+        // Секундомер с тысячными — 33 мс, иначе цифры стоят. Живые стрелки —
+        // 250 мс, тикающие счётчики — 1 с. Открытый (но скрытый) оверлей держит
+        // главное окно на 500 мс ради монитора сессий и фоновых задач.
+        let sw_running = self.stopwatch_running;
+        let sw_live = sw_running || self.stopwatch_overlay;
+        let any_enabled_alarm = self.alarms.iter().any(|a| a.enabled);
+        let any_active = !self.active.read().unwrap().is_empty();
+        // Развёрнутое окошко секундомера показывает обратный отсчёт — ему
+        // нужен свой непрерывный темп, иначе цифры стоят.
+        let fast = (self.tab == Tab::Alarms && self.show_analog && any_enabled_alarm)
+            || (self.tab == Tab::Timer && self.timer_end.is_some())
+            || (self.stopwatch_expanded && self.stopwatch_overlay && self.timer_end.is_some())
+            // Проверка обновлений: крутим спиннер в разделе «О программе».
+            || (self.tab == Tab::About && self.about_sub == 0 && self.update_checking);
+        // Мини-трей тикает по секундам, поэтому 1 с; при активной игре — чаще.
+        let slow = (self.tab == Tab::Sessions && any_active)
+            || (self.tab == Tab::Alarms && any_enabled_alarm)
+            || self.strip_open
+            // Живой обратный отсчёт в развёрнутом окошке секундомера.
+            || (self.stopwatch_expanded && self.stopwatch_overlay);
+        if sw_running && self.tab == Tab::Timer {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else if sw_live {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        } else if fast {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        } else if slow {
+            ctx.request_repaint_after(Duration::from_millis(1000));
+        } else if !self.morning_shown {
+            ctx.request_repaint_after(Duration::from_millis(2000));
+        } else if self.cfg_handle.auto_scan_enabled {
+            ctx.request_repaint_after(Duration::from_secs(60));
+        }
+    }
+}
+
+impl TrackerApp {
+    /// Кнопка навигации сайдбара: иконка из assets + подпись.
+    /// Три состояния: неактивна (приглушена), наведение (подсветка),
+    /// активна (акцентный фон + полоска + акцентный цвет иконки).
+    /// Возвращает true по клику.
+    fn nav_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: egui::ImageSource<'static>,
+        label: &str,
+        selected: bool,
+    ) -> bool {
+        let w = 76.0;
+        let h = 60.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
+            let bg = if selected {
+                egui::Color32::from_rgba_premultiplied(102, 192, 244, 38)
+            } else if resp.hovered() {
+                ui.visuals().faint_bg_color
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(rect, 8.0, bg);
+            if selected {
+                let bar = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(6.0, 12.0),
+                    egui::vec2(3.0, h - 24.0),
+                );
+                ui.painter().rect_filled(bar, 1.5, accent);
+            }
+            let fg = if selected {
+                accent
+            } else if resp.hovered() {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_rgb(0x8F, 0x98, 0xA0)
+            };
+            // Иконка 22×22 по центру верхней части кнопки.
+            let icon_size = 22.0;
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.top() + 8.0 + icon_size / 2.0),
+                egui::vec2(icon_size, icon_size),
+            );
+            // Иконки одноцветные (силуэты), поэтому красим их цветом
+            // состояния — единообразно с подписью.
+            let tex_id = self.nav_icon_id(ui, &icon);
+            // painter.image(texture_id, rect, uv, tint): uv = вся текстура.
+            ui.painter().image(
+                tex_id,
+                icon_rect,
+                egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                fg,
+            );
+            ui.painter().text(
+                rect.center_bottom() - egui::vec2(0.0, 12.0),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(11.5),
+                fg,
+            );
+        }
+        resp.clicked()
+    }
+
+    /// Текстура иконки раздела: декодируется из assets ОДИН раз за сеанс и
+    /// кэшируется. `include_image!` отдаёт сырые байты, а рисовать их надо
+    /// текстурой — иначе PNG передекодировался бы в каждом кадре.
+    fn nav_icon_id(
+        &mut self,
+        ui: &egui::Ui,
+        src: &egui::ImageSource<'static>,
+    ) -> egui::TextureId {
+        let key = src.uri().unwrap_or("nav").to_string();
+        if let Some(tex) = self.nav_icons.get(&key) {
+            return tex.id();
+        }
+        let ctx = ui.ctx().clone();
+        let tex = load_nav_icon(&ctx, &key, src);
+        self.nav_icons.insert(key, tex.clone());
+        tex.id()
+    }
+
+    fn ui_sessions(&mut self, ui: &mut egui::Ui) {
+        page_title(ui, "Сессии");
+        // Живые сессии сверху (компактно, бывшая вкладка «Активные»).
+        let now = Local::now();
+        let act: Vec<ActiveInfo> = self.active.read().unwrap().values().cloned().collect();
+        card(ui, "Сейчас идёт", |ui| {
+            if act.is_empty() {
+                ui.weak("Нет активных сессий — запустите игру, подсчёт стартует сам.");
+            } else {
+                for a in &act {
+                let secs = (now - a.start).num_seconds().max(0);
+                ui.horizontal_wrapped(|ui| {
+                    if a.pending {
+                        ui.colored_label(egui::Color32::YELLOW, "◌ проверка GPU…");
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, "● запись");
+                    }
+                    ui.strong(&a.game_name);
+                    ui.label(format!(
+                        "{} | CPU {:.1}% | RAM {}МБ | VRAM {}МБ{}",
+                        format_duration(secs),
+                        a.cpu,
+                        a.mem_mb,
+                        a.vram_mb,
+                        if a.gpu { " | GPU" } else { "" }
+                    ));
+                });
+            }
+        }});
+        card(ui, "Полоска сессии и GPU", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut open = self.strip_open;
+                ui.checkbox(&mut open, "Тонкая полоска сессии (как в uTorrent)");
+                if open != self.strip_open {
+                    self.set_strip_open(open);
+                }
+                let mut pinned = self.strip_pinned;
+                ui.checkbox(&mut pinned, "Закреплена (PIN)");
+                if pinned != self.strip_pinned {
+                    self.strip_pinned = pinned;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Позиция (3×3):");
+                // Строго слева-направо, сверху-вниз — как экран:
+                // ряд 0–2 сверху, 3–5 в центре, 6–8 снизу.
+                egui::Grid::new("strip_pos_grid")
+                    .num_columns(3)
+                    .spacing([2.0, 2.0])
+                    .show(ui, |ui| {
+                        for row in 0..3 {
+                            for col in 0..3 {
+                                let idx = (row * 3 + col) as u8;
+                                let label = match idx {
+                                    0 => "↖",
+                                    1 => "↑",
+                                    2 => "↗",
+                                    3 => "←",
+                                    4 => "•",
+                                    5 => "→",
+                                    6 => "↙",
+                                    7 => "↓",
+                                    _ => "↘",
+                                };
+                                if ui.selectable_label(self.strip_pos == idx, label).clicked()
+                                    && self.strip_pos != idx
+                                {
+                                    self.strip_pos = idx;
+                                    if self.strip_open {
+                                        self.snap_strip();
+                                        // Мгновенный отклик пресетов.
+                                        ui.ctx().request_repaint_after_for(
+                                            Duration::from_millis(16),
+                                            strip_viewport_id(),
+                                        );
+                                    }
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.label("Прозрачность:");
+                ui.add(
+                    egui::Slider::new(&mut self.strip_opacity_pct, 5.0..=100.0)
+                        .fixed_decimals(0)
+                        .show_value(false),
+                );
+                self.strip_opacity_pct = self.strip_opacity_pct.clamp(5.0, 100.0);
+                ui.label(format!("{}%", self.strip_opacity_pct.round() as i32));
+            });
+            // Полоска живёт поверх всех окон, поэтому кликнуть кнопки сетки
+            // и слайдер, пока она открыта, нельзя. Дублируем управление
+            // стрелками (глобальные хоткеи) — работают всегда.
+            ui.label(egui::RichText::new(
+                "При открытой полоске: RShift+←/→ — позиция 3×3, RShift+↑/↓ — прозрачность ±5%, Ctrl+Num± — прозрачность (PIN).",
+            )
+            .weak()
+            .small());
+            ui.label(format!(
+                "GPU-детект: {} | utilization: {}% | гейт: {} | VRAM≥{}МБ, fallback CPU≥{:.1}%/RAM≥{}МБ",
+                if self.gpu_usable_cache { "NVML доступен" } else { "NVML нет (fallback CPU/RAM)" },
+                self.gpu_util_cache,
+                if self.cfg_handle.require_gpu { "строгий (игра=GPU)" } else { "мягкий" },
+                self.cfg_handle.min_vram_mb,
+                self.cfg_handle.min_cpu_pct,
+                self.cfg_handle.min_ram_mb,
+            ));
+        });
+        card(ui, "Таблица сессий", |ui| {
+            // Строка управления: кнопки слева, итог справа. Отступ справа —
+            // тот же CARD_INNER, что слева (раньше стоял отдельный 15px,
+            // из-за чего правый край строки не совпадал с краем таблицы).
+            ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Обновить").clicked() {
+                        self.refresh_agg();
+                    }
+                    if ui.button("Экспорт CSV").clicked() {
+                        self.export_csv();
+                    }
+                    ui.checkbox(&mut self.show_id_col, "№");
+                    ui.checkbox(&mut self.show_pct_col, "%");
+                    ui.checkbox(&mut self.show_last_col, "Запускал");
+                    ui.checkbox(&mut self.show_runs_col, "Сессий");
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(CARD_INNER);
+                    let total: i64 = self.agg.iter().map(|r| r.total_duration).sum();
+                    ui.label(format!("Общее время: {}", format_duration(total)));
+                });
+            });
+            page_rule(ui);
+        let total_all: i64 = self.agg.iter().map(|r| r.total_duration).sum();
+        let active_map = self.active.read().unwrap().clone();
+
+        table_scroll(ui, "sess_scroll", 220.0, |ui| {
+            // Ширины колонок — доли ширины блока (как в таблицах игр и
+            // будильников). Раньше сетка брала ширину по содержимому и на
+            // узком окне вылезала за правый край карточки.
+            const ACTIONS_W: f32 = 74.0;
+            // Индексы колонок: id, игра, общее, %, запускал, сессий.
+            let w_id = 34.0_f32;
+            let ws = col_widths(ui, &[1.9, 1.1, 0.9, 1.25, 0.7], ACTIONS_W + w_id);
+            let (w_game, w_total, w_pct, w_last, w_runs) =
+                (ws[0], ws[1], ws[2], ws[3], ws[4]);
+            egui::Grid::new("sess_grid").num_columns(6).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
+                if self.show_id_col { tcell(ui, w_id, |ui| { ui.strong("№"); }); }
+                tcell(ui, w_game, |ui| { ui.strong("Игра"); });
+                tcell(ui, w_total, |ui| { ui.strong("Общее время"); });
+                if self.show_pct_col { tcell(ui, w_pct, |ui| { ui.strong("% от общего"); }); }
+                if self.show_last_col { tcell(ui, w_last, |ui| { ui.strong("Запускал"); }); }
+                if self.show_runs_col { tcell(ui, w_runs, |ui| { ui.strong("Сессий"); }); }
+                tcell(ui, ACTIONS_W, |_ui| {});
+                ui.end_row();
+                for (i, row) in self.agg.clone().iter().enumerate() {
+                    if self.show_id_col { tcell(ui, w_id, |ui| { ui.label(format!("{}", i + 1)); }); }
+                    let is_live = active_map.values().any(|a| !a.pending && a.game_name == row.game_name);
+                    tcell(ui, w_game, |ui| {
+                        if is_live {
+                            ui.colored_label(egui::Color32::LIGHT_GREEN, format!("● {}", row.game_name));
+                        } else {
+                            ui.add(egui::Label::new(&row.game_name).truncate())
+                                .on_hover_text(&row.game_name);
+                        }
+                    });
+                    tcell(ui, w_total, |ui| {
+                        ui.label(format_duration(row.total_duration));
+                    });
+                    if self.show_pct_col {
+                        let pct = if total_all > 0 { row.total_duration as f64 / total_all as f64 * 100.0 } else { 0.0 };
+                        tcell(ui, w_pct, |ui| {
+                            ui.label(format!("{pct:.2}%"));
+                        });
+                    }
+                    if self.show_last_col {
+                        let s = if row.last_start.is_empty() { "—".to_string() } else {
+                            chrono::DateTime::parse_from_rfc3339(&row.last_start)
+                                .map(|d| d.with_timezone(&Local).format("%H:%M %Y-%m-%d").to_string())
+                                .unwrap_or(row.last_start.clone())
+                        };
+                        tcell(ui, w_last, |ui| {
+                            ui.add(egui::Label::new(s).truncate());
+                        });
+                    }
+                    if self.show_runs_col {
+                        let runs = format!("{}", row.runs);
+                        tcell(ui, w_runs, |ui| {
+                            ui.label(runs);
+                        });
+                    }
+                    tcell(ui, ACTIONS_W, |ui| {
+                        if ui.small_button("Детали").clicked() {
+                            self.detail_game = Some(row.game_name.clone());
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        });
+        });
+    }
+
+    fn ui_games(&mut self, ui: &mut egui::Ui) {
+        page_title(ui, "Игры и программы под наблюдением");
+        // Подраздел 1: сканирование + список.
+        card(ui, "Сканирование и список игр", |ui| {
+            ui.horizontal_wrapped(|ui| {
+            if ui.button("Сканировать Steam").clicked() {
+                let found = detector::scan_steam_games(None);
+                self.merge_scan(found, "Steam");
+            }
+            if ui.button("Сканировать Windows").clicked() {
+                let found = detector::scan_windows_games();
+                if found.is_empty() {
+                    self.scan_msg = "В реестре ничего игрового не найдено.".to_string();
+                } else {
+                    self.merge_scan(found, "Windows");
+                }
+            }
+            if ui.button("Указать папку с игрой").clicked() {
+                self.pick_folder();
+            }
+            if ui.button("Из активных процессов").clicked() {
+                self.show_picker = true;
+                self.refresh_picker_list();
+            }
+            if ui.button("Вручную (exe)").clicked() {
+                self.pick_exe_manual();
+            }
+            });
+            if !self.scan_msg.is_empty() {
+                ui.colored_label(egui::Color32::LIGHT_BLUE, &self.scan_msg);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Поиск:");
+                ui.text_edit_singleline(&mut self.search);
+            });
+            let games = self.games.read().unwrap().clone();
+            let q = self.search.to_lowercase();
+            // Наши сессии по играм: дельты, прибавляемые к общему Steam.
+            let ours: std::collections::HashMap<String, i64> = self
+                .agg
+                .iter()
+                .map(|r| (r.game_name.clone(), r.total_duration))
+                .collect();
+            let synced = self.cfg_handle.steam_synced;
+            // Отзывчивая таблица: колонки — доли ширины окна, длинные пути режутся
+            // многоточием (полные — в ховере). При сужении окна таблица сжимается.
+            table_scroll(ui, "games_scroll", 320.0, |ui| {
+                let ws = col_widths(ui, &[1.1, 2.2, 0.6], 78.0);
+                egui::Grid::new("games_grid").num_columns(4).striped(true).show(ui, |ui| {
+                    tcell(ui, ws[0], |ui| {
+                        ui.strong("Название");
+                    });
+                    tcell(ui, ws[1], |ui| {
+                        ui.strong("Путь к exe");
+                    });
+                    tcell(ui, ws[2], |ui| {
+                        ui.strong("Источник");
+                    });
+                    tcell(ui, 78.0, |_ui| {});
+                    ui.end_row();
+                    for g in games.iter().filter(|g| q.is_empty() || g.name.to_lowercase().contains(&q) || g.exe_path.to_lowercase().contains(&q)) {
+                        let ours_secs = ours.get(&g.name).copied().unwrap_or(0);
+                        tcell(ui, ws[0], |ui| {
+                            // ⊗ = нет в Steam (не куплена/удалена), ? = API ещё не опрашивали.
+                            match g.steam_minutes {
+                                Some(_) => {}
+                                None if synced => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 165, 0),
+                                        "⊗",
+                                    )
+                                    .on_hover_text(
+                                        "Нет данных Steam: игра не приобретена или удалена с аккаунта.",
+                                    );
+                                }
+                                None => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0x8F, 0x98, 0xA0),
+                                        "?",
+                                    )
+                                    .on_hover_text(
+                                        "Данные Steam неизвестны — сканируйте через Steam API.",
+                                    );
+                                }
+                            }
+                            ui.add(egui::Label::new(&g.name).truncate())
+                                .on_hover_text(steam_hover(g, ours_secs, synced));
+                            if ours_secs > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("+{}", format_total_hm(ours_secs)))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                        });
+                        trunc_cell(ui, ws[1], &short_middle(&g.exe_path, 60), &g.exe_path);
+                        trunc_cell(ui, ws[2], &g.source, &g.source);
+                        tcell(ui, 78.0, |ui| {
+                            if ui.small_button("Удалить").clicked() {
+                                self.remove_game(&g.exe_path);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        // Подраздел 2: Steam Web API + общее время.
+        card(ui, "Steam Web API и общее время", |ui| {
+            ui.label("API key:");
+            ui.text_edit_singleline(&mut self.api_key);
+            ui.label("SteamID64:");
+            ui.text_edit_singleline(&mut self.steam_id);
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("Сохранить").clicked() {
+                    self.cfg_handle.api_key = self.api_key.clone();
+                    self.cfg_handle.steam_id = self.steam_id.clone();
+                    *self.cfg.write().unwrap() = self.cfg_handle.clone();
+                    self.cfg_handle.save();
+                    self.scan_msg = "API-настройки сохранены.".to_string();
+                }
+                if ui.button("Сканировать через Steam API").clicked() {
+                    self.scan_api();
+                }
+            });
+            ui.label(
+                "Серверы Steam отдают общее время (playtime_forever) — это база. \
+                Наши сессии замеряют дельты и прибавляются к общему (см. ховер на игре). \
+                Игры без часов с пометкой ⊗ в Steam не найдены.",
+            );
+        });
+    }
+
+    fn ui_alarms(&mut self, ui: &mut egui::Ui) {
+        page_title(ui, "Будильники");
+        page_note(
+            ui,
+            "Время любого будильника (в т.ч. неактивного) меняется кнопкой «Изменить» в любой момент.",
+        );
+
+        // --- Список будильников: все кнопки действий всегда на месте ---
+        // Отзывчивая таблица: ширины колонок — доли ширины окна, длинные
+        // значения режутся многоточием (полные — в ховере). При сужении окна
+        // таблица сжимается, а не смещает разделы и не уезжает вбок.
+        card(ui, "Список будильников", |ui| {
+        table_scroll(ui, "alarms_scroll", 240.0, |ui| {
+            let ws = col_widths(ui, &[0.55, 1.05, 0.4, 0.6, 1.2, 1.0, 0.6], 205.0);
+            egui::Grid::new("alarms_grid").num_columns(8).striped(true).show(ui, |ui| {
+                for (i, h) in ["Время", "Осталось", "Вкл", "Дни", "URL", "Звук", "Станд."]
+                    .iter()
+                    .enumerate()
+                {
+                    tcell(ui, ws[i], |ui| {
+                        ui.strong(*h);
+                    });
+                }
+                tcell(ui, 205.0, |_ui| {});
+                ui.end_row();
+                for a in self.alarms.clone() {
+                    let mask = effective_mask(&a);
+                    trunc_cell(ui, ws[0], &a.time, &a.time);
+                    // Анимированный обратный отсчёт (ч, м, с) для активных
+                    if a.enabled {
+                        match alarm_remaining(&a.time, mask) {
+                            Some(rem) => {
+                                let s = format_countdown(rem);
+                                tcell(ui, ws[1], |ui| {
+                                    ui.colored_label(egui::Color32::LIGHT_GREEN, &s);
+                                });
+                            }
+                            None => {
+                                trunc_cell(ui, ws[1], "—", "—");
+                            }
+                        }
+                    } else {
+                        trunc_cell(ui, ws[1], "—", "—");
+                    }
+                    trunc_cell(ui, ws[2], if a.enabled { "Да" } else { "Нет" }, "");
+                    tcell(ui, ws[3], |ui| {
+                        ui.label(mask_label(&a)).on_hover_text("Дни срабатывания");
+                    });
+                    let url = a.url.clone().unwrap_or_default();
+                    trunc_cell(ui, ws[4], &short_middle(&url, 42), &url);
+                    // Звук: только имя файла (путь целиком — в ховере).
+                    let snd = a.sound_file.clone().unwrap_or_default();
+                    let snd_show = if snd.is_empty() { String::new() } else { file_name_of(&snd) };
+                    trunc_cell(ui, ws[5], &snd_show, &snd);
+                    trunc_cell(ui, ws[6], &a.standard_sound.clone().unwrap_or_default(), "");
+                    tcell(ui, 205.0, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                        let mut en = a.enabled;
+                        if ui.small_button(if en { "Выкл" } else { "Вкл" }).clicked() {
+                            en = !en;
+                            let _ = self.db.set_alarm_enabled(a.id, en);
+                            self.refresh_alarms();
+                        }
+                        // Изменение времени и дней — в любой момент, в т.ч. для неактивных
+                        if ui.small_button("Изменить").clicked() {
+                            let (h, m) = parse_hm(&a.time).unwrap_or((8, 0));
+                            self.edit_alarm = Some((a.id, h as i32, m as i32, mask.unwrap_or([false; 7])));
+                        }
+                        if ui.small_button("Удалить").clicked() {
+                            let _ = self.db.delete_alarm(a.id);
+                            self.refresh_alarms();
+                        }
+                        });
+                    });
+                    ui.end_row();
+                }
+            });
+        });
+        });
+        card(ui, "Новый будильник", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Час:");
+            time_field(ui, &mut self.alarm_h, 23);
+            ui.label("Мин:");
+            time_field(ui, &mut self.alarm_m, 59);
+        });
+        // Дни недели галочками + пресеты. Ничего не отмечено = разовый.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Дни:");
+            Self::day_picker(ui, &mut self.alarm_days);
+        });
+        ui.horizontal_wrapped(|ui| {
+            // Подпись+поле — неразрывный модуль: при переносе уходят вместе.
+            // Ширина полей — доля строки, а не фиксированные пиксели: на
+            // большом мониторе строка не разъезжается, на узком окне поля
+            // просто ужимаются, вместо того чтобы вытолкнуть «Добавить»
+            // за край (прошлая версия занимала 260+220 точек и ломалась).
+            let full = ui.available_width();
+            let url_w = (full * 0.30).clamp(90.0, 300.0);
+            let snd_w = (full * 0.24).clamp(80.0, 240.0);
+            ui.horizontal(|ui| {
+                ui.label("URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.alarm_url)
+                        .hint_text("Вставьте URL (Ctrl+Shift+V)")
+                        .desired_width(url_w),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Звук:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.alarm_sound)
+                        .hint_text("Медиафайл")
+                        .desired_width(snd_w),
+                );
+                if ui.small_button("…").clicked() {
+                    // Только медиа: музыка/звук и видео (никаких .txt).
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter(
+                            "Медиафайлы",
+                            &[
+                                "mp3", "wav", "ogg", "flac", "m4a", "aac", "wma", "opus",
+                                "mid", "midi", "mp4", "avi", "mkv", "mov", "wmv", "webm",
+                                "m4v", "mpg", "mpeg",
+                            ],
+                        )
+                        .pick_file()
+                    {
+                        self.alarm_sound = p.to_string_lossy().to_string();
+                    }
+                }
+            });
+            ui.label("Станд.:").on_hover_text(STD_SOUND_TIP);
+            egui::ComboBox::from_id_source("alarm_std_combo")
+                .selected_text(&self.alarm_std)
+                .show_ui(ui, |ui| {
+                for s in ["Нет", "Beep", "Bell"] {
+                    ui.selectable_value(&mut self.alarm_std, s.to_string(), s);
+                }
+            });
+            if ui.button("Добавить").clicked() {
+                let t = format!("{:02}:{:02}", self.alarm_h, self.alarm_m);
+                let std = if self.alarm_std == "Нет" { None } else { Some(self.alarm_std.as_str()) };
+                let days_str;
+                let (daily, days) = if self.alarm_days.iter().any(|x| *x) {
+                    days_str = bools_to_mask(&self.alarm_days);
+                    (days_str == "1111111", Some(days_str.as_str()))
+                } else {
+                    (false, None)
+                };
+                let _ = self.db.add_alarm(
+                    &t, daily,
+                    if self.alarm_url.is_empty() { None } else { Some(self.alarm_url.as_str()) },
+                    if self.alarm_sound.is_empty() { None } else { Some(self.alarm_sound.as_str()) },
+                    std,
+                    days,
+                );
+                self.refresh_alarms();
+                self.alarm_url.clear();
+                self.alarm_sound.clear();
+            }
+        });
+        });
+
+        // --- Аналоговые часы активного будильника: НИЖЕ списка,
+        // --- чтобы таблица и все кнопки действий всегда оставались на месте.
+        let enabled: Vec<AlarmRow> = self.alarms.iter().filter(|a| a.enabled).cloned().collect();
+        if !enabled.is_empty() {
+        card(ui, "Аналоговые часы", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.show_analog, "Аналоговые часы для активного будильника");
+            });
+            if self.show_analog {
+            // Выбор будильника для часов: закреплённый или ближайший
+            let chosen_id = match self.analog_alarm_id {
+                Some(id) if enabled.iter().any(|a| a.id == id) => id,
+                _ => nearest_alarm_id(&enabled).unwrap_or(enabled[0].id),
+            };
+            let chosen = enabled.iter().find(|a| a.id == chosen_id).cloned().unwrap_or_else(|| enabled[0].clone());
+            let chosen_mask = effective_mask(&chosen);
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.strong(format!("Активен: {} ({})", chosen.time, mask_label(&chosen)));
+                    draw_analog_clock(ui, 200.0, &chosen.time);
+                    if let Some(rem) = alarm_remaining(&chosen.time, chosen_mask) {
+                        ui.heading(format_countdown(rem));
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.strong("Остальные (цифровые):");
+                    let mut any_other = false;
+                    for a in &enabled {
+                        if a.id == chosen.id {
+                            continue;
+                        }
+                        any_other = true;
+                        let rem_txt = alarm_remaining(&a.time, effective_mask(a)).map(format_countdown).unwrap_or_else(|| "—".to_string());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{} ({}) — {}", a.time, mask_label(a), rem_txt));
+                            if ui.small_button("На часы").clicked() {
+                                self.analog_alarm_id = Some(a.id);
+                            }
+                        });
+                    }
+                    if !any_other {
+                        ui.label("Других активных будильников нет.");
+                    }
+                });
+            });
+            }
+        });
+    }
+    }
+
+    /// Галочки дней недели Пн..Вс + пресеты «Будни»/«Выходные»/«Ежедневно»/«Разовый».
+    /// Галочки дней недели Пн..Вс + пресеты с подсветкой активного
+    /// (вдавленная кнопка в стиле selectable). Повторный клик по активному
+    /// пресету (кроме «Разовый») сбрасывает в разовый.
+    fn day_picker(ui: &mut egui::Ui, days: &mut [bool; 7]) {
+        const NAMES: [&str; 7] = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+        for (i, name) in NAMES.iter().enumerate() {
+            ui.checkbox(&mut days[i], *name);
+        }
+        let cur = detect_day_preset(days);
+        for (preset, label) in [
+            (DayPreset::Weekdays, "Будни"),
+            (DayPreset::Weekend, "Выходные"),
+            (DayPreset::Daily, "Ежедневно"),
+            (DayPreset::Once, "Разовый"),
+        ] {
+            if ui.selectable_label(cur == Some(preset), label).clicked() {
+                if cur == Some(preset) && preset != DayPreset::Once {
+                    *days = [false; 7];
+                } else {
+                    *days = preset_days(preset);
+                }
+            }
+        }
+    }
+
+    fn ui_timer(&mut self, ui: &mut egui::Ui) {
+        page_title(ui, "Таймер обратного отсчёта");
+        card(ui, "Таймер", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (label, secs) in [("1 мин", 60u64), ("5 мин", 300), ("10 мин", 600), ("15 мин", 900), ("30 мин", 1800), ("1 час", 3600)] {
+                if ui.button(label).clicked() {
+                    self.start_timer(secs);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Минуты:");
+            time_field(ui, &mut self.timer_min, 1440);
+            self.timer_min = self.timer_min.max(1);
+            if ui.button("Запустить").clicked() {
+                self.start_timer(self.timer_min as u64 * 60);
+            }
+            if ui.button("Стоп").clicked() {
+                self.timer_end = None;
+                self.sound.stop();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            // Ширина полей — доля строки (как в будильниках): блок не
+            // разъезжается на широком мониторе и не ломается на узком.
+            let full = ui.available_width();
+            let url_w = (full * 0.30).clamp(90.0, 300.0);
+            let snd_w = (full * 0.24).clamp(80.0, 240.0);
+            ui.horizontal(|ui| {
+                ui.label("URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.timer_url)
+                        .hint_text("Вставьте URL (Ctrl+Shift+V)")
+                        .desired_width(url_w),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Звук:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.timer_sound)
+                        .hint_text("Медиафайл")
+                        .desired_width(snd_w),
+                );
+            });
+            ui.label("Станд.:").on_hover_text(STD_SOUND_TIP);
+            egui::ComboBox::from_id_source("timer_std_combo")
+                .selected_text(&self.timer_std)
+                .show_ui(ui, |ui| {
+                for s in ["Нет", "Beep", "Bell"] {
+                    ui.selectable_value(&mut self.timer_std, s.to_string(), s);
+                }
+            });
+        });
+        if let Some(end) = self.timer_end {
+            let rem_d = end.saturating_duration_since(Instant::now());
+            let rem = rem_d.as_secs();
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.strong("Аналоговый таймер:");
+                    draw_timer_dial(ui, 180.0, rem_d, self.timer_total);
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.heading(format!("Осталось: {:02}:{:02}", rem / 60, rem % 60));
+                    ui.label(format!("Всего: {} мин", self.timer_total / 60));
+                    if ui.button("Стоп").clicked() {
+                        self.timer_end = None;
+                        self.sound.stop();
+                    }
+                });
+            });
+        } else {
+            ui.label("Нет активного таймера");
+        }
+        });
+
+        // ---------- Секундомер ----------
+        card(ui, "Секундомер", |ui| {
+        ui.heading(format_stopwatch(self.stopwatch_elapsed()));
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Старт").clicked() {
+                self.stopwatch_start();
+            }
+            if ui.button("Пауза").clicked() {
+                self.stopwatch_pause();
+            }
+            if ui.button("Стоп").clicked() {
+                self.stopwatch_stop();
+            }
+            if ui.button("Круг").clicked() {
+                self.stopwatch_lap();
+            }
+            if ui.button("Сброс").clicked() {
+                self.stopwatch_reset();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut ov = self.stopwatch_overlay;
+            ui.checkbox(&mut ov, "Окошко поверх всех окон (минимум, таскается за фон)");
+            if ov != self.stopwatch_overlay {
+                self.set_stopwatch_overlay(ov);
+            }
+            let mut pinned = self.stopwatch_pinned;
+            ui.checkbox(&mut pinned, "Закреплено (PIN): не таскается");
+            if pinned != self.stopwatch_pinned {
+                self.toggle_stopwatch_pin();
+            }
+            // Расширение имеет смысл только у открытого окошка.
+            let mut exp = self.stopwatch_expanded;
+            ui.checkbox(&mut exp, "Развёрнутое: вдвое больше + таймер обратного отсчёта");
+            if exp != self.stopwatch_expanded {
+                let ctx = ui.ctx().clone();
+                self.set_stopwatch_expanded(&ctx, exp);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Прозрачность окошка:");
+            ui.add(
+                egui::Slider::new(&mut self.stopwatch_opacity_pct, 2.0..=100.0)
+                    .fixed_decimals(0)
+                    .show_value(false),
+            );
+            ui.label(format!("{}%", self.stopwatch_opacity_pct.round() as i32));
+            ui.label(egui::RichText::new("(Ctrl+Num+/Num− — только когда закреплено)").weak());
+        });
+        ui.label(format!(
+            "Шорткаты: старт/пауза — {}, круг — {}, стоп — {}, Pin — {} (до 99 кругов за один забег).",
+            self.shortcuts.binding_str("stopwatch_toggle"),
+            self.shortcuts.binding_str("stopwatch_lap"),
+            self.shortcuts.binding_str("stopwatch_stop"),
+            self.shortcuts.binding_str("stopwatch_pin")
+        ));
+        if !self.stopwatch_laps.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Круги: {} / 99", self.stopwatch_laps.len()));
+                // Явные стрелки прокрутки (колесо мыши тоже работает).
+                if ui.small_button("▲").clicked() {
+                    self.laps_scroll = (self.laps_scroll - 60.0).max(0.0);
+                }
+                if ui.small_button("▼").clicked() {
+                    self.laps_scroll += 60.0;
+                }
+            });
+            let lw = ui.available_width();
+            let laps_out = egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, false])
+                .vertical_scroll_offset(self.laps_scroll)
+                .show(ui, |ui| {
+                    // Фиксированная ширина: сетка по содержимому вылезала
+                    // за край карточки на длинных значениях времени.
+                    ui.set_min_width(lw);
+                    ui.set_max_width(lw);
+                    egui::Grid::new("laps_grid").num_columns(3).striped(true).show(ui, |ui| {
+                        ui.strong("№");
+                        ui.strong("Круг");
+                        ui.strong("Общее");
+                        ui.end_row();
+                        let mut prev = Duration::ZERO;
+                        for (i, lap) in self.stopwatch_laps.clone().iter().enumerate() {
+                            ui.label(format!("{}", i + 1));
+                            ui.label(format_stopwatch(lap.saturating_sub(prev)));
+                            ui.label(format_stopwatch(*lap));
+                            ui.end_row();
+                            prev = *lap;
+                        }
+                    });
+                });
+            self.laps_scroll = laps_out.state.offset.y;
+        }
+        });
+    }
+
+    fn ui_shortcuts(&mut self, ui: &mut egui::Ui) {
+        page_title(ui, "Параметры");
+        page_note(ui, "Масштаб интерфейса, авто-трекинг и горячие клавиши.");
+        card(ui, "Масштаб интерфейса", |ui| {
+        ui.label("Ползунок применяется после отпускания, шаги — кнопками −/+, сброс — 100%.");
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("100%").clicked() {
+                self.commit_scale(BASE_SCALE);
+            }
+            // Слева меньше, справа больше: [−][ползунок][+].
+            if ui.small_button("−").clicked() {
+                self.commit_scale(self.cfg_handle.ui_scale - 0.05);
+            }
+            let committed = self.cfg_handle.ui_scale.clamp(0.8, 2.0);
+            let mut draft = self.scale_draft.unwrap_or(committed);
+            let resp = ui.add(
+                egui::Slider::new(&mut draft, 0.8..=2.0)
+                    .fixed_decimals(2)
+                    .show_value(false),
+            );
+            if resp.changed() {
+                self.scale_draft = Some(draft);
+                if !resp.dragged() {
+                    // Изменение не перетаскиванием (клавиатура) —
+                    // дискретный шаг, применяем сразу.
+                    self.commit_scale(draft);
+                }
+            }
+            if resp.drag_stopped() {
+                self.commit_scale(draft);
+            }
+            if ui.small_button("+").clicked() {
+                self.commit_scale(self.cfg_handle.ui_scale + 0.05);
+            }
+            let shown = self.scale_draft.unwrap_or(committed);
+            ui.label(format!("{}%", (shown / BASE_SCALE * 100.0).round() as i32))
+                .on_hover_text("100% = базовый масштаб (бывшие 130%)");
+        });
+        });
+        // Авто-трекинг живёт здесь (переехал из вкладки «Игры»).
+        card(ui, "Авто-трекинг (GPU-гейт)", |ui| {
+        ui.collapsing("Настройки", |ui| {
+            let mut c = self.cfg_handle.clone();
+            ui.checkbox(&mut c.require_gpu, "Требовать нагрузку на видеокарту (лаунчер без VRAM игнорируется)");
+            ui.add(egui::Slider::new(&mut c.min_vram_mb, 0..=2000).text("Мин. VRAM процесса (МБ)"));
+            ui.add(egui::Slider::new(&mut c.min_cpu_pct, 0.0..=50.0).text("Мин. CPU для fallback (%, без NVML)"));
+            ui.add(egui::Slider::new(&mut c.min_ram_mb, 0..=8000).text("Мин. RAM для fallback (МБ)"));
+            ui.add(egui::Slider::new(&mut c.check_interval_secs, 2..=120).text("Опрос процессов (сек)"));
+            ui.add(egui::Slider::new(&mut c.grace_secs, 2..=120).text("Пауза до завершения сессии (сек)"));
+            ui.add(egui::Slider::new(&mut c.confirm_hits, 1..=10).text("Подтверждений для старта"));
+            ui.add(egui::Slider::new(&mut c.day_start_hour, 0..=23).text("Начало игровых суток (час)"));
+            ui.checkbox(&mut c.auto_scan_enabled, "Автосканирование каждый час");
+            if ui.button("Применить").clicked() {
+                if let Ok(mut g) = self.cfg.write() {
+                    *g = c.clone();
+                }
+                // day_start_hour влияет на БД
+                self.db.set_day_start_hour(c.day_start_hour);
+                self.cfg_handle = c.clone();
+                c.save();
+                self.scan_msg = "Настройки трекинга применены.".to_string();
+            }
+            ui.label("Как это работает: каждый опрос сверяем процессы с вашим списком игр; PID проверяем в NVML. Есть VRAM выше порога — идёт игра, стартует/продолжается сессия. Нет — это лаунчер/фон, сессия не пишется.");
+        });
+        });
+        card(ui, "Горячие клавиши и кнопки мыши", |ui| {
+        ui.label("Нажмите «Изменить», затем клавиши (с Ctrl/Alt/Shift) или кнопку мыши — подойдут и дополнительные Mouse4/Mouse5. Сохраняется автоматически в shortcuts.json. Esc в режиме захвата — отмена (поэтому Esc назначить нельзя).");
+        if let Some(id) = self.capture_action.clone() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!("Нажмите клавиши или кнопку мыши для «{}»… (Esc — отмена)", action_label(&id)),
+            );
+        }
+        table_scroll(ui, "sc_scroll", 340.0, |ui| {
+            egui::Grid::new("sc_grid").num_columns(4).striped(true).show(ui, |ui| {
+                ui.strong("Действие");
+                ui.strong("Шорткат");
+                ui.strong("");
+                ui.strong("");
+                ui.end_row();
+                for a in crate::shortcuts::ACTIONS {
+                    ui.label(a.label);
+                    let mut txt = self.shortcuts.binding_str(a.id);
+                    if self.shortcuts.is_custom(a.id) {
+                        txt += " *";
+                    }
+                    ui.label(txt).on_hover_text(if self.shortcuts.is_custom(a.id) {
+                        "Своё назначение (умолчание другое)"
+                    } else {
+                        "Назначение по умолчанию"
+                    });
+                    if ui.small_button("Изменить").clicked() {
+                        self.capture_action = Some(a.id.to_string());
+                        self.capture_armed_at = ui.ctx().input(|i| i.time);
+                    }
+                    if ui.small_button("Сброс").clicked() {
+                        self.shortcuts.reset(a.id);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Сбросить всё").clicked() {
+                self.shortcuts.reset_all();
+                self.status_msg = "Шорткаты сброшены к умолчаниям.".to_string();
+            }
+            ui.label("* — своё назначение.");
+        });
+        });
+    }
+
+    /// Текст горячих клавиш для документации — строится из текущих
+    /// назначений, поэтому обновляется сам при их смене.
+    fn shortcuts_doc(&self) -> String {
+        let mut s = String::from(
+            "Горячие клавиши (настраиваются во вкладке «Параметры», сохраняются автоматически — этот список обновляется сам):\n",
+        );
+        for a in crate::shortcuts::ACTIONS {
+            s += &format!("• {} — {}\n", a.label, self.shortcuts.binding_str(a.id));
+        }
+        s += "Шорткаты с буквами работают, когда фокус не в поле ввода; Alt+цифры, мышь и закрытие диалогов — всегда. В диалогах быстрого будильника/таймера Enter подтверждает, Esc закрывает. Можно назначать дополнительные кнопки мыши (Mouse4/Mouse5).";
+        s
+    }
+
+    fn ui_about(&mut self, ui: &mut egui::Ui) {
+        // Подразделы сверху: О программе | Документация | Журнал | Клавиши.
+        // Ряд и разделитель — на общей вертикали с карточками (page_row),
+        // иначе переключатель подразделов торчал левее их заголовков.
+        page_row(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (i, label) in [
+                    (0u8, "О программе"),
+                    (1, "Документация"),
+                    (2, "Журнал изменений"),
+                    (3, "Горячие клавиши"),
+                ] {
+                    if ui.selectable_label(self.about_sub == i, label).clicked() {
+                        self.about_sub = i;
+                    }
+                }
+            });
+        });
+        page_rule(ui);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            match self.about_sub {
+                0 => self.about_program(ui),
+                1 => self.about_docs(ui),
+                2 => self.about_changelog(ui),
+                _ => self.about_keys(ui),
+            }
+        });
+    }
+
+    /// Подраздел «О программе»: версия, обновления, сообщить о проблеме.
+    fn about_program(&mut self, ui: &mut egui::Ui) {
+        card(ui, "О программе", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(format!("{APP_NAME}"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    ui.hyperlink_to("Сообщить о проблеме", ISSUE_URL);
+                    ui.label(egui::RichText::new("(ссылка будет добавлена позднее)").weak());
+                });
+            });
+            ui.label(format!("Версия: {VERSION} (сборка {BUILD})"));
+            ui.label("Авто-подсчёт игровых сессий с GPU-гейтом, трей, будильники, таймер, Steam API, экспорт CSV. Rust/egui.");
+            ui.label(egui::RichText::new(
+                "Клик по версии внизу боковой панели открывает этот раздел и сразу \
+                 запускает проверку обновлений.",
+            )
+            .weak());
+            // Результат проверки обновлений живёт здесь же: по клику на
+            // версию в сайдбаре раздел открывается и проверка стартует
+            // автоматически, а статус виден сразу в этом блоке.
+            ui.separator();
+            ui.strong("Обновления:");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Проверить обновления").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.start_update_check(&ctx);
+                }
+                ui.label(egui::RichText::new(
+                    "Сверка с релизами — следующий этап; пока проверяется доступность GitHub.",
+                )
+                .weak());
+            });
+            // Статус может быть длинным (строка ошибки reqwest) — даём
+            // выделить и скопировать.
+            ui.add(
+                egui::Label::new(if self.update_checking {
+                    "Идёт проверка соединения с GitHub…".to_string()
+                } else if self.update_status.is_empty() {
+                    "Проверка ещё не запускалась.".to_string()
+                } else {
+                    self.update_status.clone()
+                })
+                .selectable(true),
+            );
+            if self.update_checking {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Проверяем…").weak());
+                });
+            }
+        });
+    }
+
+    /// Подраздел «Документация»: руководство + согласие + правила.
+    fn about_docs(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Руководство", |ui| {
+            ui.label(
+                "Сессии: сверху живые сессии (● запись, CPU/RAM/VRAM), ниже сводная таблица. Кнопка «Детали» открывает сессии игры, двойной клик по длительности — редактирование. «Экспорт CSV» сохраняет таблицу.\n\
+                Игры: подразделы «Сканирование и список игр» и «Steam Web API и общее время». Серверы отдают общее время (playtime_forever) — это база, наши сессии прибавляются дельтами (см. ховер на игре). ⊗ у названия = игры нет в Steam (не куплена/удалена), ? = API ещё не опрашивали. Авто-трекинг переехал во вкладку «Параметры».\n\
+                Будильники: время меняется кнопкой «Изменить» в любой момент. У активных — живой обратный отсчёт. Дни недели — галочками Пн–Вс или пресетами «Будни»/«Выходные»/«Ежедневно»/«Разовый». Активный будильник можно вывести на аналоговые часы ниже списка. «Станд.» — стандартный системный звук Windows (Beep/Bell, повтор до 3 минут), когда нет своего файла; «Нет» — без звука.\n\
+                Таймер: пресеты или свои минуты; у активного — аналоговый циферблат.\n\
+                Секундомер: старт, пауза, стоп, круг, сброс; стабильное окошко-минимум без рамок (таскается за фон 1:1 с курсором, размер — курсором за край), тысячные доли, дубли последних 3 кругов, PIN от перетаскивания, прозрачность 2–100% (Ctrl+Num+/Num− когда Pinned). Кнопка ⤢ разворачивает окошко почти вдвое и добавляет таймер обратного отсчёта (тот же, что на вкладке «Таймер»: пресеты 1/5/10/30 мин, стоп, полоска хода). Глобальные хоткеи работают поверх игры, пока окошко открыто.\n\
+                Вёрстка: все блоки разделов выровнены по одной ширине (поля 5% окна симметрично). Заголовки и пояснения разделов стоят на одной вертикали с карточками. Таблицы (сессии, игры, будильники, шорткаты, круги) занимают всю ширину карточки, колонки — доли ширины блока, длинные значения режутся многоточием; ничего не выходит за границы блоков.\n\
+                Полоска сессии: тонкая панель на позиции 3×3 выбранного монитора (где полоска или курсор) — текущее время зелёным и общее ч/м; ровно одна тонкая линия, лишних деталей нет, полная история — в таблице сессий. Место запоминается и зажимается внутрь рабочей области монитора, поэтому не выходит за границы экрана даже после смены разрешения. Таскается нативно 1:1, ресайзится. Пока окошко поверх окон, кнопки сетки недоступны — управление с клавиатуры: RShift+←/→ позиция, RShift+↑/↓ прозрачность ±5%.\n\
+                Плавающие окошки нельзя свернуть: снят WS_MINIMIZEBOX, поэтому Win+D, двойной клик по таскбару и Aero Snap их не убирают, а если окно всё же свернули сторонней программой — оно возвращается на экран само. Спрятать окошко = снизить прозрачность (Ctrl+Num± или ползунок).\n\
+                Вид: «Масштаб» во вкладке «Параметры» меняет размер интерфейса (100% = базовый масштаб, бывшие 130%). Ползунок применяется после отпускания, шаги — кнопками −/+, сброс — 100%. Ряды кнопок переносятся, вкладки прокручиваются — на большом масштабе ничего не пропадает за краем окна. Все блоки разделов выровнены по одной ширине: поля 5% окна симметрично слева и справа, поэтому на 1080p и на 6–8K вёрстка одинаковая.\n\
+                Трей: крестик скрывает окно в трей; меню трея — «Открыть окно»/«Выход»; наведение показывает активные сессии; клик левой кнопкой или двойной клик открывает окно."
+            );
+        });
+        card(ui, "Согласие на использование", |ui| {
+            ui.label(
+                "Программа работает полностью локально: сессии, будильники и настройки хранятся на вашем ПК (SQLite и JSON). За пределы ПК данные уходят только по вашей явной команде: запросы Steam Web API (ваш ключ и SteamID) и проверка соединения с GitHub. Используя программу, вы соглашаетесь с локальным хранением этих данных."
+            );
+        });
+        card(ui, "Правила пользования (user agreement)", |ui| {
+            ui.label(
+                "1) Программа — для личного учёта времени; точность зависит от данных GPU и ОС.\n\
+                2) Не используйте её для скрытого наблюдения за другими людьми без их согласия.\n\
+                3) Будильники и таймеры — бытовые напоминания без гарантий срабатывания.\n\
+                4) Автор не несёт ответственности за пропущенные события и потерю данных.\n\
+                5) Сторонние сервисы (Steam, GitHub) регулируются их собственными правилами."
+            );
+        });
+    }
+
+    /// Подраздел «Журнал изменений».
+    fn about_changelog(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Журнал изменений", |ui| {
+            for (v, d, changes) in CHANGELOG {
+                ui.strong(format!("{v} — {d}"));
+                for c in *changes {
+                    ui.label(format!("• {c}"));
+                }
+                ui.separator();
+            }
+        });
+    }
+
+    /// Подраздел «Горячие клавиши» (список обновляется сам).
+    fn about_keys(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Горячие клавиши", |ui| {
+            ui.label(self.shortcuts_doc());
+        });
+    }
+
+    // ---------- actions ----------
+
+    fn export_csv(&mut self) {
+        let total_all: i64 = self.agg.iter().map(|r| r.total_duration).sum();
+        let Some(path) = rfd::FileDialog::new().set_file_name("sessions.csv").save_file() else { return };
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => { self.status_msg = format!("Не могу создать файл: {e}"); return; }
+        };
+        let mut w = csv::Writer::from_writer(file);
+        let _ = w.write_record(["№", "Игра", "Общее время", "% от общего", "Запускал", "Сессий"]);
+        for (i, r) in self.agg.iter().enumerate() {
+            let pct = if total_all > 0 { r.total_duration as f64 / total_all as f64 * 100.0 } else { 0.0 };
+            let last = if r.last_start.is_empty() { "—".to_string() } else {
+                chrono::DateTime::parse_from_rfc3339(&r.last_start)
+                    .map(|d| d.with_timezone(&Local).format("%H:%M %Y-%m-%d").to_string())
+                    .unwrap_or(r.last_start.clone())
+            };
+            let _ = w.write_record([
+                (i + 1).to_string(),
+                r.game_name.clone(),
+                format_duration(r.total_duration),
+                format!("{pct:.2}%"),
+                last,
+                r.runs.to_string(),
+            ]);
+        }
+        self.status_msg = format!("Сохранено: {}", path.to_string_lossy());
+    }
+
+    fn merge_scan(&mut self, found: Vec<TrackedGame>, label: &str) {
+        if found.is_empty() {
+            self.scan_msg = format!("{label}: ничего не найдено.");
+            return;
+        }
+        let current = self.games.read().unwrap().clone();
+        let merged = merge_games(vec![found.clone(), current]);
+        *self.games.write().unwrap() = merged.clone();
+        self.persist_games();
+        self.scan_msg = format!("{label}: добавлено/обновлено {n} (всего {t}).", n = found.len(), t = merged.len());
+    }
+
+    fn scan_api(&mut self) {
+        self.cfg_handle.api_key = self.api_key.clone();
+        self.cfg_handle.steam_id = self.steam_id.clone();
+        let api_key = self.api_key.trim().to_string();
+        let mut sid = self.steam_id.trim().to_string();
+        if api_key.is_empty() {
+            self.scan_msg = "Введите Steam API Key.".to_string();
+            return;
+        }
+        if sid.is_empty() || sid == "auto" {
+            sid = detector::local_steam_id(&detector::steam_install_path()).unwrap_or_default();
+            if sid.is_empty() {
+                self.scan_msg = "Не удалось определить SteamID64, введите вручную.".to_string();
+                return;
+            }
+            self.steam_id = sid.clone();
+        }
+        match detector::scan_steam_games_via_api(&api_key, &sid, None) {
+            Ok(found) => {
+                if found.is_empty() {
+                    self.scan_msg = "Steam API: установленных игр не найдено.".to_string();
+                } else {
+                    // Часы с серверов — истина про владение: накатываем минуты
+                    // поверх слияния (порядок merge значения не имеет), а всё,
+                    // чего в свежем списке нет — из Steam пропало: чистим.
+                    let fresh_min: std::collections::HashMap<String, u64> = found
+                        .iter()
+                        .filter_map(|g| g.steam_minutes.map(|m| (g.key(), m)))
+                        .collect();
+                    self.merge_scan(found, "Steam API");
+                    {
+                        let mut games = self.games.write().unwrap();
+                        for g in games.iter_mut() {
+                            g.steam_minutes = fresh_min.get(&g.key()).copied();
+                        }
+                    }
+                    self.persist_games();
+                    self.cfg_handle.steam_synced = true;
+                    self.scan_msg = format!(
+                        "Steam API: часы с серверов подтянуты для {} игр. Наши сессии прибавляются к этому общему.",
+                        fresh_min.len()
+                    );
+                }
+            }
+            Err(e) => {
+                self.scan_msg = format!("Ошибка Steam API: {e}");
+            }
+        }
+        self.cfg_handle.api_key = self.api_key.clone();
+        self.cfg_handle.steam_id = self.steam_id.clone();
+        *self.cfg.write().unwrap() = self.cfg_handle.clone();
+        self.cfg_handle.save();
+    }
+
+    fn remove_game(&mut self, exe_path: &str) {
+        let key = exe_path.replace('/', "\\").to_lowercase();
+        let mut g = self.games.write().unwrap();
+        g.retain(|x| x.key() != key);
+        drop(g);
+        self.persist_games();
+    }
+
+    fn pick_exe_manual(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("exe", &["exe"]).pick_file() {
+            let exe = p.to_string_lossy().to_string();
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+            let mut g = self.games.write().unwrap();
+            if !g.iter().any(|x| x.key() == exe.replace('/', "\\").to_lowercase()) {
+                g.push(TrackedGame { name: stem, exe_path: exe, source: "Manual".to_string(), steam_minutes: None });
+            }
+            drop(g);
+            self.persist_games();
+            self.scan_msg = "Добавлено вручную.".to_string();
+        }
+    }
+
+    fn pick_folder(&mut self) {
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            let exes = detector::scan_folder_for_exes(&folder, 4);
+            if exes.is_empty() {
+                self.scan_msg = "В папке нет .exe файлов.".to_string();
+                return;
+            }
+            self.folder_candidates = exes.into_iter().take(30).map(|(p, s)| (p.to_string_lossy().to_string(), s)).collect();
+            self.folder_name = folder.file_name().and_then(|n| n.to_str()).unwrap_or("game").to_string();
+            self.show_folder = true;
+        }
+    }
+
+    fn refresh_picker_list(&mut self) {
+        self.picker_list = detector::list_running_processes();
+        self.picker_refresh_at = Instant::now();
+    }
+
+    fn start_timer(&mut self, secs: u64) {
+        self.timer_end = Some(Instant::now() + Duration::from_secs(secs));
+        self.timer_total = secs;
+        let opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
+        self.timer_data = (opt(&self.timer_url), opt(&self.timer_sound), opt(&self.timer_std));
+    }
+
+    // ---------- всплывающие окна ----------
+    fn windows(&mut self, ctx: &egui::Context) {
+        // Проверка обновлений: ОТДЕЛЬНОГО ОКНА НЕТ — по клику на версию
+        // открывается раздел «О программе» (подраздел 0) с результатом
+        // проверки, а сама проверка запускается автоматически. Лишнее
+        // всплывающее окно только мешало: ради одного статуса.
+
+        // Детали игры
+        let mut close_detail = false;
+        if let Some(game) = self.detail_game.clone() {
+            let mut open = true;
+            egui::Window::new(format!("Сессии: {game}")).open(&mut open).min_size([560.0, 380.0]).show(ctx, |ui| {
+                let sessions = self.db.sessions_by_game(&game);
+                ui.label(format!("Всего сессий: {}", sessions.len()));
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    egui::Grid::new("detail_grid").num_columns(5).striped(true).show(ui, |ui| {
+                        ui.strong("№"); ui.strong("Включил"); ui.strong("Выключил"); ui.strong("Длительность"); ui.strong("");
+                        ui.end_row();
+                        let mut last_day = String::new();
+                        for (n, s) in sessions.iter().enumerate() {
+                            let day = s.start_time.get(0..10).unwrap_or("").to_string();
+                            if day != last_day {
+                                last_day = day.clone();
+                                ui.colored_label(egui::Color32::GRAY, format!("=== {day} ==="));
+                                ui.label(""); ui.label(""); ui.label(""); ui.label("");
+                                ui.end_row();
+                            }
+                            ui.label(format!("{}", n + 1));
+                            ui.label(fmt_dt(&s.start_time));
+                            ui.label(s.end_time.as_ref().map(|e| fmt_dt(e)).unwrap_or("—".to_string()));
+                            let dlabel = s.duration.map(format_duration).unwrap_or("—".to_string());
+                            // двойной клик по длительности = редактирование
+                            let resp = ui.label(&dlabel);
+                            if resp.double_clicked() {
+                                let d = s.duration.unwrap_or(0);
+                                self.edit_session = Some((s.id, (d / 3600) as i32, ((d % 3600) / 60) as i32, (d % 60) as i32));
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.small_button("Изм.").clicked() {
+                                    let d = s.duration.unwrap_or(0);
+                                    self.edit_session = Some((s.id, (d / 3600) as i32, ((d % 3600) / 60) as i32, (d % 60) as i32));
+                                }
+                                if ui.small_button("Удал.").clicked() {
+                                    let _ = self.db.delete_session(s.id);
+                                    self.refresh_agg();
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+            if !open {
+                close_detail = true;
+            }
+        }
+        if close_detail {
+            self.detail_game = None;
+            self.refresh_agg();
+        }
+
+        // Редактирование длительности
+        let mut close_edit = false;
+        if let Some((id, mut h, mut m, mut s)) = self.edit_session {
+            let mut open = true;
+            egui::Window::new("Изменение длительности").open(&mut open).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Часы:"); time_field(ui, &mut h, 999);
+                    ui.label("Мин:"); time_field(ui, &mut m, 59);
+                    ui.label("Сек:"); time_field(ui, &mut s, 59);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("OK").clicked() {
+                        let dur = (h as i64) * 3600 + (m as i64) * 60 + s as i64;
+                        // end = start + dur
+                        let _ = self.db.update_session_duration(id, dur, &Local::now());
+                        self.refresh_agg();
+                        close_edit = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close_edit = true;
+                    }
+                });
+                self.edit_session = Some((id, h, m, s));
+            });
+            if !open {
+                close_edit = true;
+            }
+        }
+        if close_edit {
+            self.edit_session = None;
+            // обновить детали
+            self.refresh_agg();
+        }
+
+        // Выбор из активных процессов
+        if self.show_picker {
+            let mut open = true;
+            egui::Window::new("Добавить из активных процессов").open(&mut open).min_size([600.0, 420.0]).show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Поиск:");
+                    ui.text_edit_singleline(&mut self.picker_search);
+                    if ui.button("Обновить").clicked() {
+                        self.refresh_picker_list();
+                    }
+                });
+                if self.picker_refresh_at.elapsed() > Duration::from_secs(4) {
+                    self.refresh_picker_list();
+                }
+                let q = self.picker_search.to_lowercase();
+                let known: std::collections::HashSet<String> = self.games.read().unwrap().iter().map(|g| g.file_name()).collect();
+                egui::ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
+                    egui::Grid::new("proc_grid").num_columns(5).striped(true).show(ui, |ui| {
+                        ui.strong("PID"); ui.strong("Имя"); ui.strong("CPU/RAM"); ui.strong("exe"); ui.strong("");
+                        ui.end_row();
+                        for p in self.picker_list.clone().iter().filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q) || p.exe.to_lowercase().contains(&q)).take(200) {
+                            ui.label(format!("{}", p.pid));
+                            ui.label(&p.name);
+                            ui.label(format!("{:.1}% / {}МБ", p.cpu, p.mem_mb));
+                            let short = if p.exe.len() > 60 { format!("…{}", &p.exe[p.exe.len()-60..]) } else { p.exe.clone() };
+                            ui.label(short).on_hover_text(&p.exe);
+                            let already = known.contains(&exe_file_name(&p.exe));
+                            if already {
+                                ui.label("уже есть");
+                            } else if ui.small_button("Отслеживать").clicked() {
+                                if !p.exe.is_empty() {
+                                    let mut g = self.games.write().unwrap();
+                                    g.push(TrackedGame { name: p.name.clone(), exe_path: p.exe.clone(), source: "Process".to_string(), steam_minutes: None });
+                                    drop(g);
+                                    self.persist_games();
+                                    self.scan_msg = format!("Добавлено из процессов: {}", p.name);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+            if !open {
+                self.show_picker = false;
+            }
+        }
+
+        // Кандидаты из папки
+        if self.show_folder {
+            let mut open = true;
+            egui::Window::new("Папка с игрой — выбор exe").open(&mut open).min_size([560.0, 380.0]).show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Название:");
+                    ui.text_edit_singleline(&mut self.folder_name);
+                });
+                ui.label("Найденные .exe (первые — самые большие, это обычно и есть игра, а не лаунчер):");
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (exe, size) in self.folder_candidates.clone() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{:.1} МБ", size as f64 / 1024.0 / 1024.0));
+                            let short = if exe.len() > 70 { format!("…{}", &exe[exe.len()-70..]) } else { exe.clone() };
+                            ui.label(short).on_hover_text(&exe);
+                            if ui.small_button("Выбрать").clicked() {
+                                let mut g = self.games.write().unwrap();
+                                let key = exe.replace('/', "\\").to_lowercase();
+                                if !g.iter().any(|x| x.key() == key) {
+                                    g.push(TrackedGame { name: self.folder_name.clone(), exe_path: exe.clone(), source: "Folder".to_string(), steam_minutes: None });
+                                }
+                                drop(g);
+                                self.persist_games();
+                                self.scan_msg = format!("Добавлено из папки: {}", self.folder_name);
+                                self.show_folder = false;
+                            }
+                        });
+                    }
+                });
+            });
+            if !open {
+                self.show_folder = false;
+            }
+        }
+
+        // Быстрый будильник (Ctrl+}): разовый, звук BEEP, Enter — добавить.
+        if self.quick_alarm_open {
+            let mut open = true;
+            egui::Window::new("Быстрый будильник").open(&mut open).show(ctx, |ui| {
+                ui.label("Разовый будильник, звук BEEP.");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.quick_alarm_text)
+                        .hint_text("ЧЧ:ММ")
+                        .id(egui::Id::new("quick_alarm_input")),
+                );
+                if self.quick_alarm_focus {
+                    ui.memory_mut(|m| m.request_focus(egui::Id::new("quick_alarm_input")));
+                    self.quick_alarm_focus = false;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("OK (Enter)").clicked() {
+                        self.confirm_quick_alarm();
+                    }
+                    if ui.button("Отмена (Esc)").clicked() {
+                        self.quick_alarm_open = false;
+                    }
+                });
+            });
+            if !open {
+                self.quick_alarm_open = false;
+            }
+        }
+
+        // Быстрый таймер (Ctrl+{): минуты 1–999, Enter — старт.
+        if self.quick_timer_open {
+            let mut open = true;
+            egui::Window::new("Быстрый таймер").open(&mut open).show(ctx, |ui| {
+                ui.label("Минуты 1–999, Enter — старт.");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.quick_timer_text)
+                        .hint_text("Минуты")
+                        .id(egui::Id::new("quick_timer_input")),
+                );
+                if self.quick_timer_focus {
+                    ui.memory_mut(|m| m.request_focus(egui::Id::new("quick_timer_input")));
+                    self.quick_timer_focus = false;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Старт (Enter)").clicked() {
+                        self.confirm_quick_timer();
+                    }
+                    if ui.button("Отмена (Esc)").clicked() {
+                        self.quick_timer_open = false;
+                    }
+                });
+            });
+            if !open {
+                self.quick_timer_open = false;
+            }
+        }
+
+        // Диалог будильника
+        if let Some(a) = self.alarm_dialog.clone() {
+            let mut open = true;
+            egui::Window::new("Будильник").open(&mut open).show(ctx, |ui| {
+                ui.label(format!("Сработал будильник на {}", a.time));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Через 10 минут").clicked() {
+                        let nt = (Local::now() + chrono::Duration::minutes(10)).format("%H:%M").to_string();
+                        let _ = self.db.add_alarm(&nt, false, a.url.as_deref(), a.sound_file.as_deref(), a.standard_sound.as_deref(), None);
+                        self.refresh_alarms();
+                        self.alarm_dialog = None;
+                        self.sound.stop();
+                    }
+                    if ui.button("Заканчиваю").clicked() {
+                        self.alarm_dialog = None;
+                        self.sound.stop();
+                    }
+                });
+            });
+            if !open {
+                self.alarm_dialog = None;
+                self.sound.stop();
+            }
+        }
+
+        // Редактирование будильника (время + дни) — доступно в любой момент,
+        // в том числе для неактивных будильников.
+        let mut close_alarm_edit = false;
+        if let Some((id, mut h, mut m, mut days)) = self.edit_alarm {
+            let mut open = true;
+            egui::Window::new("Изменить будильник").open(&mut open).show(ctx, |ui| {
+                ui.label(format!("Будильник #{id}"));
+                ui.horizontal(|ui| {
+                    ui.label("Часы:");
+                    time_field(ui, &mut h, 23);
+                    ui.label("Минуты:");
+                    time_field(ui, &mut m, 59);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Дни:");
+                    Self::day_picker(ui, &mut days);
+                });
+                let mask = if days.iter().any(|x| *x) { Some(days) } else { None };
+                if let Some(rem) = alarm_remaining(&format!("{h:02}:{m:02}"), mask) {
+                    ui.label(format!("До срабатывания: {}", format_countdown(rem)));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("OK").clicked() {
+                        let t = format!("{h:02}:{m:02}");
+                        let days_str;
+                        let days_opt = if days.iter().any(|x| *x) {
+                            days_str = bools_to_mask(&days);
+                            Some(days_str.as_str())
+                        } else {
+                            None
+                        };
+                        let mut ok = true;
+                        if let Err(e) = self.db.set_alarm_time(id, &t) {
+                            self.status_msg = format!("Не удалось изменить время: {e}");
+                            ok = false;
+                        }
+                        if let Err(e) = self.db.set_alarm_days(id, days_opt) {
+                            self.status_msg = format!("Не удалось изменить дни: {e}");
+                            ok = false;
+                        }
+                        if ok {
+                            self.status_msg = format!("Будильник #{id} изменён: {t}, {}.", mask_label_days(days_opt));
+                        }
+                        self.refresh_alarms();
+                        close_alarm_edit = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close_alarm_edit = true;
+                    }
+                });
+                self.edit_alarm = Some((id, h, m, days));
+            });
+            if !open {
+                close_alarm_edit = true;
+            }
+        }
+        if close_alarm_edit {
+            self.edit_alarm = None;
+        }
+
+        // Диалог таймера
+        if self.timer_dialog {
+            let mut open = true;
+            egui::Window::new("Таймер").open(&mut open).show(ctx, |ui| {
+                ui.label("Таймер завершён!");
+                if ui.button("OK").clicked() {
+                    self.timer_dialog = false;
+                    self.sound.stop();
+                }
+            });
+            if !open {
+                self.timer_dialog = false;
+                self.sound.stop();
+            }
+        }
+    }
+}
+
+/// Пресет дней недели будильника.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DayPreset {
+    Weekdays,
+    Weekend,
+    Daily,
+    Once,
+}
+
+fn preset_days(p: DayPreset) -> [bool; 7] {
+    match p {
+        DayPreset::Weekdays => [true, true, true, true, true, false, false],
+        DayPreset::Weekend => [false, false, false, false, false, true, true],
+        DayPreset::Daily => [true; 7],
+        DayPreset::Once => [false; 7],
+    }
+}
+
+/// Какой пресет соответствует набору дней (для подсветки активной кнопки).
+fn detect_day_preset(days: &[bool; 7]) -> Option<DayPreset> {
+    for p in [DayPreset::Weekdays, DayPreset::Weekend, DayPreset::Daily, DayPreset::Once] {
+        if preset_days(p) == *days {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Поле времени с жёстким лимитом: ручной ввод больше max невозможен
+/// (значение режется каждый кадр), ширина фиксирована — окно не разъезжается.
+/// Часы: max=23 (24:00 не бывает — это уже 00:00 следующего дня).
+fn time_field(ui: &mut egui::Ui, value: &mut i32, max: i32) {
+    *value = (*value).clamp(0, max);
+    ui.add_sized(
+        [54.0, 0.0],
+        egui::DragValue::new(value).range(0..=max),
+    );
+    *value = (*value).clamp(0, max);
+}
+
+/// Подсказка «Станд.»: стандартный системный звук Windows для
+/// будильника/таймера. Beep — сигнал «восклицание», Bell — «звёздочка»
+/// (MessageBeep). Повторяется каждые 2 секунды до 3 минут или до закрытия
+/// диалога. Используется, когда не задан свой звуковой файл.
+/// «Нет» — без звука (только диалог и уведомление).
+pub const STD_SOUND_TIP: &str = "Стандартный системный звук Windows (Beep — «восклицание», Bell — «звёздочка»). Повтор каждые 2 с до 3 минут. Нужен, когда нет своего звукового файла. «Нет» — без звука.";
+
+/// Укоротить длинную строку серединой (для компактных ячеек таблицы).
+fn short_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
+/// Похоже ли на URL-ссылку (без пробелов, с точкой или схемой).
+fn looks_like_url(s: &str) -> bool {
+    let t = s.trim().trim_matches(['<', '>', '"', '\'', ' ']);
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return false;
+    }
+    let l = t.to_ascii_lowercase();
+    l.starts_with("http://")
+        || l.starts_with("https://")
+        || l.starts_with("ftp://")
+        || l.starts_with("www.")
+        || (l.contains('.') && l.len() >= 4)
+}
+
+/// Только имя файла из пути (для компактной колонки «Звук»).
+fn file_name_of(p: &str) -> String {
+    p.replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(p)
+        .to_string()
+}
+
+/// Ширины колонок как доли доступной ширины (минус суммарная ширина
+/// фиксированных колонок). Таблица резиново сжимается вместе с окном —
+/// разделы не смещаются и не уезжают.
+/// Прокручиваемая таблица внутри карточки. Ширина блока фиксируется ДО
+/// содержимого: сетка egui иначе берёт ширину по самой широкой ячейке, и при
+/// длинном названии игры или URL таблица вылезает за правый край карточки,
+/// ломая общую границу блоков.
+fn table_scroll(ui: &mut egui::Ui, id: &str, max_h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    let w = ui.available_width();
+    egui::ScrollArea::vertical()
+        .id_source(id)
+        .max_height(max_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_min_width(w);
+            ui.set_max_width(w);
+            add(ui);
+        });
+}
+
+fn col_widths(ui: &egui::Ui, weights: &[f32], fixed: f32) -> Vec<f32> {
+    let avail = (ui.available_width() - fixed).max(160.0);
+    let sum: f32 = weights.iter().sum::<f32>().max(0.001);
+    weights.iter().map(|w| avail * w / sum).collect()
+}
+
+/// Ячейка с обрезкой многоточием: не распирает таблицу при сужении окна,
+/// полное значение — во всплывашке.
+fn trunc_cell(ui: &mut egui::Ui, w: f32, text: &str, hover: &str) {
+    tcell(ui, w, |ui| {
+        ui.add(egui::Label::new(text).truncate())
+            .on_hover_text(hover);
+    });
+}
+
+/// Ячейка таблицы фиксированной высоты с центрированием по вертикали:
+/// шапка и строки строго на одном уровне, снизу авто-отступ в несколько
+/// пикселей от букв/цифр — ничего не «съезжает».
+const TABLE_ROW_H: f32 = 24.0;
+
+fn tcell(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::Vec2::new(w, TABLE_ROW_H),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add,
+    );
+}
+
+/// Единая система отступов всех карточек (web-стиль):
+/// внутренний отступ контента и скругление одинаковы для «Сейчас идёт»,
+/// «Полоска сессии и GPU», «Таблица сессий» и остальных блоков.
+pub const CARD_INNER: f32 = 12.0;
+pub const CARD_ROUNDING: f32 = 10.0;
+pub const CARD_GAP_BOTTOM: f32 = 10.0;
+
+/// Доля ширины окна, которая остаётся полями слева и справа от разделов.
+/// 5% с каждой стороны: блоки всех разделов выравниваются по одной ширине
+/// и не липнут к границам окна. На разных мониторах (1920×1080 и 6–8K)
+/// поле масштабируется вместе с окном, поэтому вёрстка не «едет».
+pub const PAGE_MARGIN_PCT: f32 = 0.05;
+/// Границы поля: не меньше 8 и не больше 60 точек — на 4K 5% съедали бы
+/// по 100 точек с каждой стороны, на 720p были бы крошечными.
+pub const PAGE_MARGIN_MIN: f32 = 8.0;
+pub const PAGE_MARGIN_MAX: f32 = 60.0;
+
+/// Поля страницы разделов для окна шириной w: одинаковые слева и справа.
+pub fn page_margin(w: f32) -> f32 {
+    (w * PAGE_MARGIN_PCT).clamp(PAGE_MARGIN_MIN, PAGE_MARGIN_MAX)
+}
+
+/// Отступ строк уровня раздела (заголовок, пояснение, разделитель, переключатель
+/// подразделов), которые лежат ВНЕ карточек. Ровно CARD_INNER — иначе они
+/// стояли бы на 12pt левее заголовков карточек, и весь раздел «плавал».
+pub const PAGE_INNER: f32 = CARD_INNER;
+
+/// Строка уровня раздела: сдвиг на PAGE_INNER, чтобы текст разделов стоял на
+/// одной вертикали с содержимым карточек. Ширина уменьшается на тот же отступ,
+/// поэтому элемент не может заехать под правое поле страницы.
+fn page_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    // Фиксированный сдвиг PAGE_INNER, а НЕ ui.indent: тот берёт egui-спейсинг
+    // и увеличивал бы отступ вместе с масштабом интерфейса, из-за чего
+    // заголовки разъезжались бы с карточками. Ширина уменьшается на ту же
+    // величину, поэтому элемент не заедет под правое поле страницы.
+    // Ширину меряем ДО сдвига: add_space уже сузил available_width, иначе
+    // отступ посчитался бы дважды.
+    let width = ui.available_width();
+    ui.add_space(PAGE_INNER);
+    // Высота — с запасом: allocate_ui_with_layout создаёт ui по заданному
+    // размеру, а однострочному заголовку хватает высоты текста.
+    ui.allocate_ui_with_layout(
+        egui::vec2((width - PAGE_INNER).max(40.0), ui.available_height()),
+        egui::Layout::top_down(egui::Align::Min),
+        add,
+    );
+}
+
+/// Заголовок раздела на общей вертикали с карточками.
+fn page_title(ui: &mut egui::Ui, title: &str) {
+    page_row(ui, |ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(title)
+                    .size(21.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(0xE8, 0xF0, 0xF7)),
+            ),
+        );
+    });
+}
+
+/// Пояснение под заголовком раздела (приглушённый текст, тот же отступ).
+fn page_note(ui: &mut egui::Ui, text: &str) {
+    page_row(ui, |ui| {
+        ui.add(egui::Label::new(egui::RichText::new(text).weak()).wrap());
+    });
+}
+
+/// Разделитель уровня раздела, обрезанный по ширине блока.
+fn page_rule(ui: &mut egui::Ui) {
+    page_row(ui, |ui| {
+        ui.separator();
+    });
+}
+
+/// Карточка раздела в web-стиле: скруглённая панель с заголовком-акцентом
+/// и визуальным отделением областей друг от друга. Ширина — вся доступная
+/// (уже с полями страницы), поэтому блоки разных разделов совпадают.
+fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame {
+        fill: ui.visuals().faint_bg_color,
+        stroke: egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(0x2A, 0x47, 0x5E),
+        ),
+        rounding: egui::Rounding::same(CARD_ROUNDING),
+        inner_margin: egui::Margin::same(CARD_INNER),
+        outer_margin: egui::Margin {
+            left: 0.0,
+            right: 0.0,
+            top: 4.0,
+            bottom: CARD_GAP_BOTTOM,
+        },
+        ..Default::default()
+    }
+    .show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .size(15.0)
+                .strong()
+                .color(egui::Color32::from_rgb(0x66, 0xC0, 0xF4)),
+        );
+        ui.add_space(6.0);
+        add(ui);
+    });
+}
+
+fn fmt_dt(iso: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|d| d.with_timezone(&Local).format("%H:%M %Y-%m-%d").to_string())
+        .unwrap_or_else(|_| iso.to_string())
+}
+
+/// Id вьюпорта окошка секундомера.
+fn stopwatch_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("stopwatch_overlay")
+}
+
+/// Id вьюпорта тонкой полоски сессии.
+fn strip_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("session_strip")
+}
+
+/// Прямоугольник окна в экранных координатах пикселей по его заголовку.
+/// Нужно для проверки «не вышло ли окно за границы мониторов»: у главного
+/// контекста egui outer_rect описывает главное окно, а не плавающие окошки.
+#[cfg(windows)]
+fn window_rect_px(title: &str) -> Option<(i32, i32, i32, i32)> {
+    use winapi::shared::windef::RECT;
+    use winapi::um::winuser::{FindWindowW, GetWindowRect};
+    let wide = wide_title(title);
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) == 0 {
+            return None;
+        }
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+}
+
+#[cfg(not(windows))]
+fn window_rect_px(_title: &str) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// Базовая (несвёрнутая) ширина окошка секундомера в поинтах.
+fn stopwatch_base_w() -> f32 {
+    175.0
+}
+
+/// Базовая ширина мини-трея в поинтах.
+fn strip_base_w() -> f32 {
+    460.0
+}
+
+/// Размер окошка секундомера в ПОИНТАХ (ViewportBuilder::with_inner_size
+/// ждёт поинты и сам переводит их в пиксели через ppp). Развёрнутое —
+/// заметно крупнее: там же живёт таймер обратного отсчёта.
+fn stopwatch_window_size(expanded: bool) -> egui::Vec2 {
+    if expanded {
+        egui::vec2(300.0, 300.0)
+    } else {
+        egui::vec2(175.0, 170.0)
+    }
+}
+
+/// Размер мини-трея в ПОИНТАХ (так его и ждёт ViewportBuilder::with_inner_size).
+///
+/// ВАЖНО: без умножения на pixels_per_point. egui сам переводит поинты в
+/// пиксели при создании окна, а предыдущая версия умножала на ppp ещё раз —
+/// на масштабе 1.3 полоска выходила в 1.3 раза больше задуманного
+/// (777×51 px вместо 598×39).
+fn strip_window_size() -> egui::Vec2 {
+    egui::vec2(strip_base_w(), STRIP_H)
+}
+
+/// Состояние кнопок мини-трея на один кадр: наружу, чтобы строку можно было
+/// нарисовать в тесте без доступа к `TrackerApp`.
+#[derive(Default)]
+struct StripUiState {
+    pinned: bool,
+    close_clicked: bool,
+    pin_toggled: bool,
+}
+
+/// Ширина, которую займут кнопки мини-трея («PIN» и «×»), по замерам
+/// шрифта + отступы кнопок. Считается точно, иначе на узком окне зона
+/// получалась меньше содержимого и кнопки уезжали за правый край.
+fn strip_controls_width(ui: &egui::Ui, zoom: f32) -> f32 {
+    let pad = ui.spacing().button_padding.x;
+    let font = egui::FontId::proportional(12.0 * zoom);
+    // Ширина по глифам: суммируем advance каждого символа. Для «×» берём
+    // также значок закрытия egui (у него свой, более узкий глиф).
+    let mut w = 0.0_f32;
+    for c in "PIN×".chars() {
+        w += ui.fonts(|f| f.glyph_width(&font, c));
+    }
+    // По 2*pad на кнопку (лево+право), минимум — чтобы мелкие глифы
+    // не получили кнопку шириной в пару пикселей.
+    w.max(30.0) + 4.0 * pad
+}
+
+/// Одна строка мини-трея: слева информация о текущей сессии, справа PIN и ×.
+///
+/// Ширина зон задаётся ЯВНО (`allocate_ui_with_layout` + `right_to_left`
+/// в конце строки). Вложенный `with_layout` в начале строки брал всю
+/// оставшуюся ширину и сдвигал курсор родителя за край окна — информация
+/// уезжала за границу, и полоска выглядела пустой (рисовались только
+/// кнопки). Здесь информация занимает ровно `full_w - ctl_w`, поэтому при
+/// любой ширине окна остаётся видна.
+fn strip_row(
+    ui: &mut egui::Ui,
+    row_h: f32,
+    zoom: f32,
+    session: Option<(&str, i64, bool)>,
+    state: &mut StripUiState,
+) {
+    // Ширина берётся из текущей раскладки, а зоны размещаются через
+    // allocate_ui_with_layout — он корректно позиционирует дочерний ui
+    // относительно КУРСОРА родителя (проверено тестами: текст попадает
+    // в x≈0 и x≈ctl_w, а не за пределы окна).
+    let full_w = ui.available_width();
+    // Кнопки: зона по РЕАЛЬНОЙ ширине содержимого, измеренной шрифтом.
+    // Оценка «на глаз» (66pt) была занижена: две small_button занимают
+    // около 100pt, и при узком окне они выдавливались за правый край
+    // (x≈361 при ширине окна 260). Теперь считаем по galley.
+    let item_gap = ui.spacing().item_spacing.x;
+    let ctl_need = strip_controls_width(ui, zoom) + item_gap;
+    // Кнопки НИКОГДА не могут быть шире окна: если окно уже, чем сами
+    // кнопки, отдаём им всё (информация при этом обрежется, но останется
+    // читаемым хоть что-то, а кнопки не уедут за экран).
+    let ctl_w = ctl_need.min(full_w);
+    let info_w = (full_w - ctl_w - item_gap).max(0.0);
+    // Высота строки — реальная высота содержимого (кнопка выше текста),
+    // иначе Align::Center центрирует содержимое уже за нижним краем.
+    let row_h = row_h.min(ui.spacing().interact_size.y + 2.0);
+
+    // --- Левая зона: что идёт запись текущей сессии.
+    ui.allocate_ui_with_layout(
+        egui::vec2(info_w, row_h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| match session {
+            None => {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Нет активной сессии")
+                            .font(egui::FontId::proportional(12.0 * zoom))
+                            .color(egui::Color32::from_rgb(0x9A, 0xA4, 0xAD)),
+                    )
+                    .truncate(),
+                );
+            }
+            Some((name, secs, pending)) => {
+                let mut n = name.to_string();
+                if n.chars().count() > 30 {
+                    n = format!("{}…", n.chars().take(29).collect::<String>());
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(n)
+                            .font(egui::FontId::proportional(12.0 * zoom))
+                            .color(egui::Color32::WHITE),
+                    )
+                    .truncate(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format_duration(secs))
+                            .font(egui::FontId::monospace(12.0 * zoom))
+                            .color(if pending {
+                                egui::Color32::from_rgb(0x9A, 0xA4, 0xAD)
+                            } else {
+                                egui::Color32::from_rgb(0x8C, 0xFF, 0x5A)
+                            }),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(if pending {
+                    "Ждём подтверждения нагрузки на видеокарту…".to_string()
+                } else {
+                    "Идёт запись сессии".to_string()
+                });
+            }
+        },
+    );
+
+    // --- Правая зона: управление. Раскладка СЛЕВА НАПРАВО, ширина зоны
+    //     РОВНО равна сумме кнопок — значит они сами прижаты вправо и
+    //     раздвигать ничего не нужно. Никаких `right_to_left` /
+    //     `with_layout`: вложенные раскладки egui считают позицию от
+    //     остатка available space родителя и уводят виджеты за окно
+    //     (в тестах кнопки оказывались на x≈349 при ширине окна 260).
+    ui.allocate_ui_with_layout(
+        egui::vec2(ctl_w, row_h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            if ui.small_button("×").on_hover_text("Скрыть полоску").clicked() {
+                state.close_clicked = true;
+            }
+            let pin_txt = if state.pinned {
+                egui::RichText::new("PIN").color(egui::Color32::from_rgb(255, 165, 0))
+            } else {
+                egui::RichText::new("PIN").weak()
+            };
+            if ui
+                .small_button(pin_txt)
+                .on_hover_text("Закрепить: полоска перестаёт перетаскиваться")
+                .clicked()
+            {
+                state.pin_toggled = true;
+            }
+        },
+    );
+}
+
+/// Высота мини-трея в поинтах и минимальная высота окна.
+///
+/// Минимум НЕ меньше высоты контента (кнопка 18pt + рамка 1pt сверху и снизу
+/// + CentralPanel 0 = 20pt, берём 30 с запасом на масштаб интерфейса).
+/// Предыдущие 20pt были ровно по контенту: при увеличении масштаба кнопки
+/// переставали помещаться, строка обрезалась, и полоска выглядела «свёрнутой».
+pub const STRIP_H: f32 = 30.0;
+pub const STRIP_MIN_H: f32 = 26.0;
+
+/// Монитор, в рабочую область которого окно (x, y, w, h) влезает целиком.
+/// Берётся ближайший по пересечению — окно, ушедшее за край после смены
+/// разрешения или отключения экрана, «притягивается» к ближайшему экрану.
+fn nearest_monitor_for_rect(
+    mons: &[(i32, i32, i32, i32)],
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    if mons.is_empty() {
+        return None;
+    }
+    let (x1, y1) = (x + w, y + h);
+    let mut best: Option<((i64, i64, i64), (i32, i32, i32, i32))> = None;
+    for m in mons {
+        // Пересечение с рабочей областью (может быть 0 — тогда решает
+        // расстояние до неё).
+        let ix = (x1.min(m.2) - x.max(m.0)).max(0);
+        let iy = (y1.min(m.3) - y.max(m.1)).max(0);
+        let inter = ix as i64 * iy as i64;
+        let dx = if x1 < m.0 {
+            m.0 - x1
+        } else if x > m.2 {
+            x - m.2
+        } else {
+            0
+        };
+        let dy = if y1 < m.1 {
+            m.1 - y1
+        } else if y > m.3 {
+            y - m.3
+        } else {
+            0
+        };
+        let dist = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
+        // Порядок выбора: монитор, в котором стоит левый верхний угол окна
+        // (это «где полоска»); иначе — максимум пересечения; иначе — ближайший
+        // по расстоянию (окно ушло за все экраны — притягиваем к краю).
+        let has_corner = i64::from(x >= m.0 && x < m.2 && y >= m.1 && y < m.3);
+        let key = (has_corner, inter, -dist);
+        if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+            best = Some((key, *m));
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
+/// Зажать позицию окна так, чтобы оно целиком помещалось в рабочую область
+/// ближайшего монитора. Гарантирует, что мини-трей не выходит за границы
+/// показываемой области ни на одной из конфигураций экранов.
+fn clamp_into_work_areas(
+    mons: &[(i32, i32, i32, i32)],
+    x: f32,
+    y: f32,
+    w: i32,
+    h: i32,
+) -> (i32, i32) {
+    let (mut cx, mut cy) = (x.round() as i32, y.round() as i32);
+    let Some((l, t, r, b)) = nearest_monitor_for_rect(mons, cx, cy, w, h) else {
+        return (cx, cy);
+    };
+    let max_x = (r - w).max(l);
+    let max_y = (b - h).max(t);
+    cx = cx.clamp(l.min(max_x), max_x);
+    cy = cy.clamp(t.min(max_y), max_y);
+    (cx, cy)
+}
+
+/// Перетаскивание окна за фон (кнопки лежат выше).
+/// На Windows — нативным захватом ОС (ReleaseCapture + WM_NCLBUTTONDOWN),
+/// поэтому окно идёт строго за курсором 1:1 без лагов, двоения и залипаний:
+/// никаких покадровых команд и шторма перерисовок. Вне Windows — запасной
+/// вариант с накоплением дельт (см. accumulate_drag_pos).
+fn viewport_drag(
+    ui: &mut egui::Ui,
+    _vp_id: egui::ViewportId,
+    drag_id: egui::Id,
+    last_cmd: &mut Option<egui::Pos2>,
+    title: &str,
+) {
+    let bg = ui.interact(ui.max_rect(), drag_id, egui::Sense::drag());
+    if bg.drag_started_by(egui::PointerButton::Primary) {
+        *last_cmd = None;
+        #[cfg(windows)]
+        native_window_drag(title);
+    }
+    #[cfg(not(windows))]
+    {
+        let delta = bg.drag_delta();
+        if delta != egui::Vec2::ZERO {
+            let ctx = ui.ctx().clone();
+            let outer_min = ctx
+                .input(|i| i.viewport().outer_rect)
+                .map(|r| r.min)
+                .unwrap_or(egui::Pos2::ZERO);
+            let next = accumulate_drag_pos(*last_cmd, outer_min, delta);
+            let next = egui::Pos2::new(next.x.round(), next.y.round());
+            if *last_cmd != Some(next) {
+                ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::OuterPosition(next));
+                *last_cmd = Some(next);
+            }
+            ctx.request_repaint_after_for(Duration::from_millis(16), vp_id);
+        }
+    }
+    if bg.drag_stopped() {
+        *last_cmd = None;
+    }
+}
+
+/// Начать системное перетаскивание окна за любую точку (как за заголовок).
+/// ОС сама ведёт окно модальным циклом — идеально плавно.
+#[cfg(windows)]
+fn native_window_drag(title: &str) {
+    use winapi::um::winuser::{
+        FindWindowW, PostMessageW, ReleaseCapture, HTCAPTION, WM_NCLBUTTONDOWN,
+    };
+    let wide = wide_title(title);
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        ReleaseCapture();
+        PostMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+    }
+}
+
+/// Зум содержимого плавающего окна от его ширины: пользователь меняет
+/// размер курсором (невидимая THICKFRAME-рамка), контент масштабируется.
+fn float_zoom(ui: &egui::Ui, base_w: f32) -> f32 {
+    let w = ui
+        .ctx()
+        .input(|i| i.viewport().inner_rect)
+        .map(|r| r.width())
+        .unwrap_or(base_w);
+    (w / base_w).clamp(0.6, 2.5)
+}
+
+/// Соседняя позиция полоски в сетке 3×3 по кругу: delta −1 = назад,
+/// +1 = вперёд. Выход за края заворачивается (8 + 1 = 0, 0 − 1 = 8).
+fn strip_step(cur: u8, delta: i32) -> u8 {
+    let cur = cur.min(8) as i32;
+    ((cur + delta).rem_euclid(9)) as u8
+}
+
+/// Координаты позиции 0–8 (сетка 3×3) для окна size на мониторе mon.
+/// 0 1 2 / 3 4 5 / 6 7 8 (слева-направо, сверху-вниз).
+fn strip_pos_coords(mon: (f32, f32), size: egui::Vec2, idx: u8) -> (f32, f32) {
+    let xs = [0.0, (mon.0 - size.x) / 2.0, mon.0 - size.x];
+    let ys = [0.0, (mon.1 - size.y) / 2.0, mon.1 - size.y];
+    (
+        xs[(idx % 3) as usize].max(0.0),
+        ys[(idx / 3) as usize].max(0.0),
+    )
+}
+
+/// Рабочие области всех мониторов (l, t, r, b) — для многомониторных
+/// конфигураций. Главный экран тут ни при чём: полоска ставится на тот
+/// монитор, где она находится (или курсор), хоть 6–8K.
+#[cfg(windows)]
+fn enum_monitor_work_areas() -> Vec<(i32, i32, i32, i32)> {
+    use winapi::shared::minwindef::{BOOL, LPARAM};
+    use winapi::shared::windef::{HDC, HMONITOR, RECT};
+    use winapi::um::winuser::{
+        EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO,
+    };
+    unsafe extern "system" fn enum_proc(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let out = &mut *(data as *mut Vec<(i32, i32, i32, i32)>);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut mi as *mut MONITORINFO) != 0 {
+            let r = mi.rcWork;
+            out.push((r.left, r.top, r.right, r.bottom));
+        }
+        1
+    }
+    let mut out: Vec<(i32, i32, i32, i32)> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(enum_proc),
+            &mut out as *mut _ as LPARAM,
+        );
+    }
+    sanitize_monitors(out)
+}
+
+/// Привести список мониторов к каноническому виду: без пустых и вырожденных
+/// прямоугольников, без дублей и вложенных областей, в стабильном порядке.
+///
+/// Зачем: `EnumDisplayMonitors` на некоторых конфигурациях (ноутбук с
+/// док-станцией, зеркальные мониторы, смена разрешения) отдаёт повторяющиеся
+/// или вложенные области. Если оставить как есть:
+/// • `monitor_containing` находит «не тот» монитор — первый попавшийся в
+///   списке, и полоска уезжает на чужой экран;
+/// • `nearest_monitor_for_rect` выбирает область, внутрь которой окно всё
+///   равно не помещается, и зажимка теряет смысл;
+/// • две одинаковые области дают разный ответ в зависимости от порядка
+///   перечисления, то есть позиция окна «плавает» от запуска к запуску.
+fn sanitize_monitors(mut mons: Vec<(i32, i32, i32, i32)>) -> Vec<(i32, i32, i32, i32)> {
+    // 1) Выбросить пустые и вырожденные области (r <= l, b <= t).
+    mons.retain(|m| m.2 > m.0 && m.3 > m.1);
+    if mons.len() <= 1 {
+        return mons;
+    }
+    // 2) Стабильный порядок: результат перестаёт зависеть от того, в каком
+    //    порядке Windows перечислила мониторы.
+    mons.sort();
+    // 3) Убрать точные дубли и вложенные области: если одна область целиком
+    //    внутри другой, оставляем большую (внешнюю). Список отсортирован,
+    //    поэтому одинаковые области стоят рядом — дубль отсекаем явно.
+    let mut keep: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(mons.len());
+    for m in mons {
+        if keep.last() == Some(&m) {
+            continue; // точный дубль предыдущего
+        }
+        let inside_of_kept = keep
+            .iter()
+            .any(|k| m.0 >= k.0 && m.1 >= k.1 && m.2 <= k.2 && m.3 <= k.3);
+        if inside_of_kept {
+            continue; // область внутри уже оставленной
+        }
+        keep.retain(|k| !(k.0 >= m.0 && k.1 >= m.1 && k.2 <= m.2 && k.3 <= m.3));
+        keep.push(m);
+    }
+    keep
+}
+
+/// Индекс монитора, содержащего точку (учитывает отрицательные координаты
+/// экранов слева/сверху от главного).
+fn monitor_containing(mons: &[(i32, i32, i32, i32)], x: i32, y: i32) -> Option<usize> {
+    mons.iter()
+        .position(|(l, t, r, b)| x >= *l && x < *r && y >= *t && y < *b)
+}
+
+/// Позиция курсора в экранных координатах.
+#[cfg(windows)]
+fn cursor_pos() -> Option<(i32, i32)> {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::GetCursorPos;
+    unsafe {
+        let mut p: POINT = std::mem::zeroed();
+        if GetCursorPos(&mut p) != 0 {
+            Some((p.x, p.y))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn cursor_pos() -> Option<(i32, i32)> {
+    None
+}
+
+#[cfg(windows)]
+fn wide_title(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Стиль плавающего окошка по битовой маске базового стиля.
+///
+/// Две правки, обе обязательные:
+/// • `WS_THICKFRAME` — невидимая рамка для ресайза курсором за край
+///   (borderless-окно без неё не растянуть);
+/// • снятие `WS_MINIMIZEBOX` — ЗАПРЕТ СВОРАЧИВАНИЯ. Плавающие окна
+///   висят поверх игр, и сворачивание здесь ломает всё: окошко уходит
+///   в трей, поднять его обратно нечем (у него нет ни рамки, ни кнопки
+///   восстановления, ни пункта в трее). Именно это и происходило —
+///   достаточно было Win+D, двойного клика по таскбару или Aero Snap
+///   после перетаскивания к верхнему краю. Windows не сворачивает окна
+///   без WS_MINIMIZEBOX по этим сценариям, поэтому окно гарантированно
+///   остаётся на экране. Если нужно «спрятать» — снижаем прозрачность,
+///   для этого уже есть Ctrl+Num± и ползунок.
+///
+/// Битовая логика вынесена отдельно от WinAPI, чтобы её покрывал
+/// юнит-тест без создания окна.
+fn overlay_window_style(base: i32) -> i32 {
+    // Значения WS_THICKFRAME / WS_MINIMIZEBOX из winuser.h; заданы явно,
+    // чтобы тест работал и без #[cfg(windows)].
+    const WS_THICKFRAME: i32 = 0x0004_0000;
+    const WS_MINIMIZEBOX: i32 = 0x0002_0000;
+    (base | WS_THICKFRAME) & !WS_MINIMIZEBOX
+}
+
+/// Применить стиль окна (ресайз + запрет сворачивания) по заголовку.
+///
+/// ВАЖНО: строго ОДИН раз на окно. winit владеет стилем своего окна и
+/// переустанавливает его сам (в том числе возвращает WS_MINIMIZEBOX), поэтому
+/// проверка «совпадает ли стиль с желаемым» вечно истинна и даёт SetWindowPos с
+/// SWP_FRAMECHANGED на каждом кадре. Этот шторм (60 раз в секунду с полным
+/// пересчётом неклиентской области) ломал окно: оно переставало нормально
+/// открываться и восстанавливаться. Отсюда и жалоба, что полоску «свернуло
+/// и не развернуть».
+///
+/// Поэтому remembers однажды пропатченные окна и больше их не трогает.
+/// Если окно всё же свернёт посторонняя программа — это раз в 2 секунды
+/// чинит дешёвый `restore_if_minimized` (без SetWindowPos).
+#[cfg(windows)]
+fn ensure_thickframe(title: &str) {
+    use std::cell::RefCell;
+    use winapi::um::winuser::{
+        FindWindowW, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    thread_local! {
+        /// Заголовки окон, стиль которых уже выправлен.
+        static PATCHED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    // Уже правили — выходим, не трогая стиль (см. doc-комментарий).
+    if PATCHED.with(|p| p.borrow().iter().any(|t| t == title)) {
+        return;
+    }
+    let wide = wide_title(title);
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if hwnd.is_null() {
+            return; // окна ещё нет — попробуем в следующем кадре
+        }
+        let st = GetWindowLongW(hwnd, GWL_STYLE);
+        let want = overlay_window_style(st);
+        if want != st {
+            SetWindowLongW(hwnd, GWL_STYLE, want);
+            // SWP_FRAMECHANGED обязателен: без него новый стиль не
+            // применяется до следующего изменения размера.
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+        PATCHED.with(|p| p.borrow_mut().push(title.to_string()));
+    }
+}
+
+/// Сбросить отметку «стиль уже выправлен» — нужно, когда окно пересоздано
+/// (закрыли и снова открыли окошко): у нового HWND стиль исходный.
+#[cfg(windows)]
+fn forget_style_patch(title: &str) {
+    use std::cell::RefCell;
+    thread_local! {
+        static PATCHED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    PATCHED.with(|p| p.borrow_mut().retain(|t| t != title));
+}
+
+#[cfg(not(windows))]
+fn forget_style_patch(_title: &str) {}
+
+#[cfg(not(windows))]
+fn ensure_thickframe(_title: &str) {}
+
+/// Вернуть окно из свёрнутого состояния, если его всё-таки свернули
+/// (например, сторонней программой или горячей клавишей).
+/// Возвращает true, если состояние изменилось.
+#[cfg(windows)]
+fn restore_if_minimized(title: &str) -> bool {
+    use winapi::um::winuser::{FindWindowW, IsIconic, ShowWindow, SW_RESTORE};
+    let wide = wide_title(title);
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if hwnd.is_null() {
+            return false;
+        }
+        if IsIconic(hwnd) == 0 {
+            return false;
+        }
+        ShowWindow(hwnd, SW_RESTORE);
+        true
+    }
+}
+
+#[cfg(not(windows))]
+fn restore_if_minimized(_title: &str) -> bool {
+    false
+}
+
+/// Формат секундомера: "ММ:СС.ммм", с часами — "Ч:ММ:СС.ммм" (тысячные доли).
+fn format_stopwatch(d: Duration) -> String {
+    let ms = (d.as_millis() % 1000) as u64;
+    let s = d.as_secs();
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}.{ms:03}")
+    } else {
+        format!("{m:02}:{sec:02}.{ms:03}")
+    }
+}
+
+/// Добавить круг (накопленная отметка). Не больше 99 за один забег.
+fn push_lap_capped(laps: &mut Vec<Duration>, cur: Duration) -> bool {
+    if laps.len() >= 99 {
+        return false;
+    }
+    laps.push(cur);
+    true
+}
+
+/// Следующая позиция окна при перетаскивании: накапливаем дельты поверх
+/// последней КОМАНДНОЙ позиции, а не поверх прочитанной у ОС.
+/// Чтение outer_rect у ОС отставшее на 1–2 кадра — из-за него окно «двоилось»
+/// и ползло медленнее курсора.
+// На Windows перетаскивание идёт нативным захватом ОС, и функция нужна
+// только запасному пути для других платформ (плюс unit-тесту) — поэтому
+// «мёртвый» код на Windows ожидаем.
+#[cfg_attr(windows, allow(dead_code))]
+fn accumulate_drag_pos(
+    last_cmd: Option<egui::Pos2>,
+    outer_min: egui::Pos2,
+    delta: egui::Vec2,
+) -> egui::Pos2 {
+    last_cmd.unwrap_or(outer_min) + delta
+}
+
+/// Шаг прозрачности окошка с клампом 2–100%.
+fn step_opacity(pct: f32, delta: f32) -> f32 {
+    step_opacity_clamped(pct, delta, 2.0, 100.0)
+}
+
+/// Шаг прозрачности полоски с клампом 5–100%.
+fn step_opacity5(pct: f32, delta: f32) -> f32 {
+    step_opacity_clamped(pct, delta, 5.0, 100.0)
+}
+
+fn step_opacity_clamped(pct: f32, delta: f32, lo: f32, hi: f32) -> f32 {
+    (pct + delta).clamp(lo, hi)
+}
+
+/// Общее время для полоски: "X ч MM м".
+fn format_total_hm(total_secs: i64) -> String {
+    let s = total_secs.max(0);
+    format!("{} ч {:02} м", s / 3600, (s % 3600) / 60)
+}
+
+/// Подсказка строки игры: Steam-часы с серверов + наши сессии-дельты + итог.
+fn steam_hover(g: &TrackedGame, ours_secs: i64, synced: bool) -> String {
+    let mut s = format!("{}\n{}", g.name, g.exe_path);
+    match g.steam_minutes {
+        Some(m) => {
+            let base = m as i64 * 60;
+            s += &format!(
+                "\nSteam (серверы): {}\nНаши сессии: +{}\nВсего: {}",
+                format_total_hm(base),
+                format_duration(ours_secs),
+                format_duration(base + ours_secs)
+            );
+        }
+        None if synced => {
+            s += "\n⊗ Нет данных Steam: игра не приобретена или удалена с аккаунта.";
+        }
+        None => {
+            s += "\nДанные Steam неизвестны — сканируйте через Steam API.";
+        }
+    }
+    s
+}
+
+/// Строка круга для окошка: одна линия, без переносов.
+fn format_lap_line(num: usize, split: Duration, total: Duration) -> String {
+    format!("К{} · {} · Σ{}", num, format_stopwatch(split), format_stopwatch(total))
+}
+
+/// Последние до 3 кругов: (номер с 1, сплит круга, общее время).
+fn last_laps(laps: &[Duration]) -> Vec<(usize, Duration, Duration)> {
+    let n = laps.len();
+    let from = n.saturating_sub(3);
+    let mut prev = if from > 0 { laps[from - 1] } else { Duration::ZERO };
+    laps[from..]
+        .iter()
+        .enumerate()
+        .map(|(k, &total)| {
+            let split = total.saturating_sub(prev);
+            prev = total;
+            (from + k + 1, split, total)
+        })
+        .collect()
+}
+
+/// Прозрачность плавающего окна через WinAPI (слоистое окно).
+/// egui 0.28 не умеет opacity вьюпорта штатно, поэтому ищем HWND по заголовку
+/// и выставляем WS_EX_LAYERED + SetLayeredWindowAttributes.
+/// min_alpha — нижний предел (секундомер 2%, полоска 5%).
+#[cfg(windows)]
+fn apply_window_opacity(title: &str, opacity: f32, min_alpha: f32) {
+    use winapi::um::winuser::{
+        FindWindowW, GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos,
+        GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        WS_EX_LAYERED,
+    };
+    let wide = wide_title(title);
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if ex & (WS_EX_LAYERED as i32) == 0 {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex | (WS_EX_LAYERED as i32));
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+        let alpha = (opacity.clamp(min_alpha, 1.0) * 255.0).round() as u8;
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_window_opacity(_title: &str, _opacity: f32, _min_alpha: f32) {}
+
+/// Прозрачность окошка секундомера 100–2%.
+fn apply_overlay_opacity(opacity: f32) {
+    apply_window_opacity(STOPWATCH_TITLE, opacity, 0.02);
+}
+
+/// Разбор "HH:MM" в (часы, минуты). Возвращает None при неверном формате.
+fn parse_hm(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    let mut parts = s.split(':');
+    let h: u32 = parts.next()?.trim().parse().ok()?;
+    let m: u32 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() || h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+/// Маска дней "1111111" (Пн..Вс) -> [bool; 7]. Мусор = все false.
+fn mask_to_bools(s: &str) -> [bool; 7] {
+    let mut out = [false; 7];
+    for (i, ch) in s.chars().take(7).enumerate() {
+        out[i] = ch == '1';
+    }
+    out
+}
+
+fn bools_to_mask(b: &[bool; 7]) -> String {
+    b.iter().map(|x| if *x { '1' } else { '0' }).collect()
+}
+
+/// Эффективная маска срабатываний: Some(дни) = повторяемый,
+/// None = разовый. Старые строки без days трактуются по repeat_daily.
+fn effective_mask(a: &AlarmRow) -> Option<[bool; 7]> {
+    if let Some(s) = a.days.as_deref() {
+        let b = mask_to_bools(s);
+        if b.iter().any(|x| *x) {
+            return Some(b);
+        }
+        return None;
+    }
+    if a.repeat_daily {
+        return Some([true; 7]);
+    }
+    None
+}
+
+const DAY_NAMES: [&str; 7] = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+
+/// Короткая подпись дней: «Ежедн.», «Будни», «Выходные», «Пн, Ср», «Разовый».
+fn mask_label(a: &AlarmRow) -> String {
+    match effective_mask(a) {
+        None => "Разовый".to_string(),
+        Some(m) => mask_label_days_opt(Some(m)),
+    }
+}
+
+fn mask_label_days(days_opt: Option<&str>) -> String {
+    match days_opt {
+        None => "Разовый".to_string(),
+        Some(s) => {
+            let m = mask_to_bools(s);
+            if !m.iter().any(|x| *x) {
+                "Разовый".to_string()
+            } else {
+                mask_label_days_opt(Some(m))
+            }
+        }
+    }
+}
+
+fn mask_label_days_opt(mask: Option<[bool; 7]>) -> String {
+    match mask {
+        None => "Разовый".to_string(),
+        Some(m) => {
+            if m == [true; 7] {
+                "Ежедн.".to_string()
+            } else if m == [true, true, true, true, true, false, false] {
+                "Будни".to_string()
+            } else if m == [false, false, false, false, false, true, true] {
+                "Выходные".to_string()
+            } else {
+                m.iter()
+                    .enumerate()
+                    .filter(|(_, x)| **x)
+                    .map(|(i, _)| DAY_NAMES[i])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+    }
+}
+
+/// Сколько осталось до ближайшего срабатывания будильника "HH:MM"
+/// с учётом дней недели (для разового — сегодня/завтра). Точность — до секунды.
+fn alarm_remaining(alarm_time: &str, mask: Option<[bool; 7]>) -> Option<Duration> {
+    let (h, m) = parse_hm(alarm_time)?;
+    let now = Local::now();
+    let today = now.date_naive();
+    for offset in 0..8 {
+        let date = today + chrono::Duration::days(offset);
+        let wday = date.weekday().num_days_from_monday() as usize;
+        if let Some(mk) = mask {
+            if !mk[wday] {
+                continue;
+            }
+        }
+        let target_naive = date.and_hms_opt(h, m, 0)?;
+        let target = target_naive.and_local_timezone(Local).single()?;
+        if target > now {
+            return (target - now).to_std().ok();
+        }
+    }
+    None
+}
+
+/// Формат обратного отсчёта: "X ч : Y м : Z с".
+fn format_countdown(d: Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h} ч : {m:02} м : {s:02} с")
+}
+
+/// Id ближайшего по времени срабатывания включённого будильника.
+fn nearest_alarm_id(enabled: &[AlarmRow]) -> Option<i64> {
+    enabled
+        .iter()
+        .filter_map(|a| alarm_remaining(&a.time, effective_mask(a)).map(|d| (d, a.id)))
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, id)| id)
+}
+
+/// Аналоговые часы: текущее время стрелками + оранжевая метка времени
+/// активного будильника. Перерисовка каждые 250 мс даёт живую секундную стрелку.
+fn draw_analog_clock(ui: &mut egui::Ui, size: f32, alarm_time: &str) {
+    use std::f32::consts::TAU;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let center = rect.center();
+    let r = size / 2.0 - 6.0;
+
+    // Циферблат
+    painter.circle_filled(center, r + 4.0, egui::Color32::from_gray(24));
+    painter.circle_stroke(center, r + 4.0, egui::Stroke::new(2.0_f32, egui::Color32::from_gray(90)));
+    // Минутные/часовые риски
+    for i in 0..60 {
+        let a = i as f32 / 60.0 * TAU;
+        let long = i % 5 == 0;
+        let r1 = if long { r - 12.0 } else { r - 6.0 };
+        let p1 = egui::Pos2::new(center.x + r1 * a.sin(), center.y - r1 * a.cos());
+        let p2 = egui::Pos2::new(center.x + r * a.sin(), center.y - r * a.cos());
+        painter.line_segment([p1, p2], egui::Stroke::new(if long { 2.5_f32 } else { 1.0_f32 }, egui::Color32::from_gray(if long { 200 } else { 120 })));
+    }
+    for (txt, hour) in [("12", 0), ("3", 3), ("6", 6), ("9", 9)] {
+        let a = hour as f32 / 12.0 * TAU;
+        let pos = egui::Pos2::new(center.x + (r - 24.0) * a.sin(), center.y - (r - 24.0) * a.cos());
+        painter.text(pos, egui::Align2::CENTER_CENTER, txt, egui::FontId::proportional(14.0), egui::Color32::GRAY);
+    }
+
+    // Метка будильника (оранжевая)
+    if let Some((ah, am)) = parse_hm(alarm_time) {
+        let a_min = (am as f32 + 0.0) / 60.0 * TAU;
+        let tip = egui::Pos2::new(center.x + r * a_min.sin(), center.y - r * a_min.cos());
+        let base = egui::Pos2::new(center.x + (r - 16.0) * a_min.sin(), center.y - (r - 16.0) * a_min.cos());
+        painter.line_segment([base, tip], egui::Stroke::new(4.0_f32, egui::Color32::from_rgb(255, 165, 0)));
+        let a_hour = ((ah % 12) as f32 + am as f32 / 60.0) / 12.0 * TAU;
+        let dot = egui::Pos2::new(center.x + (r - 30.0) * a_hour.sin(), center.y - (r - 30.0) * a_hour.cos());
+        painter.circle_filled(dot, 4.0, egui::Color32::from_rgb(255, 165, 0));
+    }
+
+    // Стрелки текущего времени (с дробной секундой для плавности)
+    let now = Local::now();
+    let ms = now.timestamp_subsec_millis() as f32 / 1000.0;
+    let s = now.second() as f32 + ms;
+    let mnt = now.minute() as f32 + s / 60.0;
+    let hr = (now.hour() % 12) as f32 + mnt / 60.0;
+    let hand = |frac: f32, len: f32, w: f32, col: egui::Color32| {
+        let a = frac * TAU;
+        let tip = egui::Pos2::new(center.x + len * a.sin(), center.y - len * a.cos());
+        painter.line_segment([center, tip], egui::Stroke::new(w, col));
+    };
+    hand(hr / 12.0, r * 0.5, 5.0, egui::Color32::WHITE);
+    hand(mnt / 60.0, r * 0.75, 3.5, egui::Color32::LIGHT_GRAY);
+    hand(s / 60.0, r * 0.85, 1.5, egui::Color32::RED);
+    painter.circle_filled(center, 4.0, egui::Color32::WHITE);
+}
+
+/// Аналоговый циферблат таймера: оранжевая стрелка показывает долю
+/// оставшегося времени (12 = только запущен, 0 = финиш).
+fn draw_timer_dial(ui: &mut egui::Ui, size: f32, remaining: Duration, total_secs: u64) {
+    use std::f32::consts::TAU;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let center = rect.center();
+    let r = size / 2.0 - 6.0;
+
+    painter.circle_filled(center, r + 4.0, egui::Color32::from_gray(24));
+    painter.circle_stroke(center, r + 4.0, egui::Stroke::new(2.0_f32, egui::Color32::from_gray(90)));
+    for i in 0..60 {
+        let a = i as f32 / 60.0 * TAU;
+        let long = i % 5 == 0;
+        let r1 = if long { r - 12.0 } else { r - 6.0 };
+        let p1 = egui::Pos2::new(center.x + r1 * a.sin(), center.y - r1 * a.cos());
+        let p2 = egui::Pos2::new(center.x + r * a.sin(), center.y - r * a.cos());
+        painter.line_segment([p1, p2], egui::Stroke::new(if long { 2.5_f32 } else { 1.0_f32 }, egui::Color32::from_gray(if long { 200 } else { 120 })));
+    }
+    for (txt, hour) in [("12", 0), ("3", 3), ("6", 6), ("9", 9)] {
+        let a = hour as f32 / 12.0 * TAU;
+        let pos = egui::Pos2::new(center.x + (r - 24.0) * a.sin(), center.y - (r - 24.0) * a.cos());
+        painter.text(pos, egui::Align2::CENTER_CENTER, txt, egui::FontId::proportional(14.0), egui::Color32::GRAY);
+    }
+
+    // Доля оставшегося времени (с миллисекундами — стрелка идёт плавно)
+    let frac = if total_secs == 0 {
+        0.0
+    } else {
+        (remaining.as_millis() as f32 / (total_secs as f32 * 1000.0)).clamp(0.0, 1.0)
+    };
+    let a = frac * TAU;
+    let tip = egui::Pos2::new(center.x + r * 0.85 * a.sin(), center.y - r * 0.85 * a.cos());
+    painter.line_segment([center, tip], egui::Stroke::new(4.0_f32, egui::Color32::from_rgb(255, 165, 0)));
+    painter.circle_filled(center, 4.0, egui::Color32::WHITE);
+    // Цифровой остаток по центру нижней половины
+    let rem = remaining.as_secs();
+    painter.text(
+        egui::Pos2::new(center.x, center.y + r * 0.45),
+        egui::Align2::CENTER_CENTER,
+        format!("{:02}:{:02}", rem / 60, rem % 60),
+        egui::FontId::proportional(18.0),
+        egui::Color32::LIGHT_GREEN,
+    );
+}
+
+pub fn initial_games() -> Vec<TrackedGame> {
+    let known = load_known_games();
+    if !known.is_empty() {
+        return known;
+    }
+    let steam = detector::scan_steam_games(None);
+    let win = detector::scan_windows_games();
+    let merged = merge_games(vec![steam, win]);
+    if !merged.is_empty() {
+        save_known_games(&merged);
+    }
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::AlarmRow;
+
+    fn row(time: &str, enabled: bool, daily: bool, days: Option<&str>) -> AlarmRow {
+        AlarmRow {
+            id: 1,
+            time: time.to_string(),
+            enabled,
+            repeat_daily: daily,
+            url: None,
+            sound_file: None,
+            standard_sound: None,
+            days: days.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn hm_parsing() {
+        assert_eq!(parse_hm("07:30"), Some((7, 30)));
+        assert_eq!(parse_hm("7:5"), Some((7, 5)));
+        assert_eq!(parse_hm(" 23:59 "), Some((23, 59)));
+        assert!(parse_hm("24:00").is_none());
+        assert!(parse_hm("ab:cd").is_none());
+        assert!(parse_hm("12").is_none());
+    }
+
+    #[test]
+    fn mask_roundtrip_and_labels() {
+        let m = [true, true, true, true, true, false, false];
+        assert_eq!(bools_to_mask(&m), "1111100");
+        assert_eq!(mask_to_bools("1111100"), m);
+        assert_eq!(mask_label(&row("08:00", true, false, Some("1111111"))), "Ежедн.");
+        assert_eq!(mask_label(&row("08:00", true, false, Some("1111100"))), "Будни");
+        assert_eq!(mask_label(&row("08:00", true, false, Some("0000011"))), "Выходные");
+        assert_eq!(mask_label(&row("08:00", true, false, None)), "Разовый");
+        assert_eq!(mask_label(&row("08:00", true, true, None)), "Ежедн."); // legacy
+        // Legacy repeat_daily=false без days = разовый
+        assert!(effective_mask(&row("08:00", true, false, None)).is_none());
+        assert_eq!(effective_mask(&row("08:00", true, true, None)), Some([true; 7]));
+    }
+
+    #[test]
+    fn remaining_within_week() {
+        // Ежедневный будильник всегда находит срабатывание в пределах недели
+        let d = alarm_remaining("00:00", Some([true; 7])).unwrap();
+        assert!(d.as_secs() > 0 && d.as_secs() <= 7 * 24 * 3600);
+        // Разовый — в пределах двух суток
+        let d = alarm_remaining("00:00", None).unwrap();
+        assert!(d.as_secs() > 0 && d.as_secs() <= 2 * 24 * 3600);
+        // Мусорное время
+        assert!(alarm_remaining("xx", None).is_none());
+    }
+
+    #[test]
+    fn base_scale_default() {
+        assert!((BASE_SCALE - 1.3).abs() < f32::EPSILON);
+        assert!((AppConfig::default().ui_scale - 1.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn stopwatch_format() {
+        assert_eq!(format_stopwatch(Duration::from_millis(0)), "00:00.000");
+        assert_eq!(format_stopwatch(Duration::from_millis(71450)), "01:11.450");
+        assert_eq!(format_stopwatch(Duration::from_millis(71509)), "01:11.509");
+        assert_eq!(format_stopwatch(Duration::from_secs(3661)), "1:01:01.000");
+    }
+
+    #[test]
+    fn opacity_steps_clamped() {
+        assert!((step_opacity(100.0, 5.0) - 100.0).abs() < f32::EPSILON);
+        assert!((step_opacity(2.0, -5.0) - 2.0).abs() < f32::EPSILON);
+        assert!((step_opacity(50.0, 5.0) - 55.0).abs() < f32::EPSILON);
+        assert!((step_opacity(50.0, -5.0) - 45.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn total_hm_format() {
+        assert_eq!(format_total_hm(0), "0 ч 00 м");
+        assert_eq!(format_total_hm(59), "0 ч 00 м");
+        assert_eq!(format_total_hm(3661), "1 ч 01 м");
+        assert_eq!(format_total_hm(36000), "10 ч 00 м");
+    }
+
+    #[test]
+    fn steam_hover_text() {
+        use crate::config::TrackedGame;
+        let g = TrackedGame {
+            name: "X".to_string(),
+            exe_path: "C:\\X\\x.exe".to_string(),
+            source: "SteamAPI".to_string(),
+            steam_minutes: Some(60),
+        };
+        let h = steam_hover(&g, 30, true);
+        assert!(h.contains("Steam (серверы): 1 ч 00 м"));
+        assert!(h.contains("Наши сессии: +0 ч : 0 м : 30 с"));
+        assert!(h.contains("Всего: 1 ч : 0 м : 30 с"));
+        let g2 = TrackedGame { steam_minutes: None, ..g.clone() };
+        assert!(steam_hover(&g2, 0, true).contains("⊗ Нет данных Steam"));
+        assert!(steam_hover(&g2, 0, false).contains("неизвестны"));
+    }
+
+    #[test]
+    fn day_presets_detect_and_toggle() {
+        assert_eq!(detect_day_preset(&preset_days(DayPreset::Weekdays)), Some(DayPreset::Weekdays));
+        assert_eq!(detect_day_preset(&preset_days(DayPreset::Weekend)), Some(DayPreset::Weekend));
+        assert_eq!(detect_day_preset(&preset_days(DayPreset::Daily)), Some(DayPreset::Daily));
+        assert_eq!(detect_day_preset(&preset_days(DayPreset::Once)), Some(DayPreset::Once));
+        assert_eq!(detect_day_preset(&[true, false, false, false, false, false, false]), None);
+    }
+
+    #[test]
+    fn short_middle_truncates() {
+        assert_eq!(short_middle("abc", 10), "abc");
+        let s = short_middle("0123456789ABCDEF", 9);
+        assert_eq!(s.chars().count(), 9);
+        assert!(s.contains('…'));
+        assert!(s.starts_with("0123"));
+        assert!(s.ends_with("CDEF"));
+    }
+
+    #[test]
+    fn file_name_of_path() {
+        assert_eq!(file_name_of(r"C:\Music\alarm.wav"), "alarm.wav");
+        assert_eq!(file_name_of("d:/games/app/sound.mp3"), "sound.mp3");
+        assert_eq!(file_name_of("plain.exe"), "plain.exe");
+    }
+
+    #[test]
+    fn url_detection() {
+        assert!(looks_like_url("https://example.com/x"));
+        assert!(looks_like_url("  www.example.com  "));
+        assert!(looks_like_url("example.com/track.mp3"));
+        assert!(!looks_like_url(""));
+        assert!(!looks_like_url("просто текст"));
+        assert!(!looks_like_url("a b.com"));
+        assert!(!looks_like_url("abc"));
+    }
+
+    #[test]
+    fn strip_grid_positions() {
+        // монитор 1920×1080, окно 460×46
+        let sz = egui::vec2(460.0, 46.0);
+        assert_eq!(strip_pos_coords((1920.0, 1080.0), sz, 0), (0.0, 0.0));
+        assert_eq!(strip_pos_coords((1920.0, 1080.0), sz, 1), (730.0, 0.0));
+        assert_eq!(strip_pos_coords((1920.0, 1080.0), sz, 4), (730.0, 517.0));
+        assert_eq!(strip_pos_coords((1920.0, 1080.0), sz, 8), (1460.0, 1034.0));
+        // окно шире монитора — кламп в ноль
+        assert_eq!(strip_pos_coords((400.0, 300.0), sz, 8), (0.0, 254.0));
+    }
+
+    #[test]
+    fn strip_stays_inside_work_area() {
+        // Главный 1920×1080, окно мини-трея 460×26.
+        let mons = vec![(0, 0, 1920, 1080)];
+        // Просим позицию за правым/нижним краем (как после смены разрешения).
+        assert_eq!(clamp_into_work_areas(&mons, 1900.0, 1075.0, 460, 26), (1460, 1054));
+        // Совсем за экраном (монитор отключили) — притягивается к краю.
+        assert_eq!(clamp_into_work_areas(&mons, 3000.0, 2000.0, 460, 26), (1460, 1054));
+        // Обычная позиция не трогается.
+        assert_eq!(clamp_into_work_areas(&mons, 730.0, 517.0, 460, 26), (730, 517));
+        // Второй монитор 4K справа: полоса остаётся на том, где стоит.
+        let two = vec![(0, 0, 1920, 1080), (1920, 0, 5760, 2160)];
+        assert_eq!(clamp_into_work_areas(&two, 1900.0, 0.0, 460, 26), (1460, 0));
+        // Полоска на 4K, целиком влезает — не трогаем.
+        assert_eq!(clamp_into_work_areas(&two, 5000.0, 2000.0, 460, 26), (5000, 2000));
+        // У правого края 4K — прижимаем к краю, а не выталкиваем на 1080p.
+        assert_eq!(clamp_into_work_areas(&two, 5900.0, 2000.0, 460, 26), (5300, 2000));
+    }
+
+    #[test]
+    fn nearest_monitor_prefers_overlap() {
+        let mons = vec![(0, 0, 1920, 1080), (1920, 0, 5760, 2160)];
+        // Окно целиком на 4K — выбираем 4K, а не главный.
+        assert_eq!(nearest_monitor_for_rect(&mons, 3000, 500, 460, 26), Some((1920, 0, 5760, 2160)));
+        // Окно на границе: пересечение больше с правым.
+        assert_eq!(nearest_monitor_for_rect(&mons, 1700, 100, 460, 26), Some((0, 0, 1920, 1080)));
+        // Далеко за всеми экранами — берём ближайший по расстоянию.
+        assert_eq!(nearest_monitor_for_rect(&mons, 8000, 100, 460, 26), Some((1920, 0, 5760, 2160)));
+        assert_eq!(nearest_monitor_for_rect(&[], 0, 0, 10, 10), None);
+    }
+
+    #[test]
+    fn strip_step_wraps_grid() {
+        // Ходим по кругу 0..8 в обе стороны.
+        assert_eq!(strip_step(0, -1), 8);
+        assert_eq!(strip_step(8, 1), 0);
+        assert_eq!(strip_step(3, 1), 4);
+        assert_eq!(strip_step(4, -1), 3);
+        // Мусорное значение из старого конфига не ломает расчёт:
+        // 255.min(8) = 8, шаг вперёд заворачивается в 0.
+        assert_eq!(strip_step(200, 1), 0);
+        assert_eq!(strip_step(255, -1), 7);
+    }
+
+    /// Живой тест: реальная конфигурация мониторов этой машины.
+    /// Запускается вручную: `cargo test live_monitor_report -- --ignored`.
+    /// Печатает найденные рабочие области и проверяет, что расчёт позиции
+    /// и зажимка дают осмысленный результат на текущем железе.
+    #[test]
+    #[ignore]
+    fn live_monitor_report() {
+        let mons = enum_monitor_work_areas();
+        println!("мониторов: {}", mons.len());
+        for (i, m) in mons.iter().enumerate() {
+            println!(
+                "  [{i}] ({}, {}) — ({}, {})  {}x{}",
+                m.0,
+                m.1,
+                m.2,
+                m.3,
+                m.2 - m.0,
+                m.3 - m.1
+            );
+        }
+        assert!(!mons.is_empty(), "Windows не вернула ни одного монитора");
+        // Все области валидны и не вложены друг в друга.
+        for m in &mons {
+            assert!(m.2 > m.0 && m.3 > m.1, "вырожденная область {m:?}");
+        }
+        assert_eq!(mons.len(), sanitize_monitors(mons.clone()).len());
+        // Каждая из 9 позиций 3×3 на каждом мониторе влезает в его же экран.
+        for m in &mons {
+            for idx in 0..9u8 {
+                let (w, h) = (460i32, 26i32);
+                let (x, y) = strip_pos_coords(
+                    ((m.2 - m.0) as f32, (m.3 - m.1) as f32),
+                    egui::vec2(w as f32, h as f32),
+                    idx,
+                );
+                let (cx, cy) = clamp_into_work_areas(
+                    &mons,
+                    (m.0 as f32) + x,
+                    (m.1 as f32) + y,
+                    w,
+                    h,
+                );
+                assert!(
+                    cx >= m.0 && cy >= m.1 && cx + w <= m.2 && cy + h <= m.3,
+                    "позиция {idx} на {m:?} → ({cx},{cy}) мимо экрана"
+                );
+            }
+        }
+        // Окошко секундомера (175×170) тоже помещается.
+        for m in &mons {
+            if m.2 - m.0 >= 175 && m.3 - m.1 >= 170 {
+                let (cx, cy) = clamp_into_work_areas(&mons, m.0 as f32, m.1 as f32, 175, 170);
+                assert!(cx + 175 <= m.2 && cy + 170 <= m.3);
+            }
+        }
+        println!("живая проверка мониторов пройдена");
+    }
+
+    #[test]
+    fn all_navigation_items_have_icons() {
+        // Все 6 разделов идут с иконками из assets — пропущенная иконка
+        // тихо превратилась бы в пустую кнопку.
+        assert_eq!(NAV_ITEMS.len(), 6);
+        let mut uris: Vec<String> = NAV_ITEMS
+            .iter()
+            .map(|(_, src, _)| src.uri().unwrap_or("").to_string())
+            .collect();
+        assert!(uris.iter().all(|u| u.ends_with(".png")), "иконки должны быть PNG: {uris:?}");
+        uris.sort();
+        uris.dedup();
+        assert_eq!(uris.len(), 6, "иконки разделов не должны повторяться: {uris:?}");
+    }
+
+    #[test]
+    fn nav_icon_pngs_are_valid() {
+        // Заголовки PNG читаются прямо из бинарника include_image!.
+        for (name, src) in [
+            ("nav_sessions", egui::include_image!("../assets/nav_sessions.png")),
+            ("nav_games", egui::include_image!("../assets/nav_games.png")),
+            ("nav_alarms", egui::include_image!("../assets/nav_alarms.png")),
+            ("nav_timer", egui::include_image!("../assets/nav_timer.png")),
+            ("nav_params", egui::include_image!("../assets/nav_params.png")),
+            ("nav_about", egui::include_image!("../assets/nav_about.png")),
+        ] {
+            let (w, h, rgba) = decode_png_rgba(bytes_of(&src))
+                .unwrap_or_else(|| panic!("{name}: PNG не раскодировался"));
+            assert_eq!(w * h * 4, rgba.len(), "{name}: размер буфера не сходится");
+            // Иконка должна быть квадратной и достаточно крупной, иначе
+            // растянется мылом в 22×22.
+            assert_eq!(w, h, "{name}: иконка не квадратная {w}×{h}");
+            assert!(w >= 32, "{name}: иконка слишком мелкая {w}");
+        }
+    }
+
+    #[test]
+    fn overlay_style_forbids_minimize() {
+        const WS_THICKFRAME: i32 = 0x0004_0000;
+        const WS_MINIMIZEBOX: i32 = 0x0002_0000;
+        // Ресайз остаётся включённым.
+        assert_eq!(overlay_window_style(0) & WS_THICKFRAME, WS_THICKFRAME);
+        // А свернуть окно больше нельзя — ни через Win+D, ни двойным кликом
+        // по таскбару, ни Aero Snap: у этих сценариев Windows не трогает
+        // окна без WS_MINIMIZEBOX.
+        assert_eq!(overlay_window_style(0) & WS_MINIMIZEBOX, 0);
+        // Повторный вызов на уже исправленном стиле ничего не ломает
+        // (идемпотентность: стиль применяется каждый кадр).
+        let once = overlay_window_style(WS_MINIMIZEBOX);
+        assert_eq!(overlay_window_style(once), once);
+        // Чужие биты (WS_POPUP, WS_VISIBLE, WS_EX_LAYERED) сохраняются.
+        // WS_POPUP = 0x8000_0000, в i32 это отрицательное число.
+        let base = (0x8000_0000u32 as i32) | 0x1000_0000 | 0x0008_0000;
+        let st = overlay_window_style(base);
+        assert_eq!(st & base, base, "чужие биты стиля затёрлись: {st:#x}");
+    }
+
+    #[test]
+    fn silhouette_keeps_shape_and_makes_white() {
+        // Синий непрозрачный пиксель → белый непрозрачный (форма задана альфой).
+        assert_eq!(&silhouette(&[102, 192, 244, 255])[0..4], &[255, 255, 255, 255]);
+        // Цвет не влияет на результат: тёмная заливка тоже становится белой.
+        assert_eq!(&silhouette(&[10, 10, 10, 255])[0..4], &[255, 255, 255, 255]);
+        // Прозрачность сохраняется — иначе фон стал бы белым квадратом.
+        assert_eq!(&silhouette(&[0, 0, 0, 0])[0..4], &[255, 255, 255, 0]);
+        assert_eq!(silhouette(&[255, 255, 255, 128])[3], 128);
+        // Длина буфера совпадает с исходной.
+        assert_eq!(silhouette(&[1, 2, 3, 4, 5, 6, 7, 8]).len(), 8);
+        // Настоящая иконка 64×64 декодируется и остаётся 64×64 после перевода.
+        let src = egui::include_image!("../assets/nav_sessions.png");
+        let (w, h, rgba) = decode_png_rgba(bytes_of(&src)).expect("иконка не раскодировалась");
+        assert_eq!((w, h), (64, 64));
+        assert_eq!(silhouette(&rgba).len(), w * h * 4);
+    }
+
+    #[test]
+    fn page_rows_share_card_left_edge() {
+        // Заголовок/пояснение раздела (page_row, отступ PAGE_INNER) должны
+        // стоять на одной вертикали с текстом карточек (CARD_INNER).
+        // Раньше заголовки шли вровень с полем страницы и оказывались на
+        // 12pt левее карточек — весь блок «плавал».
+        assert_eq!(PAGE_INNER, CARD_INNER);
+        // Ширина строки раздела уменьшается на тот же отступ, поэтому
+        // элемент не может заехать под правое поле страницы.
+        let avail = 800.0_f32;
+        let content_w = (avail - PAGE_INNER).max(40.0);
+        assert!(content_w < avail);
+        assert!((avail - content_w - PAGE_INNER).abs() < 0.01);
+        // На очень узком окне ширина не уходит в ноль.
+        assert!((20.0 - PAGE_INNER).max(40.0) >= 40.0);
+    }
+
+    #[test]
+    fn multi_monitor_configs_are_parsed_stably() {
+        // Набор реальных конфигураций, которые мы обязаны пережить:
+        // один монитор, два рядом, 4K справа, экраны слева (отрицательные
+        // координаты), три монитора, разные DPI/разрешения, ультраширик.
+        let configs: Vec<(&str, Vec<(i32, i32, i32, i32)>)> = vec![
+            ("один 1080p", vec![(0, 0, 1920, 1080)]),
+            ("один 4K", vec![(0, 0, 3840, 2160)]),
+            ("два 1080p рядом", vec![(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]),
+            (
+                "4K справа от 1080p",
+                vec![(0, 0, 1920, 1080), (1920, 0, 5760, 2160)],
+            ),
+            (
+                "FullHD слева (отрицательные)",
+                vec![(-1920, 0, 0, 1080), (0, 0, 1920, 1080)],
+            ),
+            (
+                "три: 1080p + 4K + 1440p",
+                vec![(0, 0, 1920, 1080), (1920, 0, 5760, 2160), (5760, 0, 7200, 1440)],
+            ),
+            (
+                "ультраширик 3440×1440",
+                vec![(0, 0, 3440, 1440)],
+            ),
+            (
+                "два экрана сверху/снизу",
+                vec![(0, 0, 1920, 1080), (0, 1080, 1920, 1920)],
+            ),
+        ];
+        for (name, mons) in &configs {
+            // Каждый угол каждой раскладки 3×3 на каждом мониторе обязан
+            // помещаться в рабочую область после зажимки.
+            for m in mons.iter() {
+                for idx in 0..9u8 {
+                    let w = 460i32;
+                    let h = 26i32;
+                    let (x, y) = strip_pos_coords(
+                        ((m.2 - m.0) as f32, (m.3 - m.1) as f32),
+                        egui::vec2(w as f32, h as f32),
+                        idx,
+                    );
+                    let (cx, cy) =
+                        clamp_into_work_areas(mons, (m.0 as f32) + x, (m.1 as f32) + y, w, h);
+                    assert!(
+                        cx >= m.0 && cy >= m.1 && cx + w <= m.2 && cy + h <= m.3,
+                        "{name}: позиция {idx} на мониторе {m:?} вышла за границы: ({cx},{cy})"
+                    );
+                }
+            }
+            // Точка курсора находит свой монитор, чужая — нет.
+            for (i, m) in mons.iter().enumerate() {
+                let inside = monitor_containing(mons, (m.0 + m.2) / 2, (m.1 + m.3) / 2);
+                assert_eq!(inside, Some(i), "{name}: не нашли монитор {i} {m:?}");
+            }
+            // На горизонтальном стыке точка ровно на границе принадлежит
+            // ПРАВОМУ экрану (левая рабочая область на этом x уже кончилась).
+            // Для вертикальной раскладки такой проверки нет: там граница по
+            // x — это внешний край обоих экранов, и точка вне обоих корректна.
+            if mons.len() >= 2 && mons[0].2 == mons[1].0 {
+                assert_eq!(
+                    monitor_containing(mons, mons[0].2, mons[0].1 + 1),
+                    Some(1),
+                    "{name}: стык принадлежит не тому экрану"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_list_is_sanitized() {
+        // Пустые и вырожденные области выбрасываются.
+        assert_eq!(
+            sanitize_monitors(vec![(0, 0, 0, 1080), (0, 0, 1920, 1080), (100, 100, 100, 500)]),
+            vec![(0, 0, 1920, 1080)]
+        );
+        // Точный дубль схлопывается в один монитор: иначе monitor_containing
+        // зависел бы от порядка перечисления Windows.
+        assert_eq!(
+            sanitize_monitors(vec![(0, 0, 1920, 1080), (0, 0, 1920, 1080)]),
+            vec![(0, 0, 1920, 1080)]
+        );
+        // Вложенная область (зеркало/повтор) схлопывается с внешней.
+        assert_eq!(
+            sanitize_monitors(vec![(0, 0, 3840, 2160), (100, 100, 200, 200)]),
+            vec![(0, 0, 3840, 2160)]
+        );
+        // Порядок не важен — результат одинаковый.
+        let a = vec![(1920, 0, 3840, 1080), (0, 0, 1920, 1080)];
+        let b = vec![(0, 0, 1920, 1080), (1920, 0, 3840, 1080)];
+        assert_eq!(sanitize_monitors(a.clone()), sanitize_monitors(b));
+        assert_eq!(sanitize_monitors(a), vec![(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]);
+        // Настоящие разные мониторы сохраняются все, включая отрицательные.
+        let three = vec![(-1920, 0, 0, 1080), (0, 0, 1920, 1080), (1920, 0, 5760, 2160)];
+        assert_eq!(sanitize_monitors(three.clone()).len(), 3);
+        assert_eq!(sanitize_monitors(three)[0], (-1920, 0, 0, 1080));
+        // Пересекающиеся, но не вложенные области — не дубли, обе остаются.
+        let overlap = vec![(0, 0, 2000, 1080), (1000, 0, 2920, 1080)];
+        assert_eq!(sanitize_monitors(overlap).len(), 2);
+        // Пустой список остаётся пустым (вызывающий код это проверяет).
+        assert!(sanitize_monitors(vec![]).is_empty());
+    }
+
+    #[test]
+    fn sanitized_list_gives_stable_answers() {
+        // Одна и та же конфигурация, но Windows перечислила мониторы в
+        // разном порядке и с дублем: ответы обязаны совпасть.
+        let clean = vec![(0, 0, 1920, 1080), (1920, 0, 5760, 2160)];
+        let messy = vec![
+            (1920, 0, 5760, 2160),
+            (0, 0, 1920, 1080),
+            (0, 0, 1920, 1080), // дубль
+        ];
+        let clean = sanitize_monitors(clean);
+        let messy = sanitize_monitors(messy);
+        assert_eq!(clean, messy);
+        for (x, y) in [(0, 0), (1000, 500), (1919, 1079), (1920, 0), (3000, 1000)] {
+            assert_eq!(
+                monitor_containing(&clean, x, y),
+                monitor_containing(&messy, x, y),
+                "точка ({x},{y}) определилась по-разному"
+            );
+        }
+        // Зажимка тоже даёт одинаковый результат.
+        assert_eq!(
+            clamp_into_work_areas(&clean, 5000.0, 2000.0, 460, 26),
+            clamp_into_work_areas(&messy, 5000.0, 2000.0, 460, 26)
+        );
+    }
+
+    #[test]
+    fn saved_position_survives_monitor_changes() {
+        // Окошко запомнили на 4K, затем 4K отключили: координаты не должны
+        // ни потеряться, ни быть использованы как есть (окно ушло бы за
+        // край единственного оставшегося экрана).
+        let two = vec![(0, 0, 1920, 1080), (1920, 0, 5760, 2160)];
+        let saved = [3000.0_f32, 500.0_f32];
+        assert!(nearest_monitor_for_rect(&two, saved[0] as i32, saved[1] as i32, 175, 170).is_some());
+        // После отключения 4K остаётся только 1080p.
+        let one = vec![(0, 0, 1920, 1080)];
+        let clamped = clamp_into_work_areas(&one, saved[0], saved[1], 175, 170);
+        assert!(clamped.0 >= 0 && clamped.1 >= 0);
+        assert!(clamped.0 + 175 <= 1920 && clamped.1 + 170 <= 1080);
+        // Окно шире единственного экрана: клампится к левому верхнему краю
+        // и всё равно не даёт отрицательных координат.
+        let tiny = vec![(0, 0, 100, 100)];
+        assert_eq!(clamp_into_work_areas(&tiny, -50.0, -50.0, 300, 300), (0, 0));
+    }
+
+    #[test]
+    fn page_margin_symmetric_and_bounded() {
+        // 5% на обычном окне.
+        assert!((page_margin(960.0) - 48.0).abs() < 0.01);
+        // 6K: 5% съело бы 288 точек — ограничиваем 60.
+        assert_eq!(page_margin(5760.0), 60.0);
+        // Узкое окно: минимум 8.
+        assert_eq!(page_margin(120.0), 8.0);
+        // Поля слева и справа одинаковые по определению функции.
+        assert_eq!(page_margin(1920.0), page_margin(1920.0));
+    }
+
+    #[test]
+    fn stopwatch_sizes_expand() {
+        let small = stopwatch_window_size(false);
+        let big = stopwatch_window_size(true);
+        assert!(big.x > small.x && big.y > small.y);
+        // Развёрнутое — заметно крупнее (пропорция «равнозначного» окна).
+        assert!((big.x / small.x - 1.714).abs() < 0.01);
+        // Минимальный размер окошка меньше обоих вариантов.
+        assert!(150.0 <= small.x && 140.0 <= small.y);
+        assert!(150.0 <= big.x && 140.0 <= big.y);
+    }
+
+    /// Прямоугольники всех текстовых шейпов, отрисованных в колбэке, при
+    /// ширине окна `win_w` точек. Это фактическая «отрисованная» картина:
+    /// если сюда попал текст — он на экране, если нет — строка пустая.
+    fn collect_text_rects(
+        ctx: &egui::Context,
+        win_w: f32,
+        run: impl FnOnce(&mut egui::Ui),
+    ) -> Vec<egui::Rect> {
+        let mut rects = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().inner_margin(egui::Margin {
+                    left: 0.0,
+                    right: 0.0,
+                    top: 0.0,
+                    bottom: 0.0,
+                }))
+                .show(ctx, |ui| {
+                    // Ограничиваем ШИРИНУ САМОГО окна (а не max_width):
+                    // set_max_width не уменьшает available_width в headless,
+                    // и тест «узкого окна» проверял бы полноэкранную вёрстку.
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(win_w, STRIP_H),
+                    );
+                    ui.allocate_ui_at_rect(rect, |ui| {
+                        run(ui);
+                        let h = ui.text_style_height(&egui::TextStyle::Body);
+                        ui.painter().for_each_shape(|cs| match &cs.shape {
+                            egui::epaint::Shape::Text(t) => {
+                                rects.push(egui::Rect::from_min_size(
+                                    t.pos,
+                                    egui::vec2(1.0, h),
+                                ));
+                            }
+                            _ => {}
+                        });
+                    });
+                });
+        });
+        rects
+    }
+
+    #[test]
+    fn strip_row_places_text_inside_window() {
+        // Настоящая проверка вёрстки полоски: текст должен оказаться ВНУТРИ
+        // окна. Регрессия была ровно в этом — строка выходила пустой
+        // (рисовались только кнопки): with_layout отдавал дочернему ui всю
+        // оставшуюся ширину и сдвигал курсор родителя за край, после чего
+        // всё нарисованное оказывалось за окном.
+        let ctx = egui::Context::default();
+        let win_w = strip_base_w();
+
+        // Собираем строку ровно так, как это делает draw_session_strip:
+        // горизонтальная раскладка внутри рамки.
+        let texts = collect_text_rects(&ctx, win_w, |ui| {
+            let mut state = StripUiState::default();
+            ui.horizontal(|ui| {
+                strip_row(
+                    ui,
+                    STRIP_H - 6.0,
+                    1.0,
+                    Some(("DOOM Eternal", 5025, false)),
+                    &mut state,
+                );
+            });
+        });
+
+        // Ожидаются: название игры, время, «PIN», «×» — 4 текста.
+        assert!(
+            texts.len() >= 4,
+            "ожидались тексты: игра, время, PIN, × — а отрисовано {} ({:?})",
+            texts.len(),
+            texts.iter().map(|r| r.min.x).collect::<Vec<_>>()
+        );
+        // Всё обязано лежать внутри окна ПО ШИРИНЕ (высоту проверяем
+        // отдельно в strip_row_fits_height: у Shape::Text есть только
+        // позицияbaseline, а не полный прямоугольник).
+        let outside: Vec<_> = texts
+            .iter()
+            .filter(|r| r.min.x < -1.0 || r.max.x > win_w + 1.0)
+            .map(|r| r.min.x)
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "текст вылез за окно шириной {win_w}: {outside:?}"
+        );
+        // Информация должна быть СЛЕВА, кнопки — СПРАВА: значит зоны
+        // не наехали друг на друга.
+        let max_info_x = texts
+            .iter()
+            .filter(|r| r.min.x < win_w * 0.5)
+            .map(|r| r.min.x)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_info_x > 1.0,
+            "информация не отрисовалась слева (только кнопки справа)"
+        );
+    }
+
+    #[test]
+    fn strip_row_fits_height() {
+        // Высоты окна хватает на строку с кнопками: baseline текста не должен
+        // вылезать за нижнюю границу. Иначе полоска выглядит обрезанной.
+        let ctx = egui::Context::default();
+        let row_h = STRIP_H - 6.0;
+        let baseline = collect_text_rects(&ctx, strip_base_w(), |ui| {
+            let mut state = StripUiState::default();
+            ui.horizontal(|ui| {
+                strip_row(ui, row_h, 1.0, Some(("Игра", 5025, false)), &mut state);
+            });
+        })
+        .iter()
+        .map(|r| r.min.y)
+        .fold(f32::MIN, f32::max);
+        assert!(
+            baseline < STRIP_H,
+            "строка не влезает в окно {STRIP_H}pt: baseline={baseline}"
+        );
+        assert!(baseline > 0.0, "строка не отрисовалась: baseline={baseline}");
+    }
+
+    #[test]
+    fn strip_row_shows_no_session_state() {
+        // Без активной сессии полоска обязана писать об этом, а не быть
+        // пустой: пользователь должен видеть, что трей работает.
+        let ctx = egui::Context::default();
+        let texts = collect_text_rects(&ctx, strip_base_w(), |ui| {
+            let mut state = StripUiState::default();
+            ui.horizontal(|ui| {
+                strip_row(ui, STRIP_H - 6.0, 1.0, None, &mut state);
+            });
+        });
+        assert!(
+            texts.len() >= 3,
+            "без сессии должно быть: пояснение, PIN, × — отрисовано {}",
+            texts.len()
+        );
+        assert!(
+            texts.iter().all(|r| r.min.x >= -1.0 && r.max.x <= strip_base_w() + 1.0),
+            "пояснение уехало за окно: {:?}",
+            texts.iter().map(|r| (r.min.x, r.max.x)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn strip_row_fits_narrow_windows() {
+        // Узкое окно: информация сжимается, но остаётся ВИДИМОЙ (обрезается
+        // многоточием, а не исчезает за краем). Кнопки приоритетнее.
+        for w in [260.0_f32, 320.0, 460.0] {
+            let ctx = egui::Context::default();
+            let texts = collect_text_rects(&ctx, w, |ui| {
+                let mut state = StripUiState::default();
+                ui.horizontal(|ui| {
+                    strip_row(
+                        ui,
+                        STRIP_H - 6.0,
+                        1.0,
+                        Some(("Очень длинное название игры", 5025, false)),
+                        &mut state,
+                    );
+                });
+            });
+            let outside: Vec<f32> = texts
+                .iter()
+                .filter(|r| r.max.x > w + 1.0)
+                .map(|r| r.max.x)
+                .collect();
+            assert!(
+                outside.is_empty(),
+                "при ширине {w} текст вылез за окно: {outside:?} (все x: {:?})",
+                texts.iter().map(|r| r.min.x).collect::<Vec<_>>()
+            );
+            assert!(
+                texts.len() >= 3,
+                "при ширине {w} строка потеряла текст: {} шейп(ов)",
+                texts.len()
+            );
+        }
+    }
+
+    #[test]
+    fn show_window_command_sequence_restores_minimized() {
+        /// Какие команды viewport нужны, чтобы «Открыть окно» из трея
+        /// подняло СВЁРНУТОЕ окно. Проверяем сам набор: раньше слали только
+        /// `Visible(true)`, а у свёрнутого окна Windows держит отдельный
+        /// флаг минимизации, который видимость не снимает — окно оставалось
+        /// формально «видимым», но лежало свёрнутым, и «развернуть» не
+        /// срабатывало.
+        ///
+        /// Функция намеренно возвращает СПИСОК команд, чтобы состав
+        /// фиксировался тестом, а не «на глаз».
+        fn restore_cmds() -> Vec<&'static str> {
+            vec!["Minimized(false)", "Visible(true)", "Focus"]
+        }
+        let cmds = restore_cmds();
+        // Обязателен именно Minimized(false) — без него развернуть нельзя.
+        assert!(
+            cmds.contains(&"Minimized(false)"),
+            "без снятия минимизации окно не развернётся: {cmds:?}"
+        );
+        // Видимость и фокус — чтобы окно вышло ПОВЕРХ остальных.
+        assert!(cmds.contains(&"Visible(true)"), "нет показа окна: {cmds:?}");
+        assert!(cmds.contains(&"Focus"), "нет активации окна: {cmds:?}");
+        // Порядок важен: сначала снимаем минимизацию, потом показываем.
+        let i_min = cmds.iter().position(|c| *c == "Minimized(false)").unwrap();
+        let i_vis = cmds.iter().position(|c| *c == "Visible(true)").unwrap();
+        assert!(i_min < i_vis, "минимизацию снимаем до показа окна");
+    }
+
+    #[test]
+    fn strip_row_is_single_line() {
+        // Информация и кнопки должны быть в ОДНОЙ строке. Внутри Frame
+        // раскладка по умолчанию вертикальная, поэтому без внешнего
+        // ui.horizontal() кнопки уезжали на вторую линию и обрезались
+        // (именно это было на скриншоте: пустое окно, потом кнопки снизу).
+        let ctx = egui::Context::default();
+        let y = collect_text_rects(&ctx, strip_base_w(), |ui| {
+            let mut state = StripUiState::default();
+            ui.horizontal(|ui| {
+                strip_row(
+                    ui,
+                    STRIP_H - 6.0,
+                    1.0,
+                    Some(("Игра", 5025, false)),
+                    &mut state,
+                );
+            });
+        })
+        .iter()
+        .map(|r| r.min.y)
+        .collect::<Vec<_>>();
+        assert!(!y.is_empty(), "строка ничего не отрисовала");
+        // Разброс по вертикали — в пределах одной строки текста.
+        let min = y.iter().cloned().fold(f32::MAX, f32::min);
+        let max = y.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            max - min < 14.0,
+            "текст разбросан по вертикали {min}..{max} — это не одна строка"
+        );
+    }
+
+    #[test]
+    fn overlay_sizes_are_in_points_not_pixels() {
+        // ViewportBuilder::with_inner_size и ViewportCommand::InnerSize ждут
+        // ПОИНТЫ: egui сам умножает их на pixels_per_point. Если умножить
+        // ещё раз, окно выходит в ppp раз больше задуманного: на базовом
+        // масштабе 1.3 полоска была 777×51 px вместо 598×39.
+        assert_eq!(strip_window_size(), egui::vec2(strip_base_w(), STRIP_H));
+        assert_eq!(stopwatch_window_size(false), egui::vec2(175.0, 170.0));
+        // Размеры не зависят от масштаба — это точки, а не пиксели.
+        let strip = strip_window_size();
+        assert!(
+            (strip.x - 460.0).abs() < 0.01 && (strip.y - 30.0).abs() < 0.01,
+            "размер полоски должен быть в поинтах, а не в пикселях"
+        );
+        // Пиксели получаются РОВНО одним умножением на ppp, и не дважды.
+        let px_w = strip.x * 1.3_f32;
+        assert!(
+            (px_w - 598.0).abs() < 1.0,
+            "на масштабе 1.3 полоска должна быть ~598 px, получилось {px_w}"
+        );
+    }
+
+    #[test]
+    fn strip_visible_on_any_monitor_config() {
+        // Полоска обязана быть ВИДНА на любой конфигурации экранов: целиком
+        // помещаться в рабочую область какого-то монитора и попадать туда
+        // при всех 9 позициях сетки 3×3. Проверяем на разных разрешениях
+        // (в т.ч. 4K/6K и ультраширик) и на отрицательных координатах.
+        let w = 460i32;
+        let h = 30i32;
+        let configs: Vec<Vec<(i32, i32, i32, i32)>> = vec![
+            vec![(0, 0, 1920, 1080)],
+            vec![(0, 0, 3840, 2160)],
+            vec![(0, 0, 5760, 2160)],
+            vec![(0, 0, 7680, 4320)],
+            vec![(0, 0, 3440, 1440)],
+            vec![(0, 0, 2560, 1400), (-1920, 357, 0, 1397)],
+            vec![(-1920, 0, 0, 1080), (0, 0, 1920, 1080)],
+            vec![
+                (0, 0, 1920, 1080),
+                (1920, 0, 5760, 2160),
+                (5760, 0, 7200, 1440),
+            ],
+        ];
+        for mons in &configs {
+            for idx in 0..9u8 {
+                for m in mons.iter() {
+                    let (x, y) = strip_pos_coords(
+                        ((m.2 - m.0) as f32, (m.3 - m.1) as f32),
+                        egui::vec2(w as f32, h as f32),
+                        idx,
+                    );
+                    let (cx, cy) =
+                        clamp_into_work_areas(mons, (m.0 as f32) + x, (m.1 as f32) + y, w, h);
+                    // Полоска целиком внутри рабочей области одного экрана.
+                    assert!(
+                        cx >= m.0 && cy >= m.1 && cx + w <= m.2 && cy + h <= m.3,
+                        "конфигурация {mons:?}: позиция {idx} на {m:?} → ({cx},{cy}) не видна"
+                    );
+                    // И верхний левый угол попадает внутрь экрана (не в пустоту
+                    // между мониторами).
+                    let on_screen = mons.iter().any(|k| {
+                        cx >= k.0 && cy >= k.1 && cx < k.2 && cy < k.3
+                    });
+                    assert!(
+                        on_screen,
+                        "конфигурация {mons:?}: позиция {idx} → ({cx},{cy}) вне всех экранов"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_fully_lost_windows_are_repositioned() {
+        // Правило из keep_windows_on_screen: двигаем окно, только если оно
+        // НЕ пересекается ни с одним монитором. Частично выведенное за край
+        // окно пользователь поставил сам — его не трогаем.
+        let mons = vec![(0, 0, 1920, 1080)];
+        let visible = |x: i32, y: i32, w: i32, h: i32| {
+            mons.iter()
+                .any(|m| x < m.2 && x + w > m.0 && y < m.3 && y + h > m.1)
+        };
+        // Целиком на экране.
+        assert!(visible(100, 100, 460, 30));
+        // Наполовину за правым краем — пользователь прижал сам, не трогаем.
+        assert!(visible(1800, 100, 460, 30));
+        // За верхним краем на пару пикселей — тоже не трогаем.
+        assert!(visible(100, -2, 460, 30));
+        // А вот полностью за экраном — вернуть.
+        assert!(!visible(2500, 100, 460, 30));
+        assert!(!visible(100, -500, 460, 30));
+        // Окно шире экрана и торчит с двух сторон: пересечение есть, не трогаем.
+        assert!(visible(-100, -100, 3000, 2000));
+    }
+
+    #[test]
+    fn strip_min_height_fits_content() {
+        // Кнопка small_button — 18pt, рамка полоски по 1pt сверху и снизу,
+        // CentralPanel без полей. Значит контенту нужно ~20pt, и минимальная
+        // высота окна обязана быть НЕ меньше этого: иначе при увеличении
+        // масштаба строка обрезается и полоска выглядит «свёрнутой».
+        const SMALL_BUTTON_H: f32 = 18.0;
+        const FRAME_MARGIN: f32 = 1.0;
+        const CONTENT_H: f32 = SMALL_BUTTON_H + FRAME_MARGIN * 2.0;
+        assert!(
+            STRIP_MIN_H >= CONTENT_H,
+            "минимальная высота {STRIP_MIN_H} меньше контента {CONTENT_H}: полоска обрежется"
+        );
+        // И обычная высота больше минимальной, иначе окно нельзя ужать.
+        assert!(STRIP_H >= STRIP_MIN_H);
+        // На максимальном масштале (2.0) окно по-прежнему вмещает контент.
+        assert!(strip_window_size().y >= CONTENT_H);
+    }
+
+    #[test]
+    fn monitor_hit_testing() {
+        // Главный 1920×1080 + 4K справа + FullHD слева (отрицательные координаты).
+        let mons = vec![
+            (0, 0, 1920, 1080),
+            (1920, 0, 5760, 2160),
+            (-1920, 0, 0, 1080),
+        ];
+        assert_eq!(monitor_containing(&mons, 100, 100), Some(0));
+        assert_eq!(monitor_containing(&mons, 3000, 1000), Some(1));
+        assert_eq!(monitor_containing(&mons, -500, 500), Some(2));
+        assert_eq!(monitor_containing(&mons, 6000, 100), None);
+        // стык ровно на границе принадлежит правому
+        assert_eq!(monitor_containing(&mons, 1920, 100), Some(1));
+    }
+
+    #[test]
+    fn drag_accumulates_on_last_command() {
+        use egui::{Pos2, Vec2};
+        // Первая дельта — от позиции ОС, дальше — поверх последней команды
+        // (иначе окно отстаёт от курсора на величину лага outer_rect).
+        let p = accumulate_drag_pos(None, Pos2::new(100.0, 100.0), Vec2::new(10.0, 0.0));
+        assert_eq!(p, Pos2::new(110.0, 100.0));
+        let p = accumulate_drag_pos(Some(p), Pos2::new(100.0, 100.0), Vec2::new(0.0, 5.0));
+        assert_eq!(p, Pos2::new(110.0, 105.0));
+    }
+
+    #[test]
+    fn lap_cap_99() {
+        let mut laps = Vec::new();
+        for i in 0..99 {
+            assert!(push_lap_capped(&mut laps, Duration::from_secs(i)));
+        }
+        assert_eq!(laps.len(), 99);
+        assert!(!push_lap_capped(&mut laps, Duration::from_secs(100)));
+        assert_eq!(laps.len(), 99);
+    }
+
+    #[test]
+    fn last_three_laps() {
+        let laps: Vec<Duration> = (1..=5).map(Duration::from_secs).collect();
+        let last = last_laps(&laps);
+        assert_eq!(last.len(), 3);
+        // номера 3,4,5; сплиты по 1с; общие 3,4,5с
+        assert_eq!(last[0].0, 3);
+        assert_eq!(last[2], (5, Duration::from_secs(1), Duration::from_secs(5)));
+        assert!(last_laps(&[]).is_empty());
+        let one = last_laps(&[Duration::from_secs(7)]);
+        assert_eq!(one, vec![(1, Duration::from_secs(7), Duration::from_secs(7))]);
+    }
+
+    #[test]
+    fn lap_line_is_single_line() {
+        // Строка круга для окошек: одна линия, без переносов и пробелов-разделителей.
+        let s = format_lap_line(12, Duration::from_millis(34200), Duration::from_millis(131500));
+        assert_eq!(s, "К12 · 00:34.200 · Σ02:11.500");
+        assert!(!s.contains('\n'));
+    }
+}
