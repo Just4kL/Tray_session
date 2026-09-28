@@ -105,20 +105,63 @@ fn manifest_drops_duplicate_files() {
 // План обновления
 // ---------------------------------------------------------------------------
 
-/// Создать временный каталог для теста.
-fn temp_dir(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "traysession_update_test_{tag}_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("не создался временный каталог");
+/// Каталог для временных файлов тестов — внутри проекта, на диске с
+/// исходниками, а НЕ в системном `%TEMP%` на C:.
+///
+/// Причина: C: может быть почти заполнен, а тесты создают там каталоги с
+/// файлами-«пользователями» (sessions.db и прочее). Плюс рядом с тестами
+/// проще потом подчистить. `target/` в `.gitignore`, поэтому мусор в
+/// репозиторий не попадает.
+pub(super) fn temp_root() -> PathBuf {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp");
+    std::fs::create_dir_all(&p).expect("не создался target/test-tmp");
     p
+}
+
+/// Временный каталог теста, который удаляется сам — в том числе если тест
+/// упал на `assert!`.
+///
+/// Обычный `remove_dir_all` в конце теста не срабатывает при панике, и
+/// мусор копится. Здесь за удаление отвечает `Drop`, который вызывается и
+/// при раскрутке стека.
+pub(super) struct TempDir(pub(super) PathBuf);
+
+impl TempDir {
+    /// Создать каталог с уникальным именем внутри `temp_root`.
+    pub(super) fn new(tag: &str) -> TempDir {
+        // Имя включает поток и мгновение: параллельные прогоны не схлопываются.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = temp_root().join(format!("{tag}_{}_{}", std::process::id(), stamp));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("не создался временный каталог теста");
+        TempDir(p)
+    }
+    /// Путь внутри каталога.
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+    /// Записать файл и вернуть путь.
+    fn write(&self, name: &str, data: &[u8]) -> PathBuf {
+        let f = self.0.join(name);
+        std::fs::write(&f, data).expect("не записался файл теста");
+        f
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
 fn plan_downloads_only_changed_files() {
-    let dir = temp_dir("plan");
+    let dir = TempDir::new("plan");
     // На диске: a.exe (совпадёт), c.exe (не совпадёт), sessions.db (данные).
     let a_old = b"old-a";
     // Содержимое «истории» — ASCII, чтобы байтовые литералы компилировались.
@@ -139,7 +182,7 @@ fn plan_downloads_only_changed_files() {
             FileEntry { name: "sessions.db".into(), sha256: "00".repeat(32) },
         ],
     };
-    let plan = plan_update(&dir, &m);
+    let plan = plan_update(&dir.0, &m);
     let names: Vec<&str> = plan.to_download.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, vec!["c.exe"], "в план попало лишнее: {names:?}");
     assert_eq!(plan.unchanged, vec!["a.exe".to_string()]);
@@ -147,12 +190,11 @@ fn plan_downloads_only_changed_files() {
     assert!(plan.preserved.contains(&"sessions.db".to_string()));
     // И, главное, он остался на диске нетронутым.
     assert_eq!(std::fs::read(dir.join("sessions.db")).unwrap(), history);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn apply_update_replaces_only_listed_files() {
-    let dir = temp_dir("apply");
+    let dir = TempDir::new("apply");
     let tmp = dir.join("update_tmp");
     std::fs::create_dir_all(&tmp).unwrap();
     // Пользовательские файлы на месте.
@@ -171,7 +213,7 @@ fn apply_update_replaces_only_listed_files() {
         // Попытка подсунуть пользовательский файл в список на замену.
         FileEntry { name: "sessions.db".into(), sha256: String::new() },
     ];
-    let res = apply_update(&dir, &tmp, &files).expect("замена сорвалась");
+    let res = apply_update(&dir.0, &tmp, &files).expect("замена сорвалась");
     match &res {
         ApplyResult::Replaced(upd) => {
             assert_eq!(upd, &vec!["old.exe".to_string()], "заменено лишнее: {upd:?}");
@@ -188,24 +230,21 @@ fn apply_update_replaces_only_listed_files() {
         std::fs::read(dir.join("config.json")).unwrap(),
         b"{\"scale\":1.3}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn apply_update_reports_nothing_when_identical() {
-    let dir = temp_dir("identical");
+    let dir = TempDir::new("identical");
     let tmp = dir.join("update_tmp");
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(dir.join("a.exe"), b"SAME").unwrap();
     std::fs::write(tmp.join("a.exe"), b"SAME").unwrap();
-    let res = apply_update(
-        &dir,
+    let res = apply_update(&dir.0,
         &tmp,
         &[FileEntry { name: "a.exe".into(), sha256: String::new() }],
     )
     .expect("замена сорвалась");
     assert_eq!(res, ApplyResult::NothingToDo);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +286,7 @@ fn update_offer_decision_drives_the_notice_button() {
     let manifest = Manifest::parse(super::REAL_MANIFEST).expect("манифест не разобран");
 
     // Случай 1: на диске ровно то, что в манифесте -> качать нечего.
-    let dir = temp_dir("offer_same");
+    let dir = TempDir::new("offer_same");
     for f in &manifest.files {
         // Кладём файл, чей хеш совпадёт: пишем заведомо другое, но
         // манифест ставим такой же, какой получился.
@@ -265,7 +304,7 @@ fn update_offer_decision_drives_the_notice_button() {
             })
             .collect(),
     };
-    let plan = plan_update(&dir, &matching);
+    let plan = plan_update(&dir.0, &matching);
     assert!(
         plan.to_download.is_empty(),
         "совпадающие файлы не должны качаться: {:?}",
@@ -273,14 +312,13 @@ fn update_offer_decision_drives_the_notice_button() {
     );
     // Обновления нет -> кнопки нет.
     assert!(!crate::app::should_show_update_notice(None));
-    let _ = std::fs::remove_dir_all(&dir);
 
     // Случай 2: на диске другая версия файла -> обновление есть.
-    let dir = temp_dir("offer_new");
+    let dir = TempDir::new("offer_new");
     for f in &manifest.files {
         std::fs::write(dir.join(&f.name), b"STALE-OLD-BINARY").unwrap();
     }
-    let plan = plan_update(&dir, &manifest);
+    let plan = plan_update(&dir.0, &manifest);
     assert_eq!(
         plan.to_download.len(),
         manifest.files.len(),
@@ -294,7 +332,6 @@ fn update_offer_decision_drives_the_notice_button() {
     );
     // И подсказка на ней содержит именно эту версию.
     assert!(crate::app::update_tooltip(&version).contains(&version));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -303,7 +340,7 @@ fn stale_ready_flag_cannot_authorize_early_replacement() {
     // переживает её. Если программу убили в момент установки, флаг остаётся,
     // а `wait_for_exit` видит его с первой проверки и разрешает замену файлов
     // при работающей программе — ровно тогда, когда заменять нельзя.
-    let dir = temp_dir("stale_flag");
+    let dir = TempDir::new("stale_flag");
     let flag = dir.join(READY_FLAG);
 
     // 1. Программа упала, флаг остался.
@@ -319,17 +356,16 @@ fn stale_ready_flag_cannot_authorize_early_replacement() {
     );
 
     // 3. При старте программа снимает флаг.
-    assert!(clear_stale_ready_flag(&dir), "остаточный ф��аг не снят");
+    assert!(clear_stale_ready_flag(&dir.0), "остаточный ф��аг не снят");
     assert!(!flag.exists(), "флаг остался после очистки");
     // 4. Теперь updater честно ждёт сигнала и не спешит.
     assert!(
-        !wait_for_exit(&dir, 1),
+        !wait_for_exit(&dir.0, 1),
         "после очистки updater не должен считать, что ему разрешили"
     );
 
     // 5. И повторный вызов на чистом месте ничего не ломает.
-    assert!(!clear_stale_ready_flag(&dir), "очистка без флага должна быть no-op");
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!clear_stale_ready_flag(&dir.0), "очистка без флага должна быть no-op");
 }
 
 #[test]
@@ -337,7 +373,7 @@ fn wrong_hash_is_rejected_and_file_not_written() {
     // Ключевая защита при загрузке: если файл побился или подменился,
     // на диск он попасть не должен. Считаем локальный файл «скачанным» и
     // подсовываем заведомо неверный хеш.
-    let dir = temp_dir("badhash");
+    let dir = TempDir::new("badhash");
     let dest = dir.join("downloaded.exe");
     let payload = b"PAYLOAD-THAT-SHOULD-NEVER-BE-USED";
     std::fs::write(&dest, payload).unwrap();
@@ -350,7 +386,6 @@ fn wrong_hash_is_rejected_and_file_not_written() {
     );
     // И наоборот: правильный хеш проходит.
     assert!(sha256_bytes(payload).eq_ignore_ascii_case(&sha256_bytes(payload)));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -375,12 +410,11 @@ fn sha256_handles_block_boundaries() {
 
 #[test]
 fn sha256_file_matches_sha256_bytes() {
-    let dir = temp_dir("hashfile");
+    let dir = TempDir::new("hashfile");
     let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let f = dir.join("data.bin");
     std::fs::write(&f, &data).unwrap();
     assert_eq!(sha256_file(&f).unwrap(), sha256_bytes(&data));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +510,7 @@ fn manifest_describe_is_human_readable() {
 
 #[test]
 fn report_roundtrips_through_file() {
-    let dir = temp_dir("report");
+    let dir = TempDir::new("report");
     let r = UpdateReport {
         ok: true,
         message: "установлена версия 0.8.0".into(),
@@ -484,28 +518,26 @@ fn report_roundtrips_through_file() {
         unchanged: vec!["Tray_session_setup.exe".into()],
         preserved: vec!["sessions.db".into()],
     };
-    r.save(&dir).unwrap();
-    let back = UpdateReport::load(&dir).expect("отчёт не прочитан");
+    r.save(&dir.0).unwrap();
+    let back = UpdateReport::load(&dir.0).expect("отчёт не прочитан");
     assert_eq!(back, r);
     // Описание должно упоминать и обновлённое, и сохранённое.
     let d = back.describe();
     assert!(d.contains("TraySession.exe"), "{d}");
     assert!(d.contains("sessions.db"), "{d}");
-    UpdateReport::clear(&dir);
-    assert!(UpdateReport::load(&dir).is_none(), "отчёт не очищен");
-    let _ = std::fs::remove_dir_all(&dir);
+    UpdateReport::clear(&dir.0);
+    assert!(UpdateReport::load(&dir.0).is_none(), "отчёт не очищен");
 }
 
 #[test]
 fn ready_flag_roundtrips() {
     // Основная программа пишет флаг, updater его ждёт и удаляет.
-    let dir = temp_dir("flag");
+    let dir = TempDir::new("flag");
     let flag = dir.join(READY_FLAG);
     assert!(!flag.exists());
-    assert!(!wait_for_exit(&dir, 1), "флага нет — ждать нечего");
-    signal_ready_to_exit(&dir).unwrap();
+    assert!(!wait_for_exit(&dir.0, 1), "флага нет — ждать нечего");
+    signal_ready_to_exit(&dir.0).unwrap();
     assert!(flag.exists(), "флаг не записан");
-    assert!(wait_for_exit(&dir, 5), " updater не дождался флага");
+    assert!(wait_for_exit(&dir.0, 5), " updater не дождался флага");
     assert!(!flag.exists(), "флаг не удалён после ожидания");
-    let _ = std::fs::remove_dir_all(&dir);
 }

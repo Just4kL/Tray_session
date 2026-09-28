@@ -953,19 +953,18 @@ mod real_manifest {
     /// обязан остаться байт в байт.
     #[test]
     fn session_history_survives_an_attack_by_manifest() {
-        let dir = std::env::temp_dir().join(format!(
-            "traysession_history_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Каталог внутри проекта (target/test-tmp), а не в системном %TEMP%
+        // на C:: там тесты создают файлы-«пользователи», а диск может быть
+        // почти заполнен. `TempDir` удаляет каталог сам, даже если тест упал.
+        let dir = super::tests::TempDir::new("history");
+        let d = &dir.0;
         // «История» пользователя.
         let history = b"SESSION-HISTORY-THAT-MUST-SURVIVE";
-        std::fs::write(dir.join("sessions.db"), history).unwrap();
-        std::fs::write(dir.join("config.json"), b"{\"api_key\":\"SECRET\"}").unwrap();
+        std::fs::write(d.join("sessions.db"), history).unwrap();
+        std::fs::write(d.join("config.json"), b"{\"api_key\":\"SECRET\"}").unwrap();
         // «Старая» программа и «новая» в папке загрузки.
-        std::fs::write(dir.join("TraySession.exe"), b"OLD").unwrap();
-        let tmp = dir.join("update_tmp");
+        std::fs::write(d.join("TraySession.exe"), b"OLD").unwrap();
+        let tmp = d.join("update_tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("TraySession.exe"), b"NEW-BINARY-0123456789").unwrap();
         // В tmp подложим «новую» историю — обновление и её не должно
@@ -995,25 +994,25 @@ mod real_manifest {
         let err = evil.validate().expect_err("манифест с sessions.db принят!");
         assert!(err.contains("sessions.db"), "{err}");
         // 2. В план попадает только программа.
-        let plan = plan_update(&dir, &evil);
+        let plan = plan_update(d, &evil);
         let names: Vec<&str> = plan.to_download.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["TraySession.exe"], "в плано пошёл лишний файл: {names:?}");
         // 3. Замена трогает только плановые файлы, даже если в tmp лежит
         //    «новая» история.
-        apply_update(&dir, &tmp, &plan.to_download).unwrap();
+        apply_update(d, &tmp, &plan.to_download).unwrap();
         // 4. Проверка результата: программа обновилась, данные — нет.
         assert_eq!(
-            std::fs::read(dir.join("TraySession.exe")).unwrap(),
+            std::fs::read(d.join("TraySession.exe")).unwrap(),
             b"NEW-BINARY-0123456789",
             "программа не обновилась"
         );
         assert_eq!(
-            std::fs::read(dir.join("sessions.db")).unwrap(),
+            std::fs::read(d.join("sessions.db")).unwrap(),
             history,
             "ИСТОРИЯ СЕССИЙ ПОСТРАДАЛА"
         );
         assert_eq!(
-            std::fs::read(dir.join("config.json")).unwrap(),
+            std::fs::read(d.join("config.json")).unwrap(),
             b"{\"api_key\":\"SECRET\"}",
             "НАСТРОЙКИ ПОСТРАДАЛИ"
         );
@@ -1029,7 +1028,6 @@ mod real_manifest {
         let d = r.describe();
         assert!(d.contains("TraySession.exe"), "{d}");
         assert!(d.contains("sessions.db"), "в отчёте не сказано про сохранность: {d}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
