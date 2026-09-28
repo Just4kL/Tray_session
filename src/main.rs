@@ -293,6 +293,15 @@ mod tests {
 }
 
 fn main() -> eframe::Result {
+    // Фоновый процесс обновления. Это тот же самый .exe, запущенный с
+    // флагом --updater: отдельный процесс нужен, чтобы (а) интерфейс не
+    // висел на загрузке и (б) заменять .exe мог только тот, кто его не
+    // держит открытым. Окно при этом не создаётся.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(upd) = update::parse_args(&argv) {
+        std::process::exit(update::run_updater(upd.wait_secs));
+    }
+
     let cfg_handle = AppConfig::load();
     // Автоопределение SteamID как в Python-версии
     let mut cfg_handle = cfg_handle;

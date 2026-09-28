@@ -1,0 +1,14 @@
+{
+    "version":  "0.7.28",
+    "build":  "20260928",
+    "files":  [
+                  {
+                      "name":  "TraySession.exe",
+                      "sha256":  "2449ff0aac6a237b85eb35782fe95896c11213c51086bbdf544e9a948ff3472b"
+                  },
+                  {
+                      "name":  "Tray_session_setup.exe",
+                      "sha256":  "70c42feefb548d39cea231831e5038bb26a044b3b4701bdf98e14dc08f74e844"
+                  }
+              ]
+}
