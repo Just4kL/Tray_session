@@ -369,6 +369,56 @@ fn stale_ready_flag_cannot_authorize_early_replacement() {
 }
 
 #[test]
+fn self_rename_frees_the_program_name() {
+    // Разбор настоящей поломки: фоновый процесс — это сам TraySession.exe,
+    // и он пытался заменить файл, который сам же выполняет. Windows даёт
+    // os error 32 («процесс не может получить доступ к файлу»), обновление
+    // никогда не доходило до конца. Лечится переименованием себя: имя
+    // программы освобождается, и под него кладётся новая сборка.
+    let dir = TempDir::new("rename");
+    let base = &dir.0;
+    let exe = base.join(MAIN_EXE);
+    std::fs::write(&exe, b"OLD-BINARY").unwrap();
+
+    let aside = rename_aside_from(&exe, base).expect("переименование не удалось");
+    // Имя программы освободилось — под него можно класть новую сборку.
+    assert!(!exe.exists(), "прежнее имя всё ещё занято");
+    assert!(aside.exists(), "переименованной копии нет");
+    assert_eq!(aside, tmp_dir(base).join(UPDATER_NAME));
+    // Копия лежит внутри папки обновлений, а не рядом с программой.
+    assert_eq!(aside.parent(), Some(tmp_dir(base).as_path()));
+    // Под освобождённое имя кладётся новая сборка — конфликта быть не может.
+    std::fs::write(&exe, b"NEW-BINARY-0123456789").unwrap();
+    assert_eq!(std::fs::read(&exe).unwrap(), b"NEW-BINARY-0123456789");
+    // А старая копия всё ещё на месте и её отдельно удаляем.
+    assert_eq!(std::fs::read(&aside).unwrap(), b"OLD-BINARY");
+    std::fs::remove_file(&aside).unwrap();
+}
+
+#[test]
+fn self_rename_is_idempotent() {
+    // Повторный запуск не должен пытаться переименовать уже переименованный
+    // файл и не должен падать.
+    let dir = TempDir::new("rename2");
+    let base = &dir.0;
+    let already = tmp_dir(base).join(UPDATER_NAME);
+    std::fs::create_dir_all(already.parent().unwrap()).unwrap();
+    std::fs::write(&already, b"X").unwrap();
+    let again = rename_aside_from(&already, base).expect("повторное переименование сломалоcь");
+    assert_eq!(again, already, "путь изменился при повторном вызове");
+    assert!(already.exists(), "файл исчез при повторном вызове");
+}
+
+#[test]
+fn rename_error_is_reported_not_panicked() {
+    // Несуществующий файл: должна быть ошибка в тексте, а не паника.
+    let dir = TempDir::new("rename3");
+    let missing = dir.0.join("нет-такого.exe");
+    let e = rename_aside_from(&missing, &dir.0).unwrap_err();
+    assert!(e.contains("не удалось убрать себя с пути"), "{e}");
+}
+
+#[test]
 fn wrong_hash_is_rejected_and_file_not_written() {
     // Ключевая защита при загрузке: если файл побился или подменился,
     // на диск он попасть не должен. Считаем локальный файл «скачанным» и

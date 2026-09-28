@@ -755,14 +755,105 @@ pub struct UpdateArgs {
     pub wait_secs: u64,
 }
 
-/// Точка входа фонового процесса: скачать, дождаться закрытия программы,
-/// заменить файлы, записать отчёт и перезапустить программу.
+/// Имя, под которым фоновый процесс прячет сам себя на время работы.
+pub const UPDATER_NAME: &str = "_updater_running.exe";
+
+/// Убрать себя с пути, освободив имя `TraySession.exe` под новую сборку.
 ///
-/// Вызывается из `main` и в окне не показывается.
+/// Windows не позволяет ЗАМЕНИТЬ файл, который сейчас выполняется, но
+/// позволяет его ПЕРЕИМЕНОВАТЬ. Без этого фоновый процесс не смог бы
+/// обновить самого себя: он и есть тот файл, который требуется перезаписать
+/// (ошибка «процесс не может получить доступ к файлу», os error 32).
+///
+/// Возвращает путь, под которым процесс теперь работает, — его надо удалить
+/// в конце.
+pub fn self_rename_aside(base: &Path) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("не найден свой exe: {e}"))?;
+    rename_aside_from(&exe, base)
+}
+
+/// Переименовать `exe` в `update_tmp/_updater_running.exe`.
+///
+/// Вынесено отдельно от `self_rename_aside`, чтобы можно было проверить
+/// переименование на обычном файле, не трогая реальный исполняемый файл
+/// процесса.
+pub fn rename_aside_from(exe: &Path, base: &Path) -> Result<PathBuf, String> {
+    // Уже переименован (повторный запуск) — тогда инициализировать нечего.
+    if exe.file_name().map(|n| n == UPDATER_NAME).unwrap_or(false) {
+        return Ok(exe.to_path_buf());
+    }
+    let aside = tmp_dir(base).join(UPDATER_NAME);
+    if let Some(d) = aside.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("не создана папка {}: {e}", d.display()))?;
+    }
+    std::fs::rename(exe, &aside).map_err(|e| {
+        format!(
+            "не удалось убрать себя с пути ({} -> {}): {e}",
+            exe.display(),
+            aside.display()
+        )
+    })?;
+    Ok(aside)
+}
+
+/// Удалить переименованную копию фонового процесса после его выхода.
+///
+/// Windows не даёт удалить исполняемый файл, пока он запущен, поэтому
+/// удаление откладывается и делается сторонним процессом.
+pub fn remove_aside_delayed(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW, чтобы не мигало окно консоли.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("cmd")
+        .args(["/C", "ping", "127.0.0.1", "-n", "3", ">", "nul", "&", "del", "/F", "/Q"])
+        .arg(path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
+/// Точка входа фонового процесса.
+///
+/// Тело вынесено отдельно, чтобы переименованная копия себя удалялась на
+/// ЛЮБОМ выходе — и при ошибке, и при отсутствии обновлений. Иначе
+/// `_updater_running.exe` остался бы лежать в папке обновлений.
 pub fn run_updater(wait_secs: u64) -> i32 {
     let base = program_dir();
+    crate::log::init(&base);
+    let (code, aside) = run_updater_inner(&base, wait_secs);
+    if !aside.as_os_str().is_empty() {
+        let _ = remove_aside_delayed(&aside);
+    }
+    code
+}
+
+/// Основная работа обновления. Возвращает код и путь, под которым процесс
+/// себя переименовал (пустой, если не смог).
+fn run_updater_inner(base: &Path, wait_secs: u64) -> (i32, PathBuf) {
+    let base = base.to_path_buf();
+    crate::log::info(&format!(
+        "фоновый процесс обновления запущен, ждём закрытия программы до {wait_secs} с"
+    ));
+    // Первым делом уходим с имени TraySession.exe: иначе нельзя будет
+    // заменить сам этот файл, пока мы его выполняем (os error 32).
+    let aside = match self_rename_aside(&base) {
+        Ok(p) => {
+            crate::log::info(&format!(
+                "освободил имя программы: работаю под именем {}",
+                p.display()
+            ));
+            p
+        }
+        Err(e) => {
+            // Не смертельно: если exe не в use (например, запустили копию),
+            // замена может пройти и без переименования. Пробуем дальше.
+            crate::log::warn(&format!("переименовать себя не вышло: {e}"));
+            PathBuf::new()
+        }
+    };
     let tmp = tmp_dir(&base);
     if let Err(e) = std::fs::create_dir_all(&tmp) {
+        crate::log::err(&format!("не создана папка загрузки {}: {e}", tmp.display()));
         let _ = write_report(
             &base,
             UpdateReport {
@@ -771,7 +862,7 @@ pub fn run_updater(wait_secs: u64) -> i32 {
                 ..Default::default()
             },
         );
-        return 2;
+        return (2, aside.clone());
     }
     // Отчёт всегда свежий: старый мог остаться от прошлого обновления.
     UpdateReport::clear(&base);
@@ -784,15 +875,40 @@ pub fn run_updater(wait_secs: u64) -> i32 {
     .ok();
 
     // 1. Манифест.
+    crate::log::info(&format!("запрашиваю манифест: {}", manifest_url()));
     let manifest = match fetch_manifest() {
-        Ok(m) => m,
+        Ok(m) => {
+            crate::log::info(&format!(
+                "манифест получен: версия {}, сборка {}, файлов: {}",
+                m.version,
+                m.build,
+                m.files.len()
+            ));
+            m
+        }
         Err(e) => {
+            crate::log::err(&format!("манифест не получен: {e}"));
             let _ = write_report(&base, UpdateReport { ok: false, message: e, ..Default::default() });
-            return 3;
+            return (3, aside.clone());
         }
     };
     // 2. План: какие файлы отличаются от диска.
     let plan = plan_update(&base, &manifest);
+    crate::log::info(&format!(
+        "план: скачать {}, совпадают {}, данных пользователя рядом: {}",
+        plan.to_download.len(),
+        plan.unchanged.len(),
+        plan.preserved.len()
+    ));
+    for f in &plan.to_download {
+        crate::log::info(&format!("  к замене: {}", f.name));
+    }
+    for f in &plan.unchanged {
+        crate::log::info(&format!("  без изменений: {f}"));
+    }
+    for f in &plan.preserved {
+        crate::log::info(&format!("  НЕ ТРОГАЕМ (данные пользователя): {f}"));
+    }
     let mut report = UpdateReport {
         preserved: plan.preserved.clone(),
         ..Default::default()
@@ -801,12 +917,16 @@ pub fn run_updater(wait_secs: u64) -> i32 {
         report.ok = true;
         report.unchanged = plan.unchanged.clone();
         report.message = format!("уже установлена версия {}", manifest.version);
+        crate::log::info("обновлять нечего: файлы совпадают с манифестом");
         let _ = write_report(&base, report);
-        return 0;
+        return (0, aside.clone());
     }
     // 3. Скачать в папку рядом с программой.
     for f in &plan.to_download {
-        if let Err(e) = download_to(&file_url(&f.name), &tmp.join(&f.name), &f.sha256) {
+        let url = file_url(&f.name);
+        crate::log::info(&format!("качаю {url}"));
+        if let Err(e) = download_to(&url, &tmp.join(&f.name), &f.sha256) {
+            crate::log::err(&format!("загрузка не удалась: {e}"));
             let _ = write_report(
                 &base,
                 UpdateReport {
@@ -816,12 +936,15 @@ pub fn run_updater(wait_secs: u64) -> i32 {
                     ..Default::default()
                 },
             );
-            return 4;
+            return (4, aside.clone());
         }
+        crate::log::info(&format!("скачано и сверено по SHA-256: {}", f.name));
     }
     // 4. Дождаться, пока основная программа закроется. Она сама закроется,
     //    когда увидит файл-флаг; если не закрылась — не трогаем файлы.
+    crate::log::info("жду сигнала закрытия от основной программы");
     if !wait_for_exit(&base, wait_secs) {
+        crate::log::err("сигнала закрытия не было: файлы не тронуты");
         let _ = write_report(
             &base,
             UpdateReport {
@@ -831,11 +954,13 @@ pub fn run_updater(wait_secs: u64) -> i32 {
                 ..Default::default()
             },
         );
-        return 5;
+        return (5, aside.clone());
     }
+    crate::log::info("сигнал получен, заменяю файлы");
     // 5. Заменить файлы.
     match apply_update(&base, &tmp, &plan.to_download) {
         Err(e) => {
+            crate::log::err(&format!("замена не удалась: {e}"));
             let _ = write_report(
                 &base,
                 UpdateReport {
@@ -845,25 +970,45 @@ pub fn run_updater(wait_secs: u64) -> i32 {
                     ..Default::default()
                 },
             );
-            return 6;
+            return (6, aside.clone());
         }
         Ok(ApplyResult::NothingToDo) => {
             report.ok = true;
             report.unchanged = plan.unchanged.clone();
             report.message = format!("файлы уже обновлены до {}", manifest.version);
+            crate::log::info("файлы оказались уже новыми");
             let _ = write_report(&base, report);
         }
         Ok(ApplyResult::Replaced(updated)) => {
             report.ok = true;
+            // Логируем до переноса: `updated` уходит в move строкой ниже.
+            crate::log::info(&format!("заменено файлов: {}", updated.join(", ")));
             report.updated = updated;
             report.unchanged = plan.unchanged.clone();
             report.message = format!("установлена версия {}", manifest.version);
             // 6. Перезапустить программу.
-            let _ = std::process::Command::new(base.join(MAIN_EXE)).spawn();
+            let exe = base.join(MAIN_EXE);
+            match std::process::Command::new(&exe).spawn() {
+                Ok(_) => crate::log::info(&format!("программа перезапущена: {}", exe.display())),
+                Err(e) => {
+                    // Раньше ошибка перезапуска глоталась: файлы обновлены,
+                    // а человек думал, что всё прошло. Теперь это попадает и
+                    // в лог, и в отчёт.
+                    crate::log::err(&format!(
+                        "не удалось перезапустить программу ({e}); запустите {} вручную",
+                        exe.display()
+                    ));
+                    report.message.push_str(&format!(
+                        ". Файлы обновлены, но перезапуск не удался: {e}. Запустите {} вручную",
+                        exe.display()
+                    ));
+                }
+            }
             let _ = write_report(&base, report);
         }
     }
-    0
+    crate::log::info("обновление завершено");
+    (0, aside)
 }
 
 fn write_report(base: &Path, r: UpdateReport) -> std::io::Result<()> {

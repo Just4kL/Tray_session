@@ -3,12 +3,15 @@ mod config;
 mod db;
 mod detector;
 mod gpu;
+mod log;
 mod monitor;
 mod shortcuts;
 mod sound;
 mod update;
+#[cfg(test)]
+mod uninstall;
 
-use app::{initial_games, AppCmd, TrackerApp, TrayCmd};
+use app::{initial_games, AppCmd, TrackerApp, TrayCmd, VERSION};
 use config::AppConfig;
 use std::sync::{mpsc, Arc, RwLock};
 
@@ -302,10 +305,16 @@ fn main() -> eframe::Result {
         std::process::exit(update::run_updater(upd.wait_secs));
     }
 
+    // Логи пишутся рядом с программой, с ограничением по объёму.
+    crate::log::init(&crate::update::program_dir());
+    crate::log::info(&format!("Tray Session {VERSION} запущена"));
+
     // Остаточный файл-флаг от прошлого сеанса снимаем сразу: если он
     // пережил падение, фоновый процесс увидит его и разрешит замену файлов
     // при ещё работающей программе.
-    crate::update::clear_stale_ready_flag(&crate::update::program_dir());
+    if crate::update::clear_stale_ready_flag(&crate::update::program_dir()) {
+        crate::log::info("найден и снят остаточный файл-флаг от прошлого сеанса");
+    }
 
     let cfg_handle = AppConfig::load();
     // Автоопределение SteamID как в Python-версии
