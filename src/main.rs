@@ -302,6 +302,11 @@ fn main() -> eframe::Result {
         std::process::exit(update::run_updater(upd.wait_secs));
     }
 
+    // Остаточный файл-флаг от прошлого сеанса снимаем сразу: если он
+    // пережил падение, фоновый процесс увидит его и разрешит замену файлов
+    // при ещё работающей программе.
+    crate::update::clear_stale_ready_flag(&crate::update::program_dir());
+
     let cfg_handle = AppConfig::load();
     // Автоопределение SteamID как в Python-версии
     let mut cfg_handle = cfg_handle;
