@@ -20,6 +20,9 @@ fn default_alarm_h() -> i32 { 8 }
 fn default_timer_min() -> i32 { 10 }
 fn default_last_tab() -> String { "sessions".to_string() }
 fn default_cols4() -> [bool; 4] { [true; 4] }
+/// Как часто проверять обновления: 0 — каждый час (по умолчанию).
+fn default_update_freq() -> u8 { 0 }
+fn default_update_auto() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
@@ -96,6 +99,23 @@ pub struct AppConfig {
     /// Последняя открытая вкладка.
     #[serde(default = "default_last_tab")]
     pub last_tab: String,
+    // --- Обновления ---
+    /// Как часто проверять свежие сборки: 0 — каждый час, 1 — ежедневно,
+    /// 2 — раз в неделю, 3 — вручную (код хранится числом, чтобы старые
+    /// config.json не ломались при добавлении вариантов).
+    #[serde(default = "default_update_freq")]
+    pub update_freq: u8,
+    /// Проверять обновления автоматически (false — только по кнопке).
+    #[serde(default = "default_update_auto")]
+    pub update_auto: bool,
+    /// Молча скачивать и ставить обновления, не спрашивая. По умолчанию
+    /// false: программа сама скачает и заменит файлы только с согласия.
+    #[serde(default)]
+    pub update_silent: bool,
+    /// Когда последний раз проверяли обновления (unix-секунды). Нужно,
+    /// чтобы не проверять на каждом запуске.
+    #[serde(default)]
+    pub update_last_check: i64,
 }
 
 impl Default for AppConfig {
@@ -131,6 +151,10 @@ impl Default for AppConfig {
             alarm_days: [false; 7],
             timer_min: 10,
             last_tab: "sessions".to_string(),
+            update_freq: default_update_freq(),
+            update_auto: default_update_auto(),
+            update_silent: false,
+            update_last_check: 0,
         }
     }
 }

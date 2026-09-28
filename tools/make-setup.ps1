@@ -1,4 +1,4 @@
-# Сборка установщика Tray_sesstion_setup.exe (7-Zip SFX, только необходимое).
+# Сборка установщика Tray_session_setup.exe (7-Zip SFX, только необходимое).
 # Состав пакета: TraySession.exe + README.md (конфиги и БД создаются при первом запуске).
 $ErrorActionPreference = 'Stop'
 $root  = 'F:\Programms\Tray Session python\game-session-tracker'
@@ -24,7 +24,7 @@ $arc  = [IO.File]::ReadAllBytes($payload)
 $out  = New-Object byte[] ($stub.Length + $arc.Length)
 [Buffer]::BlockCopy($stub, 0, $out, 0, $stub.Length)
 [Buffer]::BlockCopy($arc, 0, $out, $stub.Length, $arc.Length)
-$setup = Join-Path $root 'Tray_sesstion_setup.exe'
+$setup = Join-Path $root 'Tray_session_setup.exe'
 [IO.File]::WriteAllBytes($setup, $out)
 
 Write-Output '=== состав пакета ==='
