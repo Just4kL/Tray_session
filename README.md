@@ -1,4 +1,4 @@
-# Tray Session — Rust (v0.7.25)
+# Tray Session - Rust (v0.7.26)
 
 Перепись Python-версии на Rust: авто-подсчёт времени игр/программ,
 защита от ложных срабатываний лаунчера через нагрузку на видеокарту.
@@ -168,3 +168,28 @@ Debug-сборка уже готова: `target\debug\game-session-tracker.exe`.
 
 eframe/egui, rusqlite (bundled), sysinfo, nvml-wrapper, winreg,
 reqwest (blocking, Steam API), csv, open, rfd, notify-rust, tray-icon, winapi.
+
+## Проверка оформления
+
+Окно рисуется через GPU, поэтому снимок экрана средствами Windows
+(`PrintWindow`) получается чёрным — оценить цвета и иконки на глаз нечем.
+Для этого есть превью: те же элементы рисуются теми же средствами egui.
+
+```
+cargo test -- --ignored
+```
+
+Файлы: `target/ui_preview.png` (кнопки во всех состояниях, иконки, чипы) и
+`target/nav_icons_preview.png` (иконки разделов крупно, поверх сетки 24dp).
+
+Параллельно контраст считается числами, а не «на глаз». Функция
+`contrast_ratio` реализует WCAG 2.1; тесты `button_contrast_meets_wcag` и
+`nav_button_text_contrast_in_all_states` требуют не меньше 4.5:1 во всех
+состояниях кнопок, а `nav_press_effect_is_strong_enough_to_see` следит,
+чтобы эффект нажатия не стал неразличимым.
+
+Иконки разделов заданы вектором в сетке 24dp (`nav_icon_shapes`) и красятся
+цветом состояния кнопки. Тесты `nav_icons_fit_their_cell`,
+`nav_icons_are_outline_style` и `nav_icons_have_no_degenerate_geometry`
+проверяют геометрию: иконка не вылезает за клетку, не превращается в
+глухую заливку и не схлопывается в точку.

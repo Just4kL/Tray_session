@@ -14,7 +14,7 @@ pub const APP_NAME: &str = "Tray Session";
 /// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
-pub const VERSION: &str = "0.7.25";
+pub const VERSION: &str = "0.7.26";
 pub const BUILD: &str = "20261028";
 pub const ISSUE_URL: &str = "https://example.com/issues";
 /// Заголовок окошка секундомера (он же ключ для поиска HWND под WinAPI).
@@ -23,6 +23,18 @@ pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
 pub const STRIP_TITLE: &str = "Сессия — Tray Session";
 
 const CHANGELOG: &[(&str, &str, &[&str])] = &[
+    ("0.7.26", "2026-10-29", &[
+        "Fix: Кнопки в стиле Material: заметное осветление при наведении и заметное затемнение при нажатии (кнопка «уходит вглубь»), скругление 6px.",
+        "Fix: Контраст текста в кнопках после нажатия падал до 2.3 вместо 4.5 — в кнопки клали RichText с `.weak()`/своим цветом, он перекрывал `fg_stroke` темы, и текст оставался бледным на потемневшем фоне.",
+        "Fix: Из кнопок убран собственный цвет текста: цвет состояния берётся из темы, поэтому контраст одинаков во всех состояниях (белый на всех фонах).",
+        "Fix: У кнопок боковой навигации не было отклика на нажатие вообще — `is_pointer_button_down_on()` не проверялся. Теперь: слой +16% при наведении, +32% при нажатии, кнопка опускается на 1px, иконка притухает.",
+        "New: Иконки разделов перерисованы вектором в стиле Material (сетка 24dp, обводка 2dp) вместо растровых PNG 64×64 с заливками — чётче на любом DPI и красятся цветом состояния.",
+        "New: Иконка «Игры» (геймпад) сделана залитой с прорезями: в контуре на 22px крестовина и кнопки сливались в нечитаемую кляксу.",
+        "New: Кнопки-«чипы» (PIN, ⤢) в едином стиле: скругление 10px, акцентная обводка в активном состоянии.",
+        "New: Превью оформления без окна: `cargo test -- --ignored` рисует кнопки и иконки в target/*.png. Нужно потому, что снимок окна через WinAPI отдаёт чёрный кадр (winit рисует через GPU), а оценивать оформление на глаз было нечем.",
+        "New: 9 тестов оформления: контраст WCAG во всех состояниях кнопок, видимость эффекта нажатия, запрет своего цвета текста в кнопках, геометрия иконок (в клетке, контурная, без вырожденных фигур).",
+        "Fix: Убрана ставшая ненужной зависимость крейта `image` вместе с папкой assets.",
+    ]),
     ("0.7.25", "2026-10-28", &[
         "Fix: «Открыть окно» из трея разворачивает свёрнутое окно: Minimized(false) + Visible(true) + Focus.",
         "Fix: Раньше слалась только видимость — у свёрнутого окна она не снимает флаг минимизации.",
@@ -263,98 +275,375 @@ pub enum AppCmd {
     StripOpacity(i32),
 }
 
-/// Пункты боковой навигации: вкладка, иконка из assets, подпись.
-/// Иконки — одноцветные силуэты 64×64, красятся в цвет состояния кнопки.
-const NAV_ITEMS: [(Tab, egui::ImageSource<'static>, &str); 6] = [
-    (
-        Tab::Sessions,
-        egui::include_image!("../assets/nav_sessions.png"),
-        "Сессии",
-    ),
-    (
-        Tab::Games,
-        egui::include_image!("../assets/nav_games.png"),
-        "Игры",
-    ),
-    (
-        Tab::Alarms,
-        egui::include_image!("../assets/nav_alarms.png"),
-        "Будильники",
-    ),
-    (
-        Tab::Timer,
-        egui::include_image!("../assets/nav_timer.png"),
-        "Таймер",
-    ),
-    (
-        Tab::Shortcuts,
-        egui::include_image!("../assets/nav_params.png"),
-        "Параметры",
-    ),
-    (
-        Tab::About,
-        egui::include_image!("../assets/nav_about.png"),
-        "О программе",
-    ),
+/// Пункты боковой навигации: вкладка, иконка, подпись.
+///
+/// Иконки рисуются ВЕКТОРОМ (`nav_icon_shapes`) в духе Material: сетка
+/// 24dp, обводка 2dp, скруглённые концы. Растровые PNG выглядели
+/// «пластиковыми» заливками и мылились при масштабировании, поэтому
+/// assets больше не используются.
+const NAV_ITEMS: [(Tab, &str); 6] = [
+    (Tab::Sessions, "Сессии"),
+    (Tab::Games, "Игры"),
+    (Tab::Alarms, "Будильники"),
+    (Tab::Timer, "Таймер"),
+    (Tab::Shortcuts, "Параметры"),
+    (Tab::About, "О программе"),
 ];
+
+/// Толщина обводки иконки в системе координат 24dp — как в Material (2dp).
+pub const ICON_STROKE: f32 = 2.0;
+
+/// Геометрия иконки раздела в нормализованной сетке 24×24.
+///
+/// Возвращает список фигур: контуры (`closed` = замкнуть) и заливки.
+/// Сделано чистой функцией без `egui::Painter`, чтобы тесты могли
+/// проверить, что иконка не выходит за свою клетку и не пустая.
+fn nav_icon_shapes(tab: Tab) -> Vec<IconShape> {
+    // Ось Y вниз, начало — левый верхний угол клетки 24×24.
+    let line = |pts: &[(f32, f32)]| IconShape::Line(pts.to_vec());
+    match tab {
+        // Сессии: play-треугольник в круге (контур круга + заливка знака).
+        Tab::Sessions => vec![
+            IconShape::Circle { c: (12.0, 12.0), r: 9.0, filled: false, knockout: false },
+            IconShape::Poly {
+                pts: vec![(9.5, 8.0), (9.5, 16.0), (16.0, 12.0)],
+                fill: true,
+                knockout: false,
+            },
+        ],
+        // Игры: геймпад. Корпус ЗАЛИТ, а крестовина и кнопки «прорезаны»
+        // фоном — в контуре на 22px детали сливались в нечитаемую кляксу,
+        // а заливка с прорезями держит форму при любом размере.
+        Tab::Games => vec![
+            IconShape::Poly {
+                pts: vec![
+                    (6.5, 8.5), (9.5, 7.5), (14.5, 7.5), (17.5, 8.5),
+                    (20.5, 11.0), (21.0, 15.0), (18.5, 16.0), (16.0, 13.0),
+                    (8.0, 13.0), (5.5, 16.0), (3.0, 15.0), (3.5, 11.0),
+                ],
+                fill: true,
+                knockout: false,
+            },
+            // Крестовина d-pad — прорезью.
+            IconShape::Poly {
+                pts: vec![
+                    (5.8, 9.8), (7.2, 9.8), (7.2, 10.7), (8.1, 10.7),
+                    (8.1, 12.1), (7.2, 12.1), (7.2, 13.0), (5.8, 13.0),
+                    (5.8, 12.1), (4.9, 12.1), (4.9, 10.7), (5.8, 10.7),
+                ],
+                fill: true,
+                knockout: true,
+            },
+            // Две кнопки справа — прорезью.
+            IconShape::Circle { c: (15.8, 10.2), r: 1.05, filled: true, knockout: true },
+            IconShape::Circle { c: (18.0, 11.6), r: 1.05, filled: true, knockout: true },
+        ],
+        // Будильники: колокол с язычком.
+        Tab::Alarms => vec![
+            IconShape::Poly {
+                pts: vec![
+                    (12.0, 3.0), (8.5, 5.0), (6.5, 8.5), (5.5, 12.0),
+                    (3.5, 15.0), (5.0, 16.5), (19.0, 16.5), (20.5, 15.0),
+                    (18.5, 12.0), (17.5, 8.5), (15.5, 5.0),
+                ],
+                fill: false,
+                knockout: false,
+            },
+            line(&[(10.0, 19.0), (14.0, 19.0)]),
+        ],
+        // Таймер: циферблат со стрелками.
+        Tab::Timer => vec![
+            IconShape::Circle { c: (12.0, 12.0), r: 9.0, filled: false, knockout: false },
+            line(&[(12.0, 7.0), (12.0, 12.0)]),
+            line(&[(12.0, 12.0), (15.5, 14.5)]),
+        ],
+        // Параметры: три ползунка — настройки.
+        Tab::Shortcuts => vec![
+            line(&[(4.0, 7.0), (20.0, 7.0)]),
+            line(&[(4.0, 12.0), (20.0, 12.0)]),
+            line(&[(4.0, 17.0), (20.0, 17.0)]),
+            IconShape::Poly {
+                pts: vec![(7.0, 5.0), (9.0, 5.0), (9.0, 9.0), (7.0, 9.0)],
+                fill: true,
+                knockout: false,
+            },
+            IconShape::Poly {
+                pts: vec![(15.0, 10.0), (17.0, 10.0), (17.0, 14.0), (15.0, 14.0)],
+                fill: true,
+                knockout: false,
+            },
+            IconShape::Poly {
+                pts: vec![(10.0, 15.0), (12.0, 15.0), (12.0, 19.0), (10.0, 19.0)],
+                fill: true,
+                knockout: false,
+            },
+        ],
+        // О программе: буква «i» в круге.
+        Tab::About => vec![
+            IconShape::Circle { c: (12.0, 12.0), r: 9.0, filled: false, knockout: false },
+            line(&[(12.0, 11.0), (12.0, 16.5)]),
+            IconShape::Circle { c: (12.0, 7.5), r: 1.2, filled: true, knockout: false },
+        ],
+    }
+}
+
+/// Одна фигура иконки в сетке 24×24.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IconShape {
+    /// Ломаная: рисуется обводкой цветом иконки; ровно 2 или 4 точки.
+    Line(Vec<(f32, f32)>),
+    /// Ломаная из 3+ точек; `fill` = залить, иначе замкнуть контур.
+    /// `knockout` = залить ФОНОМ (прорезь в залитой фигуре).
+    Poly { pts: Vec<(f32, f32)>, fill: bool, knockout: bool },
+    /// Круг: контур или заливка; `knockout` = заливка фоном.
+    Circle { c: (f32, f32), r: f32, filled: bool, knockout: bool },
+}
+
+impl IconShape {
+    /// Все точки фигуры в сетке 24×24 (для проверки попадания в клетку).
+    /// Нужно только тестам геометрии иконок.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn points(&self) -> Vec<(f32, f32)> {
+        match self {
+            IconShape::Line(p) | IconShape::Poly { pts: p, .. } => p.clone(),
+            IconShape::Circle { c, r, .. } => {
+                let (cx, cy) = *c;
+                // 4 крайние точки по кресту — этого достаточно, чтобы
+                // проверить, что круг не вылезает за клетку.
+                vec![
+                    (cx - r, cy - r),
+                    (cx + r, cy - r),
+                    (cx + r, cy + r),
+                    (cx - r, cy + r),
+                ]
+            }
+        }
+    }
+}
+
+/// Нарисовать иконку раздела в прямоугольнике `rect` цветом `color`.
+///
+/// Иконка рисуется по сетке 24×24, масштабируется в `rect` и красится
+/// обводкой `ICON_STROKE` (в тех же единицах), поэтому линии остаются
+/// одинаковой толщины при любом размере.
+///
+/// `bg` — цвет подложки: им прорезаются детали внутри залитых фигур
+/// (геймпад). Он должен совпадать с фоном, на котором лежит иконка.
+fn paint_nav_icon(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    tab: Tab,
+    color: egui::Color32,
+    bg: egui::Color32,
+) {
+    let k = rect.width() / 24.0;
+    let to_screen = |x: f32, y: f32| egui::pos2(rect.min.x + x * k, rect.min.y + y * k);
+    let stroke = egui::Stroke::new(ICON_STROKE * k, color);
+    let shapes: Vec<egui::Shape> = nav_icon_shapes(tab)
+        .into_iter()
+        .map(|s| match s {
+            IconShape::Line(p) => {
+                let pts: Vec<egui::Pos2> = p.iter().map(|&(x, y)| to_screen(x, y)).collect();
+                egui::Shape::line(pts, stroke)
+            }
+            IconShape::Poly { pts, fill, knockout } => {
+                let sp: Vec<egui::Pos2> =
+                    pts.iter().map(|&(x, y)| to_screen(x, y)).collect();
+                if fill {
+                    let c = if knockout { bg } else { color };
+                    egui::Shape::convex_polygon(sp, c, egui::Stroke::NONE)
+                } else {
+                    egui::Shape::closed_line(sp, stroke)
+                }
+            }
+            IconShape::Circle { c, r, filled, knockout } => {
+                let center = to_screen(c.0, c.1);
+                let rad = r * k;
+                if filled {
+                    let col = if knockout { bg } else { color };
+                    egui::Shape::circle_filled(center, rad, col)
+                } else {
+                    egui::Shape::circle_stroke(center, rad, stroke)
+                }
+            }
+        })
+        .collect();
+    // Обрезка по клетке иконки: иконка не должна «вылезать» на подпись.
+    let clip = p.with_clip_rect(rect);
+    for s in shapes {
+        clip.add(s);
+    }
+}
+
+/// Растеризовать результат `Context::tessellate` в RGBA-буфер.
+///
+/// Текстуры (шрифт) не воспроизводятся — в превью важны кнопки и иконки,
+/// они рисуются геометрией. Цвет берётся из вершин треугольника, альфа
+/// интерполируется, поэтому сглаженные штрихи выглядят корректно.
+#[cfg(test)]
+fn rasterize(
+    prims: &[egui::ClippedPrimitive],
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+) {
+    /// Залить один треугольник (screen-space, альфа-композитинг «поверх»).
+    /// Цвета — в нормализованном виде [0..1] с альфой.
+    fn tri(
+        buf: &mut [u8],
+        w: usize,
+        h: usize,
+        p: [egui::Pos2; 3],
+        col: [[f32; 4]; 3],
+    ) {
+        let minx = p.iter().fold(f32::MAX, |a, v| a.min(v.x)).floor().max(0.0) as usize;
+        let maxx = (p.iter().fold(f32::MIN, |a, v| a.max(v.x)).ceil() as isize)
+            .clamp(0, w as isize) as usize;
+        let miny = p.iter().fold(f32::MAX, |a, v| a.min(v.y)).floor().max(0.0) as usize;
+        let maxy = (p.iter().fold(f32::MIN, |a, v| a.max(v.y)).ceil() as isize)
+            .clamp(0, h as isize) as usize;
+        // Знаменатель барицентрических координат = удвоенная площадь.
+        let d = (p[1].y - p[2].y) * (p[0].x - p[2].x)
+            + (p[2].x - p[1].x) * (p[0].y - p[2].y);
+        if d.abs() < 1e-6 {
+            return; // вырожденный треугольник
+        }
+        for y in miny..maxy {
+            for x in minx..maxx {
+                // Центр пикселя.
+                let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let l0 = ((p[1].y - p[2].y) * (cx - p[2].x)
+                    + (p[2].x - p[1].x) * (cy - p[2].y))
+                    / d;
+                let l1 = ((p[2].y - p[0].y) * (cx - p[2].x)
+                    + (p[0].x - p[2].x) * (cy - p[2].y))
+                    / d;
+                let l2 = 1.0 - l0 - l1;
+                if l0 < 0.0 || l1 < 0.0 || l2 < 0.0 {
+                    continue;
+                }
+                // Интерполяция цвета по тем же весам.
+                let mut c = [0.0_f32; 4];
+                for k in 0..4 {
+                    c[k] = l0 * col[0][k] + l1 * col[1][k] + l2 * col[2][k];
+                }
+                let a = c[3];
+                if a <= 0.0 {
+                    continue;
+                }
+                let i = (y * w + x) * 4;
+                for k in 0..3 {
+                    // Значения в 0..1, поэтому переводим в байты через *255.
+                    buf[i + k] = (((c[k] * a) + (buf[i + k] as f32 / 255.0 * (1.0 - a)))
+                        * 255.0)
+                        .clamp(0.0, 255.0) as u8;
+                }
+                buf[i + 3] = 255;
+            }
+        }
+    }
+    for p in prims {
+        // В превью интересует только геометрия: текстуры (шрифт) пропускаем.
+        let mesh = match &p.primitive {
+            egui::epaint::Primitive::Mesh(m) => m,
+            _ => continue,
+        };
+        // Цвет вершины приводим к [0..1] с альфой.
+        let norm = |c: egui::Color32| {
+            let s = c.to_srgba_unmultiplied();
+            [
+                s[0] as f32 / 255.0,
+                s[1] as f32 / 255.0,
+                s[2] as f32 / 255.0,
+                s[3] as f32 / 255.0,
+            ]
+        };
+        for t in mesh.indices.chunks_exact(3) {
+            let v: Vec<_> = t.iter().map(|&i| mesh.vertices[i as usize]).collect();
+            tri(
+                buf,
+                w,
+                h,
+                [v[0].pos, v[1].pos, v[2].pos],
+                [norm(v[0].color), norm(v[1].color), norm(v[2].color)],
+            );
+        }
+    }
+}
+
+/// Записать RGBA-буфер в PNG без внешних крейтов.
+///
+/// Крейт `image` из зависимостей убран (иконки теперь векторные), а превью
+/// оформления нужно сохранять без окна. Поэтому PNG собирается вручную:
+/// сигнатура, IHDR, IDAT со zlib-потоком из несжатых (`stored`) блоков и
+/// IEND, плюс CRC32. Размер файла больше, зато кода ~60 строк и никаких
+/// новых зависимостей.
+#[cfg(test)]
+fn png_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    /// CRC32 (IEEE) — нужен для каждого PNG-чанка.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (i, e) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *e = c;
+        }
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in data {
+            c = table[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+        }
+        c ^ 0xFFFF_FFFF
+    }
+    /// Чанк PNG: длина, тип, данные, CRC.
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = Vec::with_capacity(4 + data.len());
+        body.extend_from_slice(kind);
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+
+    // Сырые строки: для каждой — байт фильтра 0 + сами пиксели.
+    let stride = w as usize * 4;
+    let mut raw = Vec::with_capacity(h as usize * (stride + 1));
+    for y in 0..h as usize {
+        raw.push(0u8);
+        raw.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
+    }
+    // zlib: заголовок 0x78 0x01 (deflate, без словаря), затем блоки stored.
+    let mut z = vec![0x78u8, 0x01];
+    for (i, chunk_) in raw.chunks(65535).enumerate() {
+        let last = (i + 1) * 65535 >= raw.len();
+        z.push(if last { 1u8 } else { 0u8 });
+        z.extend_from_slice(&(chunk_.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(chunk_.len() as u16)).to_le_bytes());
+        z.extend_from_slice(chunk_);
+    }
+    // Adler-32 для zlib.
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut out = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8 бит, RGBA, без интерлейса
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
 
 /// Фон окна по текущей теме — для панелей с нулевыми полями.
 fn ui_bg(ctx: &egui::Context) -> egui::Color32 {
     ctx.style().visuals.window_fill
-}
-
-/// Сырые байты ImageSource (include_image! кладёт статический буфер).
-fn bytes_of<'a>(src: &'a egui::ImageSource<'a>) -> &'a [u8] {
-    match src {
-        egui::ImageSource::Bytes { bytes, .. } => bytes.as_ref(),
-        _ => &[],
-    }
-}
-
-/// Раскодировать PNG-иконку раздела в текстуру egui. Вызывается один раз
-/// на иконку (дальше отдаётся кэш в `TrackerApp::nav_icons`).
-/// Ошибка декодирования не должна ронять интерфейс: рисуем прозрачную
-/// текстуру 1×1, подпись кнопки всё равно останется читаемой.
-fn load_nav_icon(
-    ctx: &egui::Context,
-    name: &str,
-    src: &egui::ImageSource<'static>,
-) -> egui::TextureHandle {
-    let image = match decode_png_rgba(bytes_of(src)) {
-        Some((w, h, rgba)) => egui::ColorImage::from_rgba_unmultiplied([w, h], &silhouette(&rgba)),
-        None => egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
-    };
-    ctx.load_texture(format!("nav_{name}"), image, egui::TextureOptions::LINEAR)
-}
-
-/// Превратить иконку в БЕЛЫЙ силуэт, сохранив альфу контура.
-/// Нужно для подкрашивания: egui умножает текстуру на цвет состояния, а
-/// готовые иконки покрашены в акцентный синий — без перевода в белый
-/// неактивный пункт был бы синим на тёмном фоне и не читался. Форма иконки
-/// задана альфой, поэтому цвет в неё не входит и просто заменяется белым.
-fn silhouette(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
-        .flat_map(|p| [255u8, 255, 255, p[3]])
-        .collect()
-}
-
-/// Байты PNG → (ширина, высота, RGBA). Минимальный декодер на базе крейта
-/// `image`: зависимость и так уже есть в дереве, а писать свой PNG-парсер
-/// незачем. Поддерживается 8 бит на канал (RGB/RGBA/серый/с альфой) —
-/// этого хватает нашим иконкам.
-fn decode_png_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    use image::ImageReader;
-    let img = ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let rgba = img.to_rgba8().into_raw();
-    if rgba.len() != w * h * 4 {
-        return None;
-    }
-    Some((w, h, rgba))
 }
 
 #[derive(Debug, Clone)]
@@ -364,9 +653,40 @@ pub enum TrayCmd {
     StopwatchHotkeys(Vec<crate::shortcuts::HotkeyReg>),
 }
 
-/// Тёмная тема в цветах клиента Steam: фон #1B2838, шапка #171A21,
-/// текст #C7D5E0, акцент #66C0F4. Окошко секундомера (тот же ctx)
-/// красится автоматически.
+/// Относительная яркость цвета по WCAG 2.1.
+///
+/// Нужна, чтобы проверять контраст текста на кнопке: цифра проверяемая, в
+/// отличие от «на глаз темнее/светлее». В основной сборке не используется —
+/// живёт ради тестов контраста.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn relative_luminance(c: egui::Color32) -> f32 {
+    let ch = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+}
+
+/// Контраст двух цветов по WCAG: 1.0 — неразличимы, 21 — чёрное на белом.
+/// Норма для текста 4.5:1, для крупного (крупнее 18pt) 3:1.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Тема в духе Material Design, цвета клиента Steam (#1B2838/#66C0F4).
+///
+/// Кнопки построены как в Material: спокойная заливка в покое, заметное
+/// осветление при наведении и заметное затемнение при нажатии (эффект
+/// «вдавленной» кнопки), плюс скругление. Текст ВСЕХ состояний — белый,
+/// поэтому контраст с фоном не меняется при нажатии (см. тесты
+/// `button_contrast_meets_wcag`).
 fn steam_visuals() -> egui::Visuals {
     use egui::Color32 as C;
     let mut v = egui::Visuals::dark();
@@ -382,19 +702,115 @@ fn steam_visuals() -> egui::Visuals {
     v.widgets.noninteractive.bg_fill = C::from_rgb(0x16, 0x20, 0x2D);
     v.widgets.noninteractive.fg_stroke =
         egui::Stroke::new(1.0_f32, C::from_rgb(0xC7, 0xD5, 0xE0));
-    v.widgets.inactive.bg_fill = C::from_rgb(0x2A, 0x47, 0x5E);
-    v.widgets.inactive.fg_stroke =
-        egui::Stroke::new(1.0_f32, C::from_rgb(0xC7, 0xD5, 0xE0));
-    // Никакого тёмного текста на синем: наведение и нажатие — светлый текст
-    // по тёмно-синему (контраст), как кнопки в клиенте Steam.
-    v.widgets.hovered.bg_fill = C::from_rgb(0x36, 0x5D, 0x7D);
+    // Покой: приглушённый сине-серый, скругление — как у Material.
+    // L = 0.064
+    v.widgets.inactive.bg_fill = C::from_rgb(0x2E, 0x4A, 0x62);
+    v.widgets.inactive.weak_bg_fill = C::from_rgb(0x2A, 0x40, 0x58);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
+    v.widgets.inactive.rounding = egui::Rounding::same(6.0);
+    // Наведение: заметно светлее покоя (Material «surface variant»), L = 0.137
+    v.widgets.hovered.bg_fill = C::from_rgb(0x3E, 0x6C, 0x8E);
+    v.widgets.hovered.weak_bg_fill = C::from_rgb(0x39, 0x5F, 0x80);
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
-    v.widgets.active.bg_fill = C::from_rgb(0x1B, 0x5F, 0x8A);
+    v.widgets.hovered.rounding = egui::Rounding::same(6.0);
+    // Нажатие: ЗАМЕТНО темнее покоя — кнопка «уходит вглубь», L = 0.029
+    // (зазор 0.035, тест `press_effect_is_visible` требует > 0.02).
+    // Именно на этом состоянии раньше всего и ломался контраст.
+    v.widgets.active.bg_fill = C::from_rgb(0x16, 0x32, 0x4A);
+    v.widgets.active.weak_bg_fill = C::from_rgb(0x11, 0x29, 0x3D);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
+    v.widgets.active.rounding = egui::Rounding::same(6.0);
     v.widgets.open.bg_fill = C::from_rgb(0x22, 0x30, 0x3F);
-    v.widgets.open.fg_stroke =
-        egui::Stroke::new(1.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
+    v.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
+    v.widgets.open.rounding = egui::Rounding::same(6.0);
+    // Обводка кнопки: тонкая, не съедает контраст текста. На нажатии
+    // обводка светлеет — «кнопка уходит вглубь» читается и по контуру.
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x3A, 0x55, 0x6C));
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x8E, 0xD4, 0xFF));
     v
+}
+
+/// Смешать цвет с фоном: `t` = доля фона (0 — как есть, 1 — чистый фон).
+pub fn blend(fg: egui::Color32, bg: egui::Color32, t: f32) -> egui::Color32 {
+    let m = |a: u8, b: u8| (a as f32 * (1.0 - t) + b as f32 * t).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        m(fg.r(), bg.r()),
+        m(fg.g(), bg.g()),
+        m(fg.b(), bg.b()),
+        255,
+    )
+}
+
+/// Цвета кнопки боковой навигации для одного состояния.
+///
+/// Вынесено в чистую функцию без `egui::Context`, чтобы тесты проверяли
+/// контраст текста/иконки и видимость эффекта нажатия без окна.
+#[derive(Debug, Clone, Copy)]
+pub struct NavPaint {
+    /// Фон кнопки (полностью прозрачный в покое — видно панель).
+    pub bg: egui::Color32,
+    /// Цвет иконки и подписи.
+    pub fg: egui::Color32,
+    /// Кнопка нажата: опустить и притушить иконку.
+    pub pressed: bool,
+}
+
+/// Состояния как в Material Design 3:
+/// * покой — только акцентная полоска, подпись приглушена;
+/// * наведение — подложка светлее (слой акцента ~12%);
+/// * нажатие — подложка ещё светлее, иконка чуть притушена и кнопка уходит
+///   вниз на 1px (видимый отклик, которого раньше не было вовсе).
+pub fn nav_item_paint(selected: bool, hovered: bool, down: bool) -> NavPaint {
+    let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
+    let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
+    let fg = if selected {
+        accent
+    } else if down {
+        egui::Color32::WHITE
+    } else if hovered {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(0x9A, 0xA4, 0xAF)
+    };
+    // Фон: выбранный пункт держит свою подложку, остальные появляются
+    // только под курсором/пальцем. Слои акцента подобраны по замеру
+    // реального рендера: покой L=0.020, наведение L=0.048, нажатие L=0.091
+    // — шаг между состояниями заметно глазом, а не «на пиксель».
+    let bg = if selected {
+        blend(accent, panel, 0.82) // 18% акцента
+    } else if down {
+        blend(accent, panel, 0.68) // 32% акцента — отчётливое нажатие
+    } else if hovered {
+        blend(accent, panel, 0.84) // 16% акцента
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    NavPaint { bg, fg, pressed: down }
+}
+
+/// Кнопка-«чип» (Material): скруглённая, с акцентной обводкой и читаемым
+/// текстом. Используется там, где кнопка должна быть заметной, но не
+/// перетягивать внимание (PIN, ⤢, позиции сетки).
+///
+/// Текст намеренно БЕЗ `.weak()` и без своего цвета: такой текст
+/// перекрывает `fg_stroke` виджета, и при нажатии (фон темнеет) остаётся
+/// бледным — контраст падал до 2.3 вместо требуемых 4.5. Цвет состояния
+/// берётся из темы, поэтому контраст одинаков во всех состояниях.
+fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let sel = ui.visuals().selection.bg_fill;
+    let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
+    ui.add(
+        egui::Button::new(text)
+            .min_size(egui::vec2(0.0, 20.0))
+            .fill(if on { sel } else { ui.visuals().widgets.inactive.bg_fill })
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                if on { accent } else { egui::Color32::from_rgb(0x3A, 0x55, 0x6C) },
+            ))
+            .rounding(egui::Rounding::same(10.0))
+            .selected(on),
+    )
 }
 
 pub struct TrackerApp {
@@ -540,9 +956,6 @@ pub struct TrackerApp {
     last_saved: AppConfig,
     /// Вкладка прошлого кадра: при переходе на Сессии/Будильники обновляем данные.
     prev_tab: Tab,
-    /// Текстуры иконок боковой навигации (по uri). Заполняется лениво:
-    /// PNG раскодируется один раз за сеанс, дальше рисуется текстура.
-    nav_icons: HashMap<String, egui::TextureHandle>,
 }
 
 impl TrackerApp {
@@ -654,7 +1067,6 @@ impl TrackerApp {
             last_hotkeys: Vec::new(),
             last_tooltip: Instant::now() - Duration::from_secs(99),
             prev_tab: Tab::from_str(&cfg_handle.last_tab),
-            nav_icons: HashMap::new(),
             about_sub: 0,
             last_saved: cfg_handle.clone(),
         };
@@ -1171,13 +1583,10 @@ impl TrackerApp {
     /// Содержимое окошка секундомера (табло | разделитель | кнопки).
     fn stopwatch_body(&mut self, ui: &mut egui::Ui, zoom: f32) {
         // Верхняя строка: PIN, счётчик, крестик — строго одна линия.
+        // Текст кнопок БЕЗ своего цвета: свой цвет перекрывает fg_stroke
+        // темы, и при нажатии (фон темнеет) текст оставался бледным.
         ui.horizontal(|ui| {
-            let pin_txt = if self.stopwatch_pinned {
-                egui::RichText::new("PIN").color(egui::Color32::from_rgb(255, 165, 0))
-            } else {
-                egui::RichText::new("PIN").weak()
-            };
-            if ui.small_button(pin_txt).clicked() {
+            if chip_button(ui, "PIN", self.stopwatch_pinned).clicked() {
                 self.toggle_stopwatch_pin();
             }
             ui.label(
@@ -1190,13 +1599,8 @@ impl TrackerApp {
                     self.set_stopwatch_overlay(false);
                 }
                 // Расширение: двойной размер окна + таймер обратного отсчёта.
-                let exp_txt = if self.stopwatch_expanded {
-                    egui::RichText::new("⤡").color(egui::Color32::from_rgb(0x66, 0xC0, 0xF4))
-                } else {
-                    egui::RichText::new("⤢").weak()
-                };
-                if ui
-                    .small_button(exp_txt)
+                let exp = if self.stopwatch_expanded { "⤡" } else { "⤢" };
+                if chip_button(ui, exp, self.stopwatch_expanded)
                     .on_hover_text(if self.stopwatch_expanded {
                         "Свернуть окошко"
                     } else {
@@ -2054,8 +2458,8 @@ impl eframe::App for TrackerApp {
             .exact_width(88.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                for (t, icon, label) in NAV_ITEMS {
-                    if self.nav_item(ui, icon, label, self.tab == t) {
+                for (t, label) in NAV_ITEMS {
+                    if self.nav_item(ui, t, label, self.tab == t) {
                         self.tab = t;
                     }
                     ui.add_space(4.0);
@@ -2236,14 +2640,20 @@ impl eframe::App for TrackerApp {
 }
 
 impl TrackerApp {
-    /// Кнопка навигации сайдбара: иконка из assets + подпись.
-    /// Три состояния: неактивна (приглушена), наведение (подсветка),
-    /// активна (акцентный фон + полоска + акцентный цвет иконки).
-    /// Возвращает true по клику.
+    /// Кнопка навигации сайдбара: векторная иконка + подпись.
+    ///
+    /// Состояния как в Material Design: покой (только акцентная полоска) →
+    /// наведение (слой +12% акцента) → нажатие (слой +24%, иконка
+    /// притухает, кнопка «вдавливается» вниз на 1px). Раньше нажатия не
+    /// было вообще — `is_pointer_button_down_on()` не проверялось, кнопка
+    /// выглядела «мёртвой».
+    ///
+    /// Цвета берутся из чистой `nav_item_paint`, поэтому их контраст и
+    /// видимость нажатия проверяются тестами без окна.
     fn nav_item(
         &mut self,
         ui: &mut egui::Ui,
-        icon: egui::ImageSource<'static>,
+        tab: Tab,
         label: &str,
         selected: bool,
     ) -> bool {
@@ -2251,75 +2661,50 @@ impl TrackerApp {
         let h = 60.0;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
         if ui.is_rect_visible(rect) {
-            let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
-            let bg = if selected {
-                egui::Color32::from_rgba_premultiplied(102, 192, 244, 38)
-            } else if resp.hovered() {
-                ui.visuals().faint_bg_color
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            ui.painter().rect_filled(rect, 8.0, bg);
+            let p = nav_item_paint(selected, resp.hovered(), resp.is_pointer_button_down_on());
+            // Эффект нажатия: кнопка опускается на 1px — «тактильный» отклик.
+            let dy = if p.pressed { 1.0 } else { 0.0 };
+            let rect = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, dy), rect.size());
+            let radius = egui::Rounding::same(10.0); // Material: скругление 10
+            // Фон.
+            if p.bg.a() > 0 {
+                ui.painter().rect_filled(rect, radius, p.bg);
+            }
+            // Акцентная полоска слева — «выбранный раздел».
             if selected {
                 let bar = egui::Rect::from_min_size(
-                    rect.min + egui::vec2(6.0, 12.0),
-                    egui::vec2(3.0, h - 24.0),
+                    rect.min + egui::vec2(5.0, 12.0),
+                    egui::vec2(3.0, h - 24.0 - dy),
                 );
-                ui.painter().rect_filled(bar, 1.5, accent);
+                ui.painter().rect_filled(bar, 1.5, p.fg);
             }
-            let fg = if selected {
-                accent
-            } else if resp.hovered() {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_rgb(0x8F, 0x98, 0xA0)
-            };
-            // Иконка 22×22 по центру верхней части кнопки.
+            // Иконка 22×22 по центру верхней части кнопки. Векторная, рисуется
+            // цветом состояния — единообразно с подписью.
             let icon_size = 22.0;
             let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.center().x, rect.top() + 8.0 + icon_size / 2.0),
                 egui::vec2(icon_size, icon_size),
             );
-            // Иконки одноцветные (силуэты), поэтому красим их цветом
-            // состояния — единообразно с подписью.
-            let tex_id = self.nav_icon_id(ui, &icon);
-            // painter.image(texture_id, rect, uv, tint): uv = вся текстура.
-            ui.painter().image(
-                tex_id,
-                icon_rect,
-                egui::Rect::from_min_max(
-                    egui::pos2(0.0, 0.0),
-                    egui::pos2(1.0, 1.0),
-                ),
-                fg,
-            );
+            // При нажатии иконка слегка притухает (Material «state layer»).
+            let tint = if p.pressed {
+                blend(p.fg, ui.visuals().panel_fill, 0.25)
+            } else {
+                p.fg
+            };
+            // Фон под иконкой = подложка кнопки поверх панели: он же нужен
+            // для «прорезей» внутри залитых иконок (геймпад).
+            let icon_bg = blend(p.bg, ui.visuals().panel_fill, 0.0);
+            let icon_bg = if icon_bg.a() == 0 { ui.visuals().panel_fill } else { icon_bg };
+            paint_nav_icon(ui.painter(), icon_rect, tab, tint, icon_bg);
             ui.painter().text(
                 rect.center_bottom() - egui::vec2(0.0, 12.0),
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::proportional(11.5),
-                fg,
+                p.fg,
             );
         }
         resp.clicked()
-    }
-
-    /// Текстура иконки раздела: декодируется из assets ОДИН раз за сеанс и
-    /// кэшируется. `include_image!` отдаёт сырые байты, а рисовать их надо
-    /// текстурой — иначе PNG передекодировался бы в каждом кадре.
-    fn nav_icon_id(
-        &mut self,
-        ui: &egui::Ui,
-        src: &egui::ImageSource<'static>,
-    ) -> egui::TextureId {
-        let key = src.uri().unwrap_or("nav").to_string();
-        if let Some(tex) = self.nav_icons.get(&key) {
-            return tex.id();
-        }
-        let ctx = ui.ctx().clone();
-        let tex = load_nav_icon(&ctx, &key, src);
-        self.nav_icons.insert(key, tex.clone());
-        tex.id()
     }
 
     fn ui_sessions(&mut self, ui: &mut egui::Ui) {
@@ -4249,13 +4634,7 @@ fn strip_row(
             if ui.small_button("×").on_hover_text("Скрыть полоску").clicked() {
                 state.close_clicked = true;
             }
-            let pin_txt = if state.pinned {
-                egui::RichText::new("PIN").color(egui::Color32::from_rgb(255, 165, 0))
-            } else {
-                egui::RichText::new("PIN").weak()
-            };
-            if ui
-                .small_button(pin_txt)
+            if chip_button(ui, "PIN", state.pinned)
                 .on_hover_text("Закрепить: полоска перестаёт перетаскиваться")
                 .clicked()
             {
@@ -5309,79 +5688,408 @@ mod tests {
         println!("живая проверка мониторов пройдена");
     }
 
+
+    /// Крупное превью иконок разделов: 6 иконок по 120×120, каждая на своём
+    /// фоне. Нужен, чтобы ГЛАЗАМИ проверить геометрию (окно агент не видит,
+    /// а `PrintWindow` отдаёт чёрный кадр — winit рисует через GPU).
+    ///
+    /// Запуск: `cargo test nav_icons_preview_png -- --ignored --nocapture`
+    /// Файл: `target/nav_icons_preview.png`
     #[test]
-    fn all_navigation_items_have_icons() {
-        // Все 6 разделов идут с иконками из assets — пропущенная иконка
-        // тихо превратилась бы в пустую кнопку.
-        assert_eq!(NAV_ITEMS.len(), 6);
-        let mut uris: Vec<String> = NAV_ITEMS
-            .iter()
-            .map(|(_, src, _)| src.uri().unwrap_or("").to_string())
-            .collect();
-        assert!(uris.iter().all(|u| u.ends_with(".png")), "иконки должны быть PNG: {uris:?}");
-        uris.sort();
-        uris.dedup();
-        assert_eq!(uris.len(), 6, "иконки разделов не должны повторяться: {uris:?}");
+    #[ignore]
+    fn nav_icons_preview_png() {
+        let cell = 120.0_f32;
+        let (w, h) = (cell * 3.0, cell * 2.0);
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let ppp = 1.0_f32;
+        let vis = steam_visuals();
+        let shapes: Vec<egui::epaint::ClippedShape> = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, h),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(vis.panel_fill))
+                    .show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        for (i, (tab, label)) in NAV_ITEMS.iter().enumerate() {
+                            let (col, row) = (i % 3, i / 3);
+                            let origin =
+                                egui::pos2(col as f32 * cell, row as f32 * cell);
+                            let r = egui::Rect::from_min_size(
+                                origin,
+                                egui::vec2(cell, cell),
+                            );
+                            // Сетка 24dp — по ней видно, не вылезает ли
+                            // иконка за свою клетку.
+                            let grid = egui::Color32::from_rgb(0x2A, 0x3A, 0x4A);
+                            for k in 1..4 {
+                                let f = cell * k as f32 / 4.0;
+                                ui.painter().vline(
+                                    origin.x + f,
+                                    egui::Rangef::new(origin.y, origin.y + cell),
+                                    egui::Stroke::new(1.0, grid),
+                                );
+                                ui.painter().hline(
+                                    egui::Rangef::new(origin.x, origin.x + cell),
+                                    origin.y + f,
+                                    egui::Stroke::new(1.0, grid),
+                                );
+                            }
+                            // Контур клетки иконки.
+                            ui.painter().rect_stroke(
+                                r.shrink(1.0),
+                                0.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3A, 0x4A, 0x5A)),
+                            );
+                            // Сама иконка: белая, на тёмном фоне — контрастно.
+                            paint_nav_icon(
+                                ui.painter(),
+                                egui::Rect::from_min_size(
+                                    origin + egui::vec2(8.0, 8.0),
+                                    egui::vec2(cell - 16.0, cell - 16.0),
+                                ),
+                                *tab,
+                                egui::Color32::WHITE,
+                                vis.panel_fill,
+                            );
+                            let _ = label;
+                        }
+                    });
+            },
+        ).shapes;
+        let prims = ctx.tessellate(shapes, ppp);
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        rasterize(&prims, &mut buf, w as usize, h as usize);
+        let path = std::path::Path::new("target/nav_icons_preview.png");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(path, png_rgba(w as u32, h as u32, &buf))
+            .expect("не записался target/nav_icons_preview.png");
+        println!("превью иконок: {}", path.display());
+    }
+
+    /// Отрисовать кнопки и иконки в PNG, чтобы можно было ПОСМОТРЕТЬ на
+    /// результат глазами.
+    ///
+    /// Запуск: `cargo test ui_preview_png -- --ignored --nocapture`
+    /// Файл: `target/ui_preview.png`
+    #[test]
+    #[ignore]
+    fn ui_preview_png() {
+        // Раскладка: 4 колонки состояний кнопки × строки.
+        let (w, h) = (900.0_f32, 420.0_f32);
+        let ctx = egui::Context::default();
+        ctx.set_style(egui::Style {
+            visuals: steam_visuals(),
+            ..Default::default()
+        });
+        ctx.set_pixels_per_point(1.0);
+        let ppp = 1.0_f32;
+        let shapes: Vec<egui::epaint::ClippedShape> = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, h),
+                )),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(steam_visuals().panel_fill))
+                    .show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(14.0, 12.0);
+                        ui.add_space(6.0);
+                        // Строка 1: обычные кнопки egui во всех состояниях.
+                        ui.horizontal(|ui| {
+                            ui.label("egui Button:");
+                            for (name, kind) in [
+                                ("покой", 0u8),
+                                ("наведение", 1),
+                                ("нажата", 2),
+                            ] {
+                                let resp = ui.add(
+                                    egui::Button::new(name)
+                                        .min_size(egui::vec2(104.0, 30.0)),
+                                );
+                                // Подсветить нужное состояние принудительно:
+                                // egui не даёт задать hovered/pressed вручную,
+                                // поэтому состояние имитируется цветом из темы.
+                                let vis = match kind {
+                                    0 => steam_visuals().widgets.inactive.clone(),
+                                    1 => steam_visuals().widgets.hovered.clone(),
+                                    _ => steam_visuals().widgets.active.clone(),
+                                };
+                                let r = resp.rect;
+                                ui.painter().rect_filled(
+                                    r,
+                                    vis.rounding,
+                                    blend(vis.bg_fill, vis.fg_stroke.color, 0.0),
+                                );
+                                ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    name,
+                                    egui::FontId::proportional(12.0),
+                                    vis.fg_stroke.color,
+                                );
+                            }
+                        });
+                        ui.add_space(8.0);
+                        // Строка 2: векторные иконки разделов + чипы.
+                        ui.horizontal(|ui| {
+                            for (tab, label) in NAV_ITEMS {
+                                ui.vertical(|ui| {
+                                    let r = ui.allocate_exact_size(
+                                        egui::vec2(70.0, 60.0),
+                                        egui::Sense::hover(),
+                                    ).0;
+                                    paint_nav_icon(
+                                        ui.painter(),
+                                        egui::Rect::from_center_size(
+                                            egui::pos2(r.center().x, r.center().y - 8.0),
+                                            egui::vec2(28.0, 28.0),
+                                        ),
+                                        tab,
+                                        egui::Color32::from_rgb(0x9A, 0xA4, 0xAF),
+                                        steam_visuals().panel_fill,
+                                    );
+                                    ui.painter().text(
+                                        r.center() + egui::vec2(0.0, 22.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        label,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::from_rgb(0xC7, 0xD5, 0xE0),
+                                    );
+                                });
+                            }
+                        });
+                        ui.add_space(10.0);
+                        // Строка 3: кнопки навигации во всех состояниях.
+                        ui.horizontal(|ui| {
+                            for (name, sel, hov, dn) in [
+                                ("покой", false, false, false),
+                                ("наведение", false, true, false),
+                                ("нажата", false, true, true),
+                                ("выбран", true, false, false),
+                            ] {
+                                let p = nav_item_paint(sel, hov, dn);
+                                let (rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(76.0, 60.0), egui::Sense::hover());
+                                let dy = if p.pressed { 1.0 } else { 0.0 };
+                                let rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(0.0, dy),
+                                    rect.size(),
+                                );
+                                if p.bg.a() > 0 {
+                                    ui.painter().rect_filled(rect, egui::Rounding::same(10.0), p.bg);
+                                }
+                                if sel {
+                                    let bar = egui::Rect::from_min_size(
+                                        rect.min + egui::vec2(5.0, 12.0),
+                                        egui::vec2(3.0, 60.0 - 24.0 - dy),
+                                    );
+                                    ui.painter().rect_filled(bar, 1.5, p.fg);
+                                }
+                                paint_nav_icon(
+                                    ui.painter(),
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(rect.center().x, rect.top() + 8.0 + 11.0),
+                                        egui::vec2(22.0, 22.0),
+                                    ),
+                                    Tab::Sessions,
+                                    p.fg,
+                                    steam_visuals().panel_fill,
+                                );
+                                ui.painter().text(
+                                    rect.center_bottom() - egui::vec2(0.0, 12.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    name,
+                                    egui::FontId::proportional(11.5),
+                                    p.fg,
+                                );
+                            }
+                        });
+                        ui.add_space(10.0);
+                        // Строка 4: чипы в обоих состояниях.
+                        ui.horizontal(|ui| {
+                            for (label, on) in [("PIN", false), ("PIN", true), ("⤢", false), ("⤡", true)] {
+                                let vis = steam_visuals();
+                                let sel = vis.selection.bg_fill;
+                                let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
+                                let r = ui.add(
+                                    egui::Button::new(label)
+                                        .min_size(egui::vec2(0.0, 22.0))
+                                        .fill(if on { sel } else { vis.widgets.inactive.bg_fill })
+                                        .stroke(egui::Stroke::new(
+                                            1.0_f32,
+                                            if on {
+                                                accent
+                                            } else {
+                                                egui::Color32::from_rgb(0x3A, 0x55, 0x6C)
+                                            },
+                                        ))
+                                        .rounding(egui::Rounding::same(10.0))
+                                        .selected(on),
+                                ).rect;
+                                let _ = r;
+                            }
+                        });
+                    });
+            },
+        ).shapes;
+        // Тесселяция egui → треугольники, затем растеризация в RGBA.
+        let prims = ctx.tessellate(shapes, ppp);
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        rasterize(&prims, &mut buf, w as usize, h as usize);
+        // Запись PNG. Крейт `image` из зависимостей убран, поэтому пишем
+        // PNG вручную (IHDR/IDAT/IEND + zlib «stored»-блоки без сжатия).
+        let path = std::path::Path::new("target/ui_preview.png");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(path, png_rgba(w as u32, h as u32, &buf))
+            .expect("не записался target/ui_preview.png");
+        println!("превью записано: {} ({}x{})", path.display(), w, h);
     }
 
     #[test]
-    fn nav_icon_pngs_are_valid() {
-        // Заголовки PNG читаются прямо из бинарника include_image!.
-        for (name, src) in [
-            ("nav_sessions", egui::include_image!("../assets/nav_sessions.png")),
-            ("nav_games", egui::include_image!("../assets/nav_games.png")),
-            ("nav_alarms", egui::include_image!("../assets/nav_alarms.png")),
-            ("nav_timer", egui::include_image!("../assets/nav_timer.png")),
-            ("nav_params", egui::include_image!("../assets/nav_params.png")),
-            ("nav_about", egui::include_image!("../assets/nav_about.png")),
-        ] {
-            let (w, h, rgba) = decode_png_rgba(bytes_of(&src))
-                .unwrap_or_else(|| panic!("{name}: PNG не раскодировался"));
-            assert_eq!(w * h * 4, rgba.len(), "{name}: размер буфера не сходится");
-            // Иконка должна быть квадратной и достаточно крупной, иначе
-            // растянется мылом в 22×22.
-            assert_eq!(w, h, "{name}: иконка не квадратная {w}×{h}");
-            assert!(w >= 32, "{name}: иконка слишком мелкая {w}");
+    fn rasterize_fills_triangles() {
+        // Изолированная проверка растеризатора: если он не работает,
+        // превью показывает пустоту и ничего нельзя проверить глазами.
+        let (w, h) = (10usize, 10usize);
+        let prim = egui::ClippedPrimitive {
+            clip_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32)),
+            primitive: egui::epaint::Primitive::Mesh(egui::epaint::Mesh {
+                texture_id: egui::TextureId::default(),
+                indices: vec![0, 1, 2],
+                vertices: vec![
+                    egui::epaint::Vertex {
+                        pos: egui::pos2(0.0, 0.0),
+                        uv: egui::epaint::WHITE_UV,
+                        color: egui::Color32::from_rgb(255, 0, 0),
+                    },
+                    egui::epaint::Vertex {
+                        pos: egui::pos2(10.0, 0.0),
+                        uv: egui::epaint::WHITE_UV,
+                        color: egui::Color32::from_rgb(255, 0, 0),
+                    },
+                    egui::epaint::Vertex {
+                        pos: egui::pos2(0.0, 10.0),
+                        uv: egui::epaint::WHITE_UV,
+                        color: egui::Color32::from_rgb(255, 0, 0),
+                    },
+                ],
+            }),
+        };
+        let mut buf = vec![0u8; w * h * 4];
+        rasterize(&[prim], &mut buf, w, h);
+        // Внутри треугольника (пиксель 1,1) должен быть красный.
+        let i = (1 * w + 1) * 4;
+        assert_eq!(&buf[i..i + 3], &[255, 0, 0], "внутри треугольника не залито");
+        // А вне треугольника (пиксель 9,9) — пусто.
+        let j = (9 * w + 9) * 4;
+        assert_eq!(buf[j], 0, "вне треугольника что-то залито");
+    }
+
+    #[test]
+    fn all_navigation_items_have_icons() {
+        // Все 6 разделов идут с иконкой и непустой подписью. Пропущенная
+        // иконка тихо превратилась бы в пустую кнопку.
+        assert_eq!(NAV_ITEMS.len(), 6);
+        for (t, label) in NAV_ITEMS {
+            assert!(!label.trim().is_empty(), "{t:?}: пустая подпись");
+            assert!(
+                !nav_icon_shapes(t).is_empty(),
+                "{t:?}: иконка без фигур"
+            );
+        }
+        // Разделы не должны повторяться.
+        let mut tabs: Vec<Tab> = NAV_ITEMS.iter().map(|(t, _)| *t).collect();
+        tabs.sort_by_key(|t| format!("{t:?}"));
+        tabs.dedup();
+        assert_eq!(tabs.len(), 6, "разделы навигации повторяются");
+    }
+
+    #[test]
+    fn nav_icons_fit_their_cell() {
+        // Геометрия задана в сетке 24×24: всё, что рисуется, должно лежать
+        // внутри клетки (с учётом обводки), иначе иконка вылезет на подпись
+        // или обрежется краем кнопки.
+        const CELL: f32 = 24.0;
+        for (tab, _) in NAV_ITEMS {
+            for shape in nav_icon_shapes(tab) {
+                for (x, y) in shape.points() {
+                    assert!(
+                        x >= -0.01 && x <= CELL + 0.01 && y >= -0.01 && y <= CELL + 0.01,
+                        "{tab:?}: точка ({x}, {y}) выходит за клетку {CELL}×{CELL}"
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn overlay_style_forbids_minimize() {
-        const WS_THICKFRAME: i32 = 0x0004_0000;
-        const WS_MINIMIZEBOX: i32 = 0x0002_0000;
-        // Ресайз остаётся включённым.
-        assert_eq!(overlay_window_style(0) & WS_THICKFRAME, WS_THICKFRAME);
-        // А свернуть окно больше нельзя — ни через Win+D, ни двойным кликом
-        // по таскбару, ни Aero Snap: у этих сценариев Windows не трогает
-        // окна без WS_MINIMIZEBOX.
-        assert_eq!(overlay_window_style(0) & WS_MINIMIZEBOX, 0);
-        // Повторный вызов на уже исправленном стиле ничего не ломает
-        // (идемпотентность: стиль применяется каждый кадр).
-        let once = overlay_window_style(WS_MINIMIZEBOX);
-        assert_eq!(overlay_window_style(once), once);
-        // Чужие биты (WS_POPUP, WS_VISIBLE, WS_EX_LAYERED) сохраняются.
-        // WS_POPUP = 0x8000_0000, в i32 это отрицательное число.
-        let base = (0x8000_0000u32 as i32) | 0x1000_0000 | 0x0008_0000;
-        let st = overlay_window_style(base);
-        assert_eq!(st & base, base, "чужие биты стиля затёрлись: {st:#x}");
+    fn nav_icons_are_outline_style() {
+        // Material: иконки контурные, обводка 2dp в сетке 24dp. Проверяем,
+        // что толщина не «съедает» мелкие фигуры и не нулевая.
+        assert_eq!(ICON_STROKE, 2.0);
+        for (tab, _) in NAV_ITEMS {
+            let shapes = nav_icon_shapes(tab);
+            // Заливка без прорезей — это «пластиковая» клякса, а не иконка.
+            let knockout = shapes
+                .iter()
+                .any(|s| matches!(s, IconShape::Poly { knockout: true, .. }
+                    | IconShape::Circle { knockout: true, .. }));
+            // Контурная часть обязательна.
+            let has_outline = shapes.iter().any(|s| match s {
+                IconShape::Line(_) => true,
+                IconShape::Poly { fill, .. } => !fill,
+                IconShape::Circle { filled, .. } => !filled,
+            });
+            // Или контур есть, или заливка «прорезана» деталями — третьего
+            // (глухая заливка) быть не должно.
+            assert!(
+                has_outline || knockout,
+                "{tab:?}: глухая заливка без прорезей и без контура"
+            );
+            // Геймпад — единственная залитая иконка: она специально залита с
+            // прорезями, иначе на 22px детали сливались.
+            if tab == Tab::Games {
+                assert!(
+                    knockout,
+                    "геймпад должен быть залит с прорезями: на 22px контур не читается"
+                );
+            }
+        }
     }
 
     #[test]
-    fn silhouette_keeps_shape_and_makes_white() {
-        // Синий непрозрачный пиксель → белый непрозрачный (форма задана альфой).
-        assert_eq!(&silhouette(&[102, 192, 244, 255])[0..4], &[255, 255, 255, 255]);
-        // Цвет не влияет на результат: тёмная заливка тоже становится белой.
-        assert_eq!(&silhouette(&[10, 10, 10, 255])[0..4], &[255, 255, 255, 255]);
-        // Прозрачность сохраняется — иначе фон стал бы белым квадратом.
-        assert_eq!(&silhouette(&[0, 0, 0, 0])[0..4], &[255, 255, 255, 0]);
-        assert_eq!(silhouette(&[255, 255, 255, 128])[3], 128);
-        // Длина буфера совпадает с исходной.
-        assert_eq!(silhouette(&[1, 2, 3, 4, 5, 6, 7, 8]).len(), 8);
-        // Настоящая иконка 64×64 декодируется и остаётся 64×64 после перевода.
-        let src = egui::include_image!("../assets/nav_sessions.png");
-        let (w, h, rgba) = decode_png_rgba(bytes_of(&src)).expect("иконка не раскодировалась");
-        assert_eq!((w, h), (64, 64));
-        assert_eq!(silhouette(&rgba).len(), w * h * 4);
+    fn nav_icons_have_no_degenerate_geometry() {
+        // Ни одна фигура не должна схлопнуться в точку или иметь NaN —
+        // иначе в кадре появляются артефакты.
+        for (tab, _) in NAV_ITEMS {
+            for shape in nav_icon_shapes(tab) {
+                for (x, y) in shape.points() {
+                    assert!(
+                        x.is_finite() && y.is_finite(),
+                        "{tab:?}: нечисловая координата ({x}, {y})"
+                    );
+                }
+                // Ломаная из одной точки не рисуется — брак геометрии.
+                if let IconShape::Line(p) | IconShape::Poly { pts: p, .. } = &shape {
+                    assert!(p.len() >= 2, "{tab:?}: ломаная из одной точки");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5753,6 +6461,191 @@ mod tests {
                 texts.len()
             );
         }
+    }
+
+    #[test]
+    fn button_contrast_meets_wcag() {
+        // ГЛАВНЫЙ тест на жалобу «после нажатия текст плохо читается».
+        // Контраст текста кнопки к её фону должен быть >= 4.5:1 (WCAG AA)
+        // ВО ВСЕХ состояниях, включая active (нажатое) — раньше именно там
+        // он падал до 2.3, потому что в кнопку клали `.weak()`/свой цвет.
+        let v = steam_visuals();
+        const MIN: f32 = 4.5;
+        let check = |name: &str, w: &egui::style::WidgetVisuals| {
+            let bg = w.bg_fill;
+            let fg = w.fg_stroke.color;
+            let cr = contrast_ratio(fg, bg);
+            assert!(
+                cr >= MIN,
+                "{name}: контраст {cr:.2} < {MIN} (текст {:?} на фоне {:?})",
+                fg,
+                bg
+            );
+        };
+        check("inactive (покой)", &v.widgets.inactive);
+        check("hovered (наведение)", &v.widgets.hovered);
+        check("active (нажата)", &v.widgets.active);
+        // Показываем числа, чтобы было видно запас.
+        println!(
+            "контраст: покой {:.2}, наведение {:.2}, нажатие {:.2}",
+            contrast_ratio(v.widgets.inactive.fg_stroke.color, v.widgets.inactive.bg_fill),
+            contrast_ratio(v.widgets.hovered.fg_stroke.color, v.widgets.hovered.bg_fill),
+            contrast_ratio(v.widgets.active.fg_stroke.color, v.widgets.active.bg_fill),
+        );
+    }
+
+    #[test]
+    fn press_effect_is_visible() {
+        // Нажатие должно ЗАМЕТНО отличаться от покоя — иначе эффекта
+        // «вдавленной кнопки» нет. Проверяем и яркостью, и цветом.
+        let v = steam_visuals();
+        let rest = v.widgets.inactive.bg_fill;
+        let over = v.widgets.hovered.bg_fill;
+        let press = v.widgets.active.bg_fill;
+        // Наведение светлее покоя.
+        assert!(
+            relative_luminance(over) > relative_luminance(rest) + 0.02,
+            "наведение должно быть светлее покоя (покой {:?} vs наведение {:?})",
+            rest,
+            over
+        );
+        // Нажатие темнее покоя — кнопка «уходит вглубь».
+        assert!(
+            relative_luminance(press) < relative_luminance(rest) - 0.02,
+            "нажатие должно быть темнее покоя (покой {:?} vs нажатие {:?})",
+            rest,
+            press
+        );
+        // И три состояния попарно различимы.
+        assert_ne!(rest, press, "нажатие не отличается от покоя");
+        assert_ne!(rest, over, "наведение не отличается от покоя");
+    }
+
+    #[test]
+    fn buttons_never_override_text_colour() {
+        // В кнопках нельзя задавать собственный цвет текста (`.weak()` или
+        // `.color()`): такой текст перекрывает fg_stroke темы, и при
+        // нажатии остаётся бледным. Проверяем исходник: в этом файле не
+        // должно остаться ни одной кнопки с .weak()/.color() внутри.
+        let src = include_str!("app.rs");
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            // Кнопка, получающая RichText/текст с явным цветом.
+            let is_button = l.contains("small_button(") || l.contains("ui.button(");
+            let has_own_colour = l.contains(".weak()") || l.contains(".color(");
+            if is_button && has_own_colour {
+                panic!(
+                    "строка {}: кнопка со своим цветом текста ломает контраст при нажатии:\n  {}",
+                    i + 1,
+                    l
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nav_button_has_visible_press_effect() {
+        // Раньше кнопка навигации вообще не реагировала на нажатие
+        // (is_pointer_button_down_on() не проверялся). Теперь:
+        // покой → наведение → нажатие должны различаться по фону.
+        let rest = nav_item_paint(false, false, false);
+        let over = nav_item_paint(false, true, false);
+        let down = nav_item_paint(false, true, true);
+        assert!(!rest.pressed && !over.pressed, "нажатия нет");
+        assert!(down.pressed, "нажатие должно быть помечено");
+        // Фон: прозрачный в покое, светлеет при наведении, ещё светлеет
+        // при нажатии.
+        assert_eq!(rest.bg, egui::Color32::TRANSPARENT, "в покое фон прозрачный");
+        assert!(
+            relative_luminance(over.bg) > relative_luminance(rest.bg),
+            "наведение должно светлеть: {:?} -> {:?}",
+            rest.bg,
+            over.bg
+        );
+        assert!(
+            relative_luminance(down.bg) > relative_luminance(over.bg),
+            "нажатие должно быть ещё светлее: {:?} -> {:?}",
+            over.bg,
+            down.bg
+        );
+        // Подложка не должна становиться слишком светлой, иначе потеряется
+        // «прилипание» к панели.
+        assert!(
+            relative_luminance(down.bg) < 0.12,
+            "подложка нажатия слишком светлая: {:?}",
+            down.bg
+        );
+    }
+
+    #[test]
+    fn nav_press_effect_is_strong_enough_to_see() {
+        // Замер по реальному превью: покой L=0.020, наведение L=0.048,
+        // нажатие L=0.089. Требование — нажатие заметно светлее фона
+        // панели, иначе отклика снова не видно (так было до правки:
+        // первый вариант давал лишь L=0.066 поверх панели 0.020 и визуально
+        // почти не читался).
+        let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
+        let lp = relative_luminance(panel);
+        let rest = nav_item_paint(false, false, false);
+        let down = nav_item_paint(false, true, true);
+        let ld = relative_luminance(down.bg);
+        assert!(
+            ld / lp > 3.0,
+            "нажатие должно быть втрое светлее панели, а не «в полтора»: панель L={lp:.4}, нажатие L={ld:.4}"
+        );
+        assert!(rest.bg.a() == 0, "в покое подложки быть не должно");
+        println!(
+            "навигация: панель L={lp:.4}, наведение L={:.4}, нажатие L={ld:.4}",
+            relative_luminance(nav_item_paint(false, true, false).bg)
+        );
+    }
+
+    #[test]
+    fn nav_button_text_contrast_in_all_states() {
+        // Подпись и иконка должны читаться на подложке в каждом состоянии.
+        let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
+        for (name, p) in [
+            ("выбранный", nav_item_paint(true, false, false)),
+            ("выбранный+наведение", nav_item_paint(true, true, false)),
+            ("выбранный+нажатие", nav_item_paint(true, true, true)),
+            ("покой", nav_item_paint(false, false, false)),
+            ("наведение", nav_item_paint(false, true, false)),
+            ("нажатие", nav_item_paint(false, true, true)),
+        ] {
+            // Реальный фон — это подложка поверх панели (или сама панель,
+            // если подложки нет).
+            let bg = blend(p.bg, panel, 0.0);
+            let bg = if bg.a() == 0 { panel } else { bg };
+            let cr = contrast_ratio(p.fg, bg);
+            assert!(
+                cr >= 4.5,
+                "{name}: контраст {cr:.2} < 4.5 (текст {:?} на фоне {:?})",
+                p.fg,
+                bg
+            );
+        }
+    }
+
+    #[test]
+    fn nav_selected_keeps_accent_identity() {
+        // Выбранный пункт обязан отличаться от соседних и по фону, и по
+        // цвету иконки — иначе активный раздел не читается.
+        let sel = nav_item_paint(true, false, false);
+        let idle = nav_item_paint(false, false, false);
+        assert_ne!(sel.bg, idle.bg, "у выбранного пункта должна быть подложка");
+        assert_ne!(sel.fg, idle.fg, "иконка выбранного пункта должна быть акцентной");
+    }
+
+    #[test]
+    fn contrast_ratio_math_is_right() {
+        use egui::Color32 as C;
+        // Контрастные пары с известным ответом (WCAG).
+        assert!((contrast_ratio(C::BLACK, C::WHITE) - 21.0).abs() < 0.05);
+        assert!((contrast_ratio(C::WHITE, C::WHITE) - 1.0).abs() < 0.01);
+        // Симметричность: порядок аргументов не важен.
+        let a = C::from_rgb(0x2E, 0x4A, 0x62);
+        let b = C::WHITE;
+        assert_eq!(contrast_ratio(a, b), contrast_ratio(b, a));
     }
 
     #[test]

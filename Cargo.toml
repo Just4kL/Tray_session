@@ -1,6 +1,6 @@
 [package]
 name = "game-session-tracker"
-version = "0.7.25"
+version = "0.7.26"
 edition = "2021"
 description = "Game Session Tracker — авто-подсчёт времени игр с GPU-гейтом (Rust/egui)"
 authors = ["Game Session Tracker"]
@@ -23,9 +23,8 @@ arboard = "3"
 nvml-wrapper = "0.11"
 winreg = "0.52"
 winapi = { version = "0.3", features = ["winuser", "mmsystem"] }
-# Иконки разделов (assets/*.png): раскодируются один раз при старте и живут
-# в памяти как текстуры egui — без повторного декодирования в каждом кадре.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Иконки разделов рисуются вектором (nav_icon_shapes), растровые PNG и крейт
+# `image` больше не нужны.
 
 [profile.release]
 opt-level = 2
