@@ -2,13 +2,13 @@ mod app;
 mod config;
 mod db;
 mod detector;
+mod export;
 mod gpu;
 mod log;
 mod monitor;
 mod shortcuts;
 mod sound;
 mod update;
-#[cfg(test)]
 mod uninstall;
 
 use app::{initial_games, AppCmd, TrackerApp, TrayCmd, VERSION};
@@ -302,7 +302,18 @@ fn main() -> eframe::Result {
     // держит открытым. Окно при этом не создаётся.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(upd) = update::parse_args(&argv) {
-        std::process::exit(update::run_updater(upd.wait_secs));
+        std::process::exit(update::run_updater(upd.wait_secs, &upd.channel));
+    }
+
+    // Режим деактиватора. Отдельного маленького бинарника не делаем
+    // намеренно: он тянул бы за собой копию логирования, работы с базой и
+    // выгрузки CSV, а они должны быть ровно одни и те же, что и у программы.
+    // Вместо этого один и тот же файл копируется как `_uninstall.exe` и сам
+    // узнаёт себя по имени.
+    if uninstall::is_uninstaller() {
+        crate::log::init(&update::program_dir());
+        crate::log::info("запуск в режиме деактивации");
+        std::process::exit(uninstall::run(&argv));
     }
 
     // Логи пишутся рядом с программой, с ограничением по объёму.

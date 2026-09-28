@@ -13,6 +13,29 @@
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
 
+# Куда складывать прошлую сборку. Без неё нельзя проверить обновление:
+# для этого нужна программа, которую обновление ещё не заменило.
+$PrevDir = Join-Path (Get-Location) 'dist\old'
+
+# Сохраняем текущую сборку ДО подмены на новую. Вызывают так:
+#     copy target\release\game-session-tracker.exe TraySession.exe
+#     tools\make-manifest.ps1 -Archive
+# Без -Archive скрипт ничего не архивирует (обычный пересбор манифеста).
+if ($args -contains '-Archive') {
+    if (Test-Path 'TraySession.exe') {
+        $oldVer = 'без-версии'
+        if (Test-Path 'update_manifest.json') {
+            try {
+                $oldVer = (Get-Content 'update_manifest.json' -Raw | ConvertFrom-Json).version
+            } catch { $oldVer = 'нечитаемый' }
+        }
+        New-Item -ItemType Directory -Force -Path $PrevDir | Out-Null
+        $dest = Join-Path $PrevDir ("TraySession_$oldVer.exe")
+        Copy-Item 'TraySession.exe' $dest -Force
+        Write-Host "Прошлая сборка сохранена: $dest"
+    }
+}
+
 # Файлы сборки, которые имеет смысл обновлять. Порядок не важен.
 $Files = @('TraySession.exe', 'Tray_session_setup.exe')
 

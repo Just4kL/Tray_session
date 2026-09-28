@@ -14,8 +14,8 @@ pub const APP_NAME: &str = "Tray Session";
 /// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
-pub const VERSION: &str = "0.7.29";
-pub const BUILD: &str = "20260928";
+pub const VERSION: &str = "0.7.30";
+pub const BUILD: &str = "20260929";
 pub const ISSUE_URL: &str = "https://example.com/issues";
 /// Заголовок окошка секундомера (он же ключ для поиска HWND под WinAPI).
 pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
@@ -23,6 +23,20 @@ pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
 pub const STRIP_TITLE: &str = "Сессия — Tray Session";
 
 const CHANGELOG: &[(&str, &str, &[&str])] = &[
+    ("0.7.30", "2026-09-29", &[
+        "New: Канал обновлений. Раньше ветка жёстко вшита, и любая сборка с новой функцией молча возвращалась на стабильную: человек ставил бету, а программа откатывала его назад без объяснений. Теперь в настройках выбирается «Стабильный» или «Бета», и канал уходит в фоновый процесс вместе с запуском обновления.",
+        "New: Неизвестное значение канала считается стабильным, а не отключает обновления: опечатка в config.json не должна оставлять человека без обновлений совсем.",
+        "New: Выгрузка таблицы сессий вынесена в общий модуль и больше не зависит от данных в памяти. Программа и деактиватор пишут CSV одним и тем же кодом, поэтому файлы выходят одинаковыми.",
+        "New: Деактиватор спрашивает про таблицу сессий до подтверждения удаления. Если человек её уже сохранял — программа называет, где файл лежит, и оставляет его на месте. Если не сохранял — предлагает сохранить: файл пишется на Рабочий стол, а не рядом с программой, и Проводник открывается сразу на нём.",
+        "New: Проверка, что файл выгрузки не попадёт в удаляемую папку. Случай, когда выгрузка оказывалась внутри папки программы, раньше молча оставлял её сиротой: не в списках целей она не значилась, и после деактивации в папке валялся файл без программы.",
+        "New: Прошлая выгрузка не затирается: если файл уже есть, следующий получает свободное имя sessions_2.csv, sessions_3.csv и так далее. Раньше новая выгрузка перезаписывала старую, и человек терял историю вместе с ней.",
+        "New: Пустая база больше не называется ошибкой: «сессий ещё не было, выгружать нечего» — это нормальный исход, и удаление продолжается.",
+        "New: Деактиватор — тот же файл, что и программа, и узнаёт себя по имени _uninstall.exe. Раньше это был отдельный маленький бинарник, из-за чего логирование, работа с базой и выгрузка CSV были бы продублированы и со временем разошлись бы с программой.",
+        "Fix: Настройки обновлений не сохранялись. Частота, автопроверка, «ставить молча» и канал выбирались и сохранялись, но в файл config.json их не записывали — при перезапуске всё возвращалось к умолчанию без всякого сообщения. Теперь и запись, и чтение на месте.",
+        "Fix: Путь выгрузки проверялся по самому файлу, которого в этот момент ещё нет: проверка отвечала «внутри папки программы» на совершенно внешний путь и срывала выгрузку.",
+        "Fix: В отчёте о выгрузке вместо числа строк печатался весь путь к файлу — сообщение вводило в заблуждение.",
+        "New: 18 тестов на выгрузку и деактивацию: оба варианта удаления, запрет писать в удаляемую папку, устаревшая метка, свободное имя файла, разные каналы обновлений, их сквозная передача и сохранение в настройках.",
+    ]),
     ("0.7.29", "2026-09-29", &[
         "Fix: Обновление не работало вообще. Фоновый процесс — это сам TraySession.exe, и он пытался заменить файл, который сам же выполняет: Windows возвращал «процесс не может получить доступ к файлу» (os error 32). Теперь процесс на старте переименовывает сам себя в update_tmp/_updater_running.exe, освобождая имя под новую сборку, и убирает копию после завершения.",
         "Fix: Ошибка перезапуска программы больше не теряется: раньше она молча проглатывалась, и человек думал, что всё прошло. Теперь попадает и в лог, и в отчёт.",
@@ -1565,7 +1579,10 @@ impl TrackerApp {
             self.update_status = "Не удалось найти файл программы.".to_string();
             return;
         }
-        match crate::update::spawn_updater(&exe, 20) {
+        // Канал берём из настроек: бета должна обновляться по бета-ветке,
+        // иначе установленная бета молча возвращается на старую версию.
+        let channel = crate::update::normalize_channel(&self.cfg_handle.update_channel);
+        match crate::update::spawn_updater(&exe, 20, channel) {
             Ok(()) => {
                 self.update_checking = false;
                 self.status_msg = "Обновление ставится, программа сейчас закроется…"
@@ -1603,8 +1620,11 @@ impl TrackerApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
         let silent = self.cfg_handle.update_silent;
+        // Канал тоже уходит в поток: проверка по расписанию обязана смотреть
+        // ту же ветку, что и ручное обновление.
+        let channel = crate::update::normalize_channel(&self.cfg_handle.update_channel);
         std::thread::spawn(move || {
-            let info = match crate::update::fetch_manifest() {
+            let info = match crate::update::fetch_manifest_for(channel) {
                 Ok(m) => {
                     let base = crate::update::program_dir();
                     let plan = crate::update::plan_update(&base, &m);
@@ -1612,7 +1632,7 @@ impl TrackerApp {
                         // Пользователь разрешил ставить молча.
                         let exe = std::env::current_exe().unwrap_or_default();
                         if !exe.as_os_str().is_empty() {
-                            let _ = crate::update::spawn_updater(&exe, 20);
+                            let _ = crate::update::spawn_updater(&exe, 20, channel);
                             let _ = crate::update::signal_ready_to_exit(&base);
                             UpdateInfo {
                                 msg: "Обновление найдено, ставлю в фоне, программа сейчас закроется."
@@ -4056,6 +4076,28 @@ impl TrackerApp {
                 &mut c.update_silent,
                 "Ставить найденное молча, не спрашивая",
             );
+            // Канал: стабильный или бета. Без него бетовые сборки обновлялись
+            // бы по стабильной ветке и молча откатывались назад.
+            let draft_channel = crate::update::normalize_channel(&c.update_channel);
+            egui::ComboBox::from_label("Канал обновлений")
+                .selected_text(crate::update::channel_label(draft_channel))
+                .show_ui(ui, |ui| {
+                    for ch in crate::update::CHANNELS {
+                        if ui
+                            .selectable_label(*ch == draft_channel, crate::update::channel_label(ch))
+                            .clicked()
+                        {
+                            c.update_channel = (*ch).to_string();
+                        }
+                    }
+                });
+            ui.add(
+                egui::Label::new(
+                    "«Бета» — сборки с новыми, ещё не проверенными функциями. \
+                     Если что-то пойдёт не так, верните «Стабильный».",
+                )
+                .wrap(),
+            );
             ui.add(
                 egui::Label::new(
                     "«Молча» означает: фоновый процесс сам скачает и заменит файлы, \
@@ -4067,7 +4109,9 @@ impl TrackerApp {
             );
             let changed = c.update_freq != self.cfg_handle.update_freq
                 || c.update_auto != self.cfg_handle.update_auto
-                || c.update_silent != self.cfg_handle.update_silent;
+                || c.update_silent != self.cfg_handle.update_silent
+                || crate::update::normalize_channel(&c.update_channel)
+                    != crate::update::normalize_channel(&self.cfg_handle.update_channel);
             if ui
                 .add_enabled(changed, egui::Button::new("Сохранить настройки обновлений"))
                 .clicked()
@@ -4334,32 +4378,52 @@ impl TrackerApp {
 
     // ---------- actions ----------
 
+    /// Выгрузить таблицу сессий в CSV, выбранный человеком.
+    ///
+    /// Запись идёт через общий модуль `export`, а не напрямую: деактиватор
+    /// пользуется тем же кодом, поэтому файлы выходят одинаковыми. Сюда же
+    /// пишется метка `last_export.txt` — по ней деактиватор поймёт, что
+    /// человек таблицу уже сохранял, и не станет предлагать сохранить
+    /// её заново.
     fn export_csv(&mut self) {
-        let total_all: i64 = self.agg.iter().map(|r| r.total_duration).sum();
-        let Some(path) = rfd::FileDialog::new().set_file_name("sessions.csv").save_file() else { return };
-        let file = match std::fs::File::create(&path) {
-            Ok(f) => f,
-            Err(e) => { self.status_msg = format!("Не могу создать файл: {e}"); return; }
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("sessions.csv")
+            .save_file()
+        else {
+            return;
         };
-        let mut w = csv::Writer::from_writer(file);
-        let _ = w.write_record(["№", "Игра", "Общее время", "% от общего", "Запускал", "Сессий"]);
-        for (i, r) in self.agg.iter().enumerate() {
-            let pct = if total_all > 0 { r.total_duration as f64 / total_all as f64 * 100.0 } else { 0.0 };
-            let last = if r.last_start.is_empty() { "—".to_string() } else {
-                chrono::DateTime::parse_from_rfc3339(&r.last_start)
-                    .map(|d| d.with_timezone(&Local).format("%H:%M %Y-%m-%d").to_string())
-                    .unwrap_or(r.last_start.clone())
-            };
-            let _ = w.write_record([
-                (i + 1).to_string(),
-                r.game_name.clone(),
-                format_duration(r.total_duration),
-                format!("{pct:.2}%"),
-                last,
-                r.runs.to_string(),
-            ]);
+        let rows: Vec<(String, i64, String, i64, i64)> = self
+            .agg
+            .iter()
+            .map(|r| {
+                // AggRow не хранит числа сессий, а в таблице есть такой
+                // столбец. Считаем из базы: там sessions_by_game отдаёт все
+                // сессии игры, а не только те, что попали в текущую сводку.
+                let sessions = self.db.sessions_by_game(&r.game_name).len() as i64;
+                (
+                    r.game_name.clone(),
+                    r.total_duration,
+                    r.last_start.clone(),
+                    r.runs,
+                    sessions,
+                )
+            })
+            .collect();
+        match crate::export::write_csv(&path, &crate::export::build_rows(&rows)) {
+            Ok(n) => {
+                let marker = crate::update::program_dir().join(crate::uninstall::LAST_EXPORT);
+                if let Err(e) = std::fs::write(marker, path.to_string_lossy().as_bytes()) {
+                    // Не страшно: метка только подсказывает деактиватору,
+                    // куда смотреть. Сам файл уже записан.
+                    crate::log::err(&format!("метка о выгрузке не записана: {e}"));
+                }
+                crate::log::info(&format!("выгружено {n} строк в {}", path.display()));
+                self.status_msg = format!("Сохранено: {}", path.to_string_lossy());
+            }
+            Err(e) => {
+                self.status_msg = format!("Не могу сохранить файл: {e}");
+            }
         }
-        self.status_msg = format!("Сохранено: {}", path.to_string_lossy());
     }
 
     fn merge_scan(&mut self, found: Vec<TrackedGame>, label: &str) {

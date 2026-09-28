@@ -2,7 +2,7 @@ use chrono::{DateTime, Local, Duration};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn default_check_interval() -> u64 { 10 }
 fn default_grace() -> u64 { 10 }
@@ -116,6 +116,18 @@ pub struct AppConfig {
     /// чтобы не проверять на каждом запуске.
     #[serde(default)]
     pub update_last_check: i64,
+    /// Канал обновлений: `stable` или `beta`.
+    ///
+    /// Хранится строкой, а не числом: читается человеком в config.json
+    /// при разборе, что случилось с программой. Неизвестное значение
+    /// считается стабильным (см. `update::normalize_channel`), чтобы
+    /// опечатка не отключила обновления совсем.
+    #[serde(default = "default_update_channel")]
+    pub update_channel: String,
+}
+
+fn default_update_channel() -> String {
+    "stable".to_string()
 }
 
 impl Default for AppConfig {
@@ -155,6 +167,7 @@ impl Default for AppConfig {
             update_auto: default_update_auto(),
             update_silent: false,
             update_last_check: 0,
+            update_channel: default_update_channel(),
         }
     }
 }
@@ -163,8 +176,18 @@ impl AppConfig {
     pub fn path() -> PathBuf {
         PathBuf::from("config.json")
     }
+    /// Прочитать настройки из файла по умолчанию.
     pub fn load() -> Self {
-        match fs::read_to_string(Self::path()) {
+        Self::load_from(Self::path())
+    }
+
+    /// Прочитать настройки из указанного файла.
+    ///
+    /// Отдельная функция нужна тестам: путь по умолчанию относительный, а
+    /// тесты идут параллельно и не могут менять рабочую папку — иначе один
+    /// тест читался бы из файла, который переписал другой.
+    pub fn load_from<P: AsRef<Path>>(path: P) -> Self {
+        match fs::read_to_string(path) {
             Ok(text) => {
                 match serde_json::from_str::<serde_json::Value>(&text) {
                     Ok(v) => {
@@ -282,6 +305,28 @@ impl AppConfig {
                         if let Some(s) = v.get("last_tab").and_then(|x| x.as_str()) {
                             cfg.last_tab = s.to_string();
                         }
+                        // Настройки обновлений. Раньше они вообще не читались
+                        // при загрузке: человек выбирал частоту или канал,
+                        // нажимал «Сохранить» — а после перезапуска всё
+                        // возвращалось к умолчанию молча.
+                        if let Some(n) = v.get("update_freq").and_then(|x| x.as_u64()) {
+                            cfg.update_freq = (n as u8).min(3);
+                        }
+                        if let Some(b) = v.get("update_auto").and_then(|x| x.as_bool()) {
+                            cfg.update_auto = b;
+                        }
+                        if let Some(b) = v.get("update_silent").and_then(|x| x.as_bool()) {
+                            cfg.update_silent = b;
+                        }
+                        if let Some(n) = v.get("update_last_check").and_then(|x| x.as_i64()) {
+                            cfg.update_last_check = n;
+                        }
+                        if let Some(s) = v.get("update_channel").and_then(|x| x.as_str()) {
+                            // Нормализуем сразу при чтении: мусор в файле не
+                            // должен доезжать до выбора ветки.
+                            cfg.update_channel =
+                                crate::update::normalize_channel(s).to_string();
+                        }
                         cfg
                     }
                     Err(_) => Self::default(),
@@ -290,7 +335,13 @@ impl AppConfig {
             Err(_) => Self::default(),
         }
     }
+    /// Сохранить настройки в файл по умолчанию.
     pub fn save(&self) {
+        self.save_to(Self::path());
+    }
+
+    /// Сохранить настройки в указанный файл (тесты пишут в свою папку).
+    pub fn save_to<P: AsRef<Path>>(&self, path: P) {
         let m = serde_json::json!({
             "api_key": self.api_key,
             "steam_id": self.steam_id,
@@ -322,8 +373,17 @@ impl AppConfig {
             "alarm_days": self.alarm_days,
             "timer_min": self.timer_min,
             "last_tab": self.last_tab,
+            // Настройки обновлений. Их не было в списке: человек менял
+            // частоту или канал, нажимал «Сохранить», а файл их не содержал
+            // — при перезапуске всё возвращалось к умолчанию без всякого
+            // сообщения.
+            "update_freq": self.update_freq,
+            "update_auto": self.update_auto,
+            "update_silent": self.update_silent,
+            "update_last_check": self.update_last_check,
+            "update_channel": self.update_channel,
         });
-        let _ = fs::write(Self::path(), serde_json::to_string_pretty(&m).unwrap_or_default());
+        let _ = fs::write(path, serde_json::to_string_pretty(&m).unwrap_or_default());
     }
 }
 

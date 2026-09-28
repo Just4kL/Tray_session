@@ -22,8 +22,51 @@ use std::path::{Path, PathBuf};
 
 /// Репозиторий, откуда берутся сборки и манифест.
 pub const REPO: &str = "Just4kL/Tray_session";
-/// Ветка, в которой лежат сборки.
+/// Канал обновлений: стабильный.
+pub const CHANNEL_STABLE: &str = "stable";
+/// Канал обновлений: бета, для новых функций.
+pub const CHANNEL_BETA: &str = "beta";
+
+/// Ветка, в которой лежат сборки по каналу.
+///
+/// Раньше ветка была одна и жёстко вшита, из-за чего сборка с новой
+/// функцией молча уходила на стабильную: человек ставил бету, а программа
+/// возвращала его на старую. Теперь ветку выбирает настройка.
+pub fn branch_for(channel: &str) -> &'static str {
+    if channel.eq_ignore_ascii_case(CHANNEL_BETA) {
+        "app-Tray_session"
+    } else {
+        // Любое неизвестное значение считаем стабильным: не должно быть
+        // так, чтобы опечатка в настройке оставила человека без
+        // обновлений вовсе.
+        "Tray-session"
+    }
+}
+
+/// Ветка по умолчанию, если канал не задан.
 pub const BRANCH: &str = "Tray-session";
+
+/// Название канала по-русски, для сообщений человеку.
+pub fn channel_label(channel: &str) -> &'static str {
+    if channel.eq_ignore_ascii_case(CHANNEL_BETA) {
+        "бета"
+    } else {
+        "стабильный"
+    }
+}
+
+/// Все допустимые каналы — для интерфейса и для проверки настроек.
+pub const CHANNELS: &[&str] = &[CHANNEL_STABLE, CHANNEL_BETA];
+
+/// Привести строку настройки к каналу: неизвестное значение молча
+/// становится стабильным, чтобы опечатка не отключила обновления.
+pub fn normalize_channel(raw: &str) -> &'static str {
+    if raw.trim().eq_ignore_ascii_case(CHANNEL_BETA) {
+        CHANNEL_BETA
+    } else {
+        CHANNEL_STABLE
+    }
+}
 /// Имя файла манифеста в репозитории: список изменившихся файлов и версия.
 pub const MANIFEST_NAME: &str = "update_manifest.json";
 /// Папка для загрузки — рядом с программой, не в системном TEMP.
@@ -513,16 +556,30 @@ pub fn plan_update(base: &Path, manifest: &Manifest) -> UpdatePlan {
 // Сеть: проверка и загрузка
 // ---------------------------------------------------------------------------
 
-/// Адрес манифеста для ветки.
-pub fn manifest_url() -> String {
+/// Адрес манифеста для указанного канала.
+pub fn manifest_url_for(channel: &str) -> String {
     format!(
-        "https://raw.githubusercontent.com/{REPO}/{BRANCH}/{MANIFEST_NAME}"
+        "https://raw.githubusercontent.com/{REPO}/{}/{MANIFEST_NAME}",
+        branch_for(channel)
     )
 }
 
-/// Адрес файла сборки в ветке (raw отдаёт без редиректов).
+/// Адрес файла сборки в ветке канала (raw отдаёт без редиректов).
+pub fn file_url_for(channel: &str, name: &str) -> String {
+    format!(
+        "https://raw.githubusercontent.com/{REPO}/{}/{name}",
+        branch_for(channel)
+    )
+}
+
+/// Адрес манифеста по умолчанию (стабильный канал).
+pub fn manifest_url() -> String {
+    manifest_url_for(CHANNEL_STABLE)
+}
+
+/// Адрес файла по умолчанию (стабильный канал).
 pub fn file_url(name: &str) -> String {
-    format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}/{name}")
+    file_url_for(CHANNEL_STABLE, name)
 }
 
 fn client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
@@ -548,11 +605,11 @@ pub fn check_github_connection() -> Result<String, String> {
     }
 }
 
-/// Скачать манифест и разобрать его.
-pub fn fetch_manifest() -> Result<Manifest, String> {
+/// Скачать манифест указанного канала и разобрать его.
+pub fn fetch_manifest_for(channel: &str) -> Result<Manifest, String> {
     let c = client(20)?;
     let text = c
-        .get(&manifest_url())
+        .get(&manifest_url_for(channel))
         .send()
         .map_err(|e| format!("не скачался манифест: {e}"))?
         .error_for_status()
@@ -560,6 +617,11 @@ pub fn fetch_manifest() -> Result<Manifest, String> {
         .text()
         .map_err(|e| format!("манифест не прочитан: {e}"))?;
     Manifest::parse(&text)
+}
+
+/// Скачать манифест стабильного канала (как раньше).
+pub fn fetch_manifest() -> Result<Manifest, String> {
+    fetch_manifest_for(CHANNEL_STABLE)
 }
 
 /// Скачать один файл в `dest` и проверить его SHA-256.
@@ -742,6 +804,15 @@ pub fn parse_args(args: &[String]) -> Option<UpdateArgs> {
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(20),
+        // Канал идёт третьим аргументом после числа секунд. Передавать
+        // его нужно обязательно: фоновый процесс — отдельный, и без
+        // явного канала он обновил бы программу по стабильной ветке.
+        channel: args
+            .iter()
+            .position(|a| a == UPDATER_FLAG)
+            .and_then(|i| args.get(i + 2))
+            .cloned()
+            .unwrap_or_else(|| CHANNEL_STABLE.to_string()),
     })
 }
 
@@ -753,6 +824,8 @@ pub const UPDATER_FLAG: &str = "--updater";
 pub struct UpdateArgs {
     /// Сколько секунд ждать, пока основная программа закроется.
     pub wait_secs: u64,
+    /// Канал обновлений: `stable` или `beta`.
+    pub channel: String,
 }
 
 /// Имя, под которым фоновый процесс прячет сам себя на время работы.
@@ -817,10 +890,10 @@ pub fn remove_aside_delayed(path: &Path) -> std::io::Result<()> {
 /// Тело вынесено отдельно, чтобы переименованная копия себя удалялась на
 /// ЛЮБОМ выходе — и при ошибке, и при отсутствии обновлений. Иначе
 /// `_updater_running.exe` остался бы лежать в папке обновлений.
-pub fn run_updater(wait_secs: u64) -> i32 {
+pub fn run_updater(wait_secs: u64, channel: &str) -> i32 {
     let base = program_dir();
     crate::log::init(&base);
-    let (code, aside) = run_updater_inner(&base, wait_secs);
+    let (code, aside) = run_updater_inner(&base, wait_secs, channel);
     if !aside.as_os_str().is_empty() {
         let _ = remove_aside_delayed(&aside);
     }
@@ -829,10 +902,11 @@ pub fn run_updater(wait_secs: u64) -> i32 {
 
 /// Основная работа обновления. Возвращает код и путь, под которым процесс
 /// себя переименовал (пустой, если не смог).
-fn run_updater_inner(base: &Path, wait_secs: u64) -> (i32, PathBuf) {
+fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBuf) {
     let base = base.to_path_buf();
     crate::log::info(&format!(
-        "фоновый процесс обновления запущен, ждём закрытия программы до {wait_secs} с"
+        "фоновый процесс обновления запущен, канал {}, ждём закрытия программы до {wait_secs} с",
+        channel_label(channel)
     ));
     // Первым делом уходим с имени TraySession.exe: иначе нельзя будет
     // заменить сам этот файл, пока мы его выполняем (os error 32).
@@ -875,8 +949,11 @@ fn run_updater_inner(base: &Path, wait_secs: u64) -> (i32, PathBuf) {
     .ok();
 
     // 1. Манифест.
-    crate::log::info(&format!("запрашиваю манифест: {}", manifest_url()));
-    let manifest = match fetch_manifest() {
+    crate::log::info(&format!(
+        "запрашиваю манифест: {}",
+        manifest_url_for(channel)
+    ));
+    let manifest = match fetch_manifest_for(channel) {
         Ok(m) => {
             crate::log::info(&format!(
                 "манифест получен: версия {}, сборка {}, файлов: {}",
@@ -923,7 +1000,7 @@ fn run_updater_inner(base: &Path, wait_secs: u64) -> (i32, PathBuf) {
     }
     // 3. Скачать в папку рядом с программой.
     for f in &plan.to_download {
-        let url = file_url(&f.name);
+        let url = file_url_for(channel, &f.name);
         crate::log::info(&format!("качаю {url}"));
         if let Err(e) = download_to(&url, &tmp.join(&f.name), &f.sha256) {
             crate::log::err(&format!("загрузка не удалась: {e}"));
@@ -1063,10 +1140,17 @@ pub fn clear_stale_ready_flag(base: &Path) -> bool {
 /// `exe` — путь к своему исполняемому файлу. Отдельный процесс нужен
 /// затем, что (а) интерфейс не должен висеть на загрузке, (б) заменять
 /// `.exe` может только тот, кто его не держит открытым.
-pub fn spawn_updater(exe: &Path, wait_secs: u64) -> std::io::Result<()> {
+pub fn spawn_updater(exe: &Path, wait_secs: u64, channel: &str) -> std::io::Result<()> {
     std::process::Command::new(exe)
         .arg(UPDATER_FLAG)
         .arg(wait_secs.to_string())
+        // Канал обязателен: без него фоновый процесс взял бы стабильную
+        // ветку, и бета-сборка молча откатывалась бы на старую версию.
+        .arg(if channel.eq_ignore_ascii_case(CHANNEL_BETA) {
+            CHANNEL_BETA
+        } else {
+            CHANNEL_STABLE
+        })
         .current_dir(exe.parent().unwrap_or(Path::new(".")))
         .spawn()
         .map(|_| ())

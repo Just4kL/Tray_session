@@ -128,6 +128,11 @@ pub(super) fn temp_root() -> PathBuf {
 /// при раскрутке стека.
 pub(super) struct TempDir(pub(super) PathBuf);
 
+/// Список аргументов командной строки из среза строк.
+fn args(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
 impl TempDir {
     /// Создать каталог с уникальным именем внутри `temp_root`.
     pub(super) fn new(tag: &str) -> TempDir {
@@ -498,6 +503,34 @@ fn update_frequency_roundtrips_through_config_code() {
     assert_eq!(UpdateFreq::from_code(200), UpdateFreq::Hourly);
 }
 
+#[test]
+fn channel_survives_saving_and_loading_the_config() {
+    // Настройка обязана пережить цикл сохранения: человек выбрал «Бета»,
+    // нажал «Сохранить», перезапустил программу — и канал не сбросился.
+    // Без этого бета молча превращалась бы в стабильную при первом же
+    // перезапуске.
+    let dir = TempDir::new("channel_cfg");
+    let path = dir.join("config.json");
+    for want in [CHANNEL_STABLE, CHANNEL_BETA] {
+        let cfg = crate::config::AppConfig {
+            update_channel: want.to_string(),
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+        assert!(path.is_file(), "файл настроек не записан");
+        let back = crate::config::AppConfig::load_from(&path);
+        assert_eq!(
+            normalize_channel(&back.update_channel),
+            want,
+            "канал не пережил сохранение"
+        );
+    }
+    // Старый конфиг без поля вообще — не ошибка, а стабильный канал.
+    std::fs::write(&path, r#"{"day_start_hour":3}"#).unwrap();
+    let back = crate::config::AppConfig::load_from(&path);
+    assert_eq!(normalize_channel(&back.update_channel), CHANNEL_STABLE);
+}
+
 // ---------------------------------------------------------------------------
 // Пути и аргументы
 // ---------------------------------------------------------------------------
@@ -518,7 +551,6 @@ fn temp_dir_is_beside_program_not_system_temp() {
 
 #[test]
 fn updater_flag_is_parsed_from_args() {
-    let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
     // Обычный запуск — не updater.
     assert!(parse_args(&args(&[])).is_none());
     assert!(parse_args(&args(&["TraySession.exe"])).is_none());
@@ -541,6 +573,63 @@ fn manifest_urls_point_at_the_right_branch() {
     assert!(m.ends_with(MANIFEST_NAME), "{m}");
     let f = file_url("TraySession.exe");
     assert!(f.contains(BRANCH) && f.ends_with("TraySession.exe"), "{f}");
+}
+
+#[test]
+fn beta_channel_reads_a_different_branch() {
+    // Главное требование: бета и стабильный смотрят в РАЗНЫЕ ветки. Иначе
+    // бетовая сборка обновилась бы из стабильной ветки и молча откатывалась
+    // на старую версию — человек бы и не понял, почему пропала бета.
+    let stable = manifest_url_for(CHANNEL_STABLE);
+    let beta = manifest_url_for(CHANNEL_BETA);
+    assert!(stable.contains("Tray-session"), "{stable}");
+    assert!(beta.contains("app-Tray_session"), "{beta}");
+    assert_ne!(stable, beta, "каналы смотрят в одну ветку");
+    // Имя файла то же — отличается только ветка.
+    assert!(beta.ends_with(MANIFEST_NAME), "{beta}");
+    let bf = file_url_for(CHANNEL_BETA, "TraySession.exe");
+    assert!(bf.contains("app-Tray_session") && bf.ends_with("TraySession.exe"), "{bf}");
+}
+
+#[test]
+fn unknown_channel_falls_back_to_stable_not_to_nothing() {
+    // Опечатка в config.json не должна отключить обновления совсем.
+    assert_eq!(normalize_channel("что-то"), CHANNEL_STABLE);
+    assert_eq!(normalize_channel(""), CHANNEL_STABLE);
+    assert_eq!(normalize_channel("STABLE"), CHANNEL_STABLE);
+    // Бета принимается в любом регистре и с пробелами: пишет человек.
+    assert_eq!(normalize_channel(" Beta "), CHANNEL_BETA);
+    assert_eq!(normalize_channel("BETA"), CHANNEL_BETA);
+    // И URL строится от нормализованного канала, а не от сырого текста.
+    assert_eq!(
+        manifest_url_for(normalize_channel("что-то")),
+        manifest_url_for(CHANNEL_STABLE)
+    );
+}
+
+#[test]
+fn updater_receives_its_channel_through_arguments() {
+    // Фоновый процесс — отдельный, и без явной передачи канала он взял бы
+    // стабильный по умолчанию. Проверяем именно сквозную передачу.
+    let u = parse_args(&args(&["--updater", "20", "beta"])).unwrap();
+    assert_eq!(u.channel, "beta");
+    // Без третьего аргумента — стабильный, обратная совместимость со
+    // старыми запусками.
+    let u = parse_args(&args(&["--updater", "20"])).unwrap();
+    assert_eq!(u.channel, CHANNEL_STABLE);
+    let u = parse_args(&args(&["--updater", "не-число", "beta"])).unwrap();
+    assert_eq!(u.channel, "beta", "канал терялся из-за неверного числа секунд");
+}
+
+#[test]
+fn channel_has_a_readable_name() {
+    // В логах и интерфейсе канал показывается по-русски: «beta» в сообщении
+    // человеку ничего не объясняет.
+    assert_eq!(channel_label(CHANNEL_STABLE), "стабильный");
+    assert_eq!(channel_label(CHANNEL_BETA), "бета");
+    // Оба канала существуют и не пересекаются.
+    assert_eq!(CHANNELS.len(), 2);
+    assert!(CHANNELS.contains(&CHANNEL_STABLE) && CHANNELS.contains(&CHANNEL_BETA));
 }
 
 #[test]

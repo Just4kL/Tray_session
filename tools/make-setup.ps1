@@ -20,11 +20,9 @@ $root  = Split-Path -Parent $PSScriptRoot
 $seven = 'C:\Program Files\7-Zip\7z.exe'
 $dist  = Join-Path $root 'dist\Tray Session'
 $exe   = Join-Path $root 'target\release\game-session-tracker.exe'
-$uninst= Join-Path $root 'target\release\uninstall.exe'
 $setup = Join-Path $root 'Tray_session_setup.exe'
 
 if (-not (Test-Path $exe)) { throw "Нет релизного exe: $exe (сначала cargo build --release)" }
-if (-not (Test-Path $uninst)) { throw "Нет деактиватора: $uninst (сначала cargo build --release)" }
 if (-not (Test-Path $seven)) { throw "Не найден 7z.exe: $seven" }
 
 # Версия берётся из Cargo.toml, чтобы заголовок установщика не расходился
@@ -40,7 +38,13 @@ Copy-Item $exe (Join-Path $dist 'TraySession.exe')
 Copy-Item (Join-Path $root 'README.md') $dist
 # Деактиватор: имя с подчёркиванием, чтобы не спутать с программой. Именно
 # под этим именем его удаляет сам себя и ищет пользователь.
-Copy-Item $uninst (Join-Path $dist '_uninstall.exe')
+#
+# Это ТОТ ЖЕ файл, что и программа: он узнаёт себя по имени. Отдельного
+# маленького бинарника больше нет — он тянул бы за собой копию логирования,
+# работы с базой и выгрузки CSV, а они должны быть ровно одни и те же, что и
+# у программы. Иначе через полгода эти две копии разошлись бы, и деактиватор
+# удалял бы не всё.
+Copy-Item $exe (Join-Path $dist '_uninstall.exe')
 
 # Блок настроек SFX. Кладётся в корень архива, иначе 7-Zip его не найдёт.
 # AutoInstall здесь НЕТ намеренно — именно его отсутствие включает окно
