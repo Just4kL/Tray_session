@@ -8,6 +8,9 @@ pub mod dark;
 pub mod default;
 pub mod tokens;
 
+#[cfg(test)]
+mod tests;
+
 use egui::Context;
 use std::sync::Arc;
 use tokens::Tokens;
@@ -26,12 +29,10 @@ pub trait Skin: Send + Sync {
 }
 
 /// Владелец текущей темы.
-#[allow(dead_code)] // TODO(phase-1.2/1.4): current() читается из update(), set() — из переключателя
 pub struct ThemeManager {
     current: Arc<dyn Skin>,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2/1.4): current()/set() задействуются следующими коммитами
 impl ThemeManager {
     /// Создать менеджер с начальным скином.
     pub fn new(initial: Arc<dyn Skin>) -> Self {
@@ -45,6 +46,7 @@ impl ThemeManager {
 
     /// Сменить скин и сразу применить стиль. Вызывается с фазы 1.4
     /// (переключатель в «О программе»).
+    #[allow(dead_code)] // TODO(phase-1.4)
     pub fn set(&mut self, s: Arc<dyn Skin>, ctx: &Context) {
         self.current = s;
         ctx.set_style(self.current.egui_style());

@@ -10,7 +10,6 @@ use super::Skin;
 use egui::Color32;
 
 /// Скин по умолчанию.
-#[allow(dead_code)] // TODO(phase-1.2.a.2): поле читается при маппинге токенов в egui_style()
 pub struct DefaultSkin {
     tokens: Tokens,
 }
@@ -101,8 +100,51 @@ impl Skin for DefaultSkin {
     }
 
     fn egui_style(&self) -> egui::Style {
-        // Маппинг токенов — в 1.2.a.2. В 1.2.a.1 поведение не трогаем:
-        // метод нигде не вызывается.
-        egui::Style::default()
+        use egui::{Rounding, Stroke};
+        let t = &self.tokens;
+        let p = &t.palette;
+
+        let mut v = egui::Visuals::dark();
+        // — фоны —
+        v.panel_fill        = p.bg.surface;
+        v.window_fill       = p.bg.window;
+        v.extreme_bg_color  = p.bg.extreme;
+        v.faint_bg_color    = p.bg.faint;
+        v.code_bg_color     = p.bg.sunken;
+        // — акценты и выделение —
+        v.text_cursor.stroke = Stroke::new(t.strokes.cursor, p.accent.primary);
+        v.hyperlink_color    = p.accent.primary;
+        v.selection.bg_fill  = p.accent.selection;
+        v.selection.stroke   = Stroke::new(t.strokes.hairline, p.text.on_accent);
+        // — noninteractive —
+        v.widgets.noninteractive.bg_fill   = p.bg.noninteractive;
+        v.widgets.noninteractive.fg_stroke = Stroke::new(t.strokes.hairline, p.text.primary);
+        // — inactive —
+        v.widgets.inactive.bg_fill      = p.interactive.inactive.bg;
+        v.widgets.inactive.weak_bg_fill = p.interactive.inactive.weak;
+        v.widgets.inactive.fg_stroke    = Stroke::new(t.strokes.hairline, p.text.on_accent);
+        v.widgets.inactive.rounding     = Rounding::same(t.radii.widget);
+        v.widgets.inactive.bg_stroke    = Stroke::new(t.strokes.hairline, p.border.interactive);
+        // — hovered —
+        v.widgets.hovered.bg_fill      = p.interactive.hovered.bg;
+        v.widgets.hovered.weak_bg_fill = p.interactive.hovered.weak;
+        v.widgets.hovered.fg_stroke    = Stroke::new(t.strokes.hairline, p.text.on_accent);
+        v.widgets.hovered.rounding     = Rounding::same(t.radii.widget);
+        v.widgets.hovered.bg_stroke    = Stroke::new(t.strokes.hairline, p.accent.primary);
+        // — active —
+        v.widgets.active.bg_fill      = p.interactive.active.bg;
+        v.widgets.active.weak_bg_fill = p.interactive.active.weak;
+        v.widgets.active.fg_stroke    = Stroke::new(t.strokes.hairline, p.text.on_accent);
+        v.widgets.active.rounding     = Rounding::same(t.radii.widget);
+        v.widgets.active.bg_stroke    = Stroke::new(t.strokes.hairline, p.accent.bright);
+        // — open —
+        v.widgets.open.bg_fill   = p.bg.faint;
+        v.widgets.open.fg_stroke = Stroke::new(t.strokes.hairline, p.accent.primary);
+        v.widgets.open.rounding  = Rounding::same(t.radii.widget);
+
+        egui::Style {
+            visuals: v,
+            ..Default::default()
+        }
     }
 }

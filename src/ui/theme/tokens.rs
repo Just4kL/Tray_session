@@ -21,7 +21,6 @@ pub struct Radii {
     pub panel:  f32, // 8.0
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct Strokes {
     pub hairline: f32, // 1.0
@@ -44,11 +43,9 @@ pub struct BgPalette {
     pub raised:         Color32,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct InteractiveState { pub bg: Color32, pub weak: Color32 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct InteractivePalette {
     pub inactive: InteractiveState,
@@ -56,7 +53,6 @@ pub struct InteractivePalette {
     pub active:   InteractiveState,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct AccentPalette {
     pub primary:   Color32,
@@ -88,7 +84,7 @@ pub struct SemanticPalette {
     pub err:       Color32,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[allow(dead_code)] // TODO(phase-1.2.a.2): поле semantic не читается — семантика красится напрямую в виджетах
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub bg:          BgPalette,

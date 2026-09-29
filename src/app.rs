@@ -993,57 +993,6 @@ pub fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// Тема в духе Material Design, цвета клиента Steam (#1B2838/#66C0F4).
-///
-/// Кнопки построены как в Material: спокойная заливка в покое, заметное
-/// осветление при наведении и заметное затемнение при нажатии (эффект
-/// «вдавленной» кнопки), плюс скругление. Текст ВСЕХ состояний — белый,
-/// поэтому контраст с фоном не меняется при нажатии (см. тесты
-/// `button_contrast_meets_wcag`).
-fn steam_visuals() -> egui::Visuals {
-    use egui::Color32 as C;
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = C::from_rgb(0x1B, 0x28, 0x38);
-    v.window_fill = C::from_rgb(0x17, 0x1D, 0x25);
-    v.extreme_bg_color = C::from_rgb(0x0E, 0x14, 0x1B);
-    v.faint_bg_color = C::from_rgb(0x22, 0x30, 0x3F);
-    v.code_bg_color = C::from_rgb(0x10, 0x18, 0x20);
-    v.text_cursor.stroke = egui::Stroke::new(2.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
-    v.hyperlink_color = C::from_rgb(0x66, 0xC0, 0xF4);
-    v.selection.bg_fill = C::from_rgb(0x1B, 0x5F, 0x8A);
-    v.selection.stroke = egui::Stroke::new(1.0_f32, C::WHITE);
-    v.widgets.noninteractive.bg_fill = C::from_rgb(0x16, 0x20, 0x2D);
-    v.widgets.noninteractive.fg_stroke =
-        egui::Stroke::new(1.0_f32, C::from_rgb(0xC7, 0xD5, 0xE0));
-    // Покой: приглушённый сине-серый, скругление — как у Material.
-    // L = 0.064
-    v.widgets.inactive.bg_fill = C::from_rgb(0x2E, 0x4A, 0x62);
-    v.widgets.inactive.weak_bg_fill = C::from_rgb(0x2A, 0x40, 0x58);
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
-    v.widgets.inactive.rounding = egui::Rounding::same(6.0);
-    // Наведение: заметно светлее покоя (Material «surface variant»), L = 0.137
-    v.widgets.hovered.bg_fill = C::from_rgb(0x3E, 0x6C, 0x8E);
-    v.widgets.hovered.weak_bg_fill = C::from_rgb(0x39, 0x5F, 0x80);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
-    v.widgets.hovered.rounding = egui::Rounding::same(6.0);
-    // Нажатие: ЗАМЕТНО темнее покоя — кнопка «уходит вглубь», L = 0.029
-    // (зазор 0.035, тест `press_effect_is_visible` требует > 0.02).
-    // Именно на этом состоянии раньше всего и ломался контраст.
-    v.widgets.active.bg_fill = C::from_rgb(0x16, 0x32, 0x4A);
-    v.widgets.active.weak_bg_fill = C::from_rgb(0x11, 0x29, 0x3D);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, C::WHITE);
-    v.widgets.active.rounding = egui::Rounding::same(6.0);
-    v.widgets.open.bg_fill = C::from_rgb(0x22, 0x30, 0x3F);
-    v.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
-    v.widgets.open.rounding = egui::Rounding::same(6.0);
-    // Обводка кнопки: тонкая, не съедает контраст текста. На нажатии
-    // обводка светлеет — «кнопка уходит вглубь» читается и по контуру.
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x3A, 0x55, 0x6C));
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x66, 0xC0, 0xF4));
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, C::from_rgb(0x8E, 0xD4, 0xFF));
-    v
-}
-
 /// Смешать цвет с фоном: `t` = доля фона (0 — как есть, 1 — чистый фон).
 pub fn blend(fg: egui::Color32, bg: egui::Color32, t: f32) -> egui::Color32 {
     let m = |a: u8, b: u8| (a as f32 * (1.0 - t) + b as f32 * t).round() as u8;
@@ -1139,7 +1088,7 @@ pub struct TrackerApp {
     pub views: Views,
     #[allow(dead_code)] // TODO(phase-1.2): чтение токенов из update() при замене хардкодов
     pub theme: ThemeManager,
-    /// Id текущего скина: `ctx.set_style` вызывается только при смене,
+    /// Id текущего скина: `ctx.set_visuals` вызывается только при смене,
     /// а не каждый кадр (иначе ломаются анимации). Задействуется в 1.4
     /// (переключатель скинов), пока висит `None`.
     #[allow(dead_code)] // TODO(phase-1.4): читать при смене скина в update()
@@ -2806,8 +2755,11 @@ impl eframe::App for TrackerApp {
             self.state.prev_tab = self.state.tab;
         }
 
-        // Тема в цветах клиента Steam (окошко секундомера красится тоже — общий ctx)
-        ctx.set_visuals(steam_visuals());
+        // Тема в цветах клиента Steam (окошко секундомера красится тоже — общий ctx).
+        // Стиль берётся из токенов скина. Применяется только Visuals;
+        // spacing/animation_time остаются дефолтными. Переход на полную
+        // замену стиля — фаза 1.4, одним коммитом (см. roadmap в аудите).
+        ctx.set_visuals(self.theme.current().egui_style().visuals);
         // Масштаб интерфейса (читаемость на больших мониторах)
         ctx.set_pixels_per_point(self.state.cfg_handle.ui_scale.clamp(0.8, 2.0));
 
@@ -5995,6 +5947,10 @@ pub fn initial_games() -> Vec<TrackedGame> {
 mod tests {
     use super::*;
     use crate::db::AlarmRow;
+    // Фикстура steam-темы для тестов: visuals берутся из токенов скина
+    // (миграция 1.2.a.2). Значения доказаны равными исторической функции
+    // темы временным тестом перед её удалением.
+    use crate::ui::theme::{default::DefaultSkin, Skin};
 
     fn row(time: &str, enabled: bool, daily: bool, days: Option<&str>) -> AlarmRow {
         AlarmRow {
@@ -6260,7 +6216,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let ppp = 1.0_f32;
-        let vis = steam_visuals();
+        let vis = DefaultSkin::default().egui_style().visuals;
         let shapes: Vec<egui::epaint::ClippedShape> = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -6345,7 +6301,7 @@ mod tests {
         let (w, h) = (900.0_f32, 420.0_f32);
         let ctx = egui::Context::default();
         ctx.set_style(egui::Style {
-            visuals: steam_visuals(),
+            visuals: DefaultSkin::default().egui_style().visuals,
             ..Default::default()
         });
         ctx.set_pixels_per_point(1.0);
@@ -6361,7 +6317,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(steam_visuals().panel_fill))
+                    .frame(egui::Frame::none().fill(DefaultSkin::default().egui_style().visuals.panel_fill))
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(14.0, 12.0);
                         ui.add_space(6.0);
@@ -6381,9 +6337,9 @@ mod tests {
                                 // egui не даёт задать hovered/pressed вручную,
                                 // поэтому состояние имитируется цветом из темы.
                                 let vis = match kind {
-                                    0 => steam_visuals().widgets.inactive.clone(),
-                                    1 => steam_visuals().widgets.hovered.clone(),
-                                    _ => steam_visuals().widgets.active.clone(),
+                                    0 => DefaultSkin::default().egui_style().visuals.widgets.inactive.clone(),
+                                    1 => DefaultSkin::default().egui_style().visuals.widgets.hovered.clone(),
+                                    _ => DefaultSkin::default().egui_style().visuals.widgets.active.clone(),
                                 };
                                 let r = resp.rect;
                                 ui.painter().rect_filled(
@@ -6417,7 +6373,7 @@ mod tests {
                                         ),
                                         tab,
                                         egui::Color32::from_rgb(0x9A, 0xA4, 0xAF),
-                                        steam_visuals().panel_fill,
+                                        DefaultSkin::default().egui_style().visuals.panel_fill,
                                     );
                                     ui.painter().text(
                                         r.center() + egui::vec2(0.0, 22.0),
@@ -6464,7 +6420,7 @@ mod tests {
                                     ),
                                     Tab::Sessions,
                                     p.fg,
-                                    steam_visuals().panel_fill,
+                                    DefaultSkin::default().egui_style().visuals.panel_fill,
                                 );
                                 ui.painter().text(
                                     rect.center_bottom() - egui::vec2(0.0, 12.0),
@@ -6479,7 +6435,7 @@ mod tests {
                         // Строка 4: чипы в обоих состояниях.
                         ui.horizontal(|ui| {
                             for (label, on) in [("PIN", false), ("PIN", true), ("⤢", false), ("⤡", true)] {
-                                let vis = steam_visuals();
+                                let vis = DefaultSkin::default().egui_style().visuals;
                                 let sel = vis.selection.bg_fill;
                                 let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
                                 let r = ui.add(
@@ -6811,7 +6767,7 @@ mod tests {
         let (w, h) = (560.0_f32, 150.0_f32);
         let ctx = egui::Context::default();
         ctx.set_style(egui::Style {
-            visuals: steam_visuals(),
+            visuals: DefaultSkin::default().egui_style().visuals,
             ..Default::default()
         });
         ctx.set_pixels_per_point(1.0);
@@ -6827,7 +6783,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(steam_visuals().panel_fill))
+                    .frame(egui::Frame::none().fill(DefaultSkin::default().egui_style().visuals.panel_fill))
                     .show(ctx, |ui| {
                         ui.add_space(20.0);
                         ui.horizontal_wrapped(|ui| {
@@ -7540,7 +7496,7 @@ mod tests {
         // Контраст текста кнопки к её фону должен быть >= 4.5:1 (WCAG AA)
         // ВО ВСЕХ состояниях, включая active (нажатое) — раньше именно там
         // он падал до 2.3, потому что в кнопку клали `.weak()`/свой цвет.
-        let v = steam_visuals();
+        let v = DefaultSkin::default().egui_style().visuals;
         const MIN: f32 = 4.5;
         let check = |name: &str, w: &egui::style::WidgetVisuals| {
             let bg = w.bg_fill;
@@ -7569,7 +7525,7 @@ mod tests {
     fn press_effect_is_visible() {
         // Нажатие должно ЗАМЕТНО отличаться от покоя — иначе эффекта
         // «вдавленной кнопки» нет. Проверяем и яркостью, и цветом.
-        let v = steam_visuals();
+        let v = DefaultSkin::default().egui_style().visuals;
         let rest = v.widgets.inactive.bg_fill;
         let over = v.widgets.hovered.bg_fill;
         let press = v.widgets.active.bg_fill;

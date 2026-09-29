@@ -73,3 +73,41 @@
 
 Отдельно, после вкладок: `windows()` → `ui/views/dialogs.rs`,
 `show_stopwatch_overlay` / `show_session_strip` → `ui/overlays.rs`.
+
+## Оставшийся allow(dead_code) в src/ui/theme/ (снято на 1.2.a.2)
+
+Фактический список (`Select-String -Path src/ui/theme/*.rs -Pattern
+'allow\(dead_code\)'`). Правило: allow не переставляется со структур на
+поля, пока clippy реально не падает, — структурный allow покрывает
+непрочитанные поля целиком.
+
+| Файл:строка | Что под allow | Когда снимем |
+|---|---|---|
+| tokens.rs:10 `Spacing` | все поля (xs/sm/md/lg/nav_w/status_h/row_h) | 1.2.a.3 — при замене геометрии в каркасе |
+| tokens.rs:17 `Radii` | `panel` (`widget` читается в `egui_style`) | 1.2.a.3 — при замене скруглений |
+| tokens.rs:30 `Typography` | все поля (body/caption/heading) | фаза 2 — при маппинге шрифтов в `egui_style` |
+| tokens.rs:34 `BgPalette` | `raised` (остальные 6 читаются) | 1.2.a.3 — если найдётся потребитель, иначе фаза 2 |
+| tokens.rs:63 `TextPalette` | `muted` (`primary`, `on_accent` читаются) | 1.2.a.3 — при замене приглушённого текста |
+| tokens.rs:71 `BorderPalette` | `default` (`interactive` читается) | 1.2.a.3 — при замене рамок |
+| tokens.rs:78 `SemanticPalette` | все поля (ok/warn/warn_soft/err) | фаза 2 — семантика красится напрямую в виджетах, не через `Visuals` |
+| tokens.rs:87 `Palette` | поле `semantic` (остальные 5 читаются) | вместе с `SemanticPalette`, фаза 2 |
+| tokens.rs:98 `Tokens` | поля `spacing`, `typography` (остальные читаются) | вместе с `Spacing`/`Typography` |
+| mod.rs:19 `trait Skin` | методы `id()`, `tokens()` (`egui_style()` читается) | 1.4 — `id()` для переключателя, `tokens()` для прямого чтения |
+| mod.rs:49 `ThemeManager::set` | весь метод | 1.4 — переключатель скинов в «О программе» |
+| dark.rs:11 `DarkSkin` | структура целиком | 1.4 — реальная инверсия цветов |
+
+Сняты в 1.2.a.2 (больше не нужны): `Strokes`, `InteractiveState`,
+`InteractivePalette`, `AccentPalette` (все поля читаются в `egui_style`),
+`DefaultSkin.tokens`, `ThemeManager` (структура), `ThemeManager::current`.
+
+## Roadmap: ctx.set_visuals → ctx.set_style
+
+`app.rs:2761`: сейчас `ctx.set_visuals(theme.current().egui_style().visuals)`,
+потому что `egui_style()` возвращает только `Visuals` (spacing/typography
+из токенов пока не применяются). В фазе 1.4 при добавлении dark-темы —
+перейти на полный `ctx.set_style(...)` одним коммитом, проверив, что
+`ui.spacing_mut(...)` в `app.rs` не сломались.
+`ThemeManager::set()` (`mod.rs`) использует `ctx.set_style` — при 1.4
+пересмотреть согласованно с `app.rs:2761`.
+`app.rs:6302` и `6768` (тесты) — форма `ctx.set_style(egui::Style {
+visuals, ..Default })` оставлена намеренно, менять не нужно.
