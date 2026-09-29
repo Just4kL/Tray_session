@@ -1135,11 +1135,15 @@ fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
 /// замена механическая, выполнена скриптом `tools/split-state-3.0.ps1`.
 pub struct TrackerApp {
     pub state: AppState,
+    #[allow(dead_code)] // TODO(phase-3): вью разделов заезжают по одной своим коммитом
     pub views: Views,
+    #[allow(dead_code)] // TODO(phase-1.2): чтение токенов из update() при замене хардкодов
     pub theme: ThemeManager,
     /// Id текущего скина: `ctx.set_style` вызывается только при смене,
-    /// а не каждый кадр (иначе ломаются анимации).
-    last_skin_id: &'static str,
+    /// а не каждый кадр (иначе ломаются анимации). Задействуется в 1.4
+    /// (переключатель скинов), пока висит `None`.
+    #[allow(dead_code)] // TODO(phase-1.4): читать при смене скина в update()
+    last_skin_id: Option<&'static str>,
 }
 
 impl TrackerApp {
@@ -1257,8 +1261,12 @@ impl TrackerApp {
                 last_saved: cfg_handle.clone(),
             },
             views: Views::default(),
-            theme: ThemeManager::default(),
-            last_skin_id: "default",
+            // Живое поле с 1.1: менеджер владеет текущим скином.
+            // Поведение не меняется — токены пока нигде не читаются.
+            theme: ThemeManager::new(Arc::new(
+                crate::ui::theme::default::DefaultSkin::default(),
+            )),
+            last_skin_id: None,
         };
         app.refresh_agg();
         app.refresh_alarms();
