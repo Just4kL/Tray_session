@@ -264,6 +264,17 @@ fn remove_one(p: &Path, report: &mut UninstallReport) {
 /// Не удаляет сам деактиватор: запущенный файл Windows удалить не даёт.
 /// Он убирает себя через `cmd /c` с задержкой (см. `self_delete`).
 pub fn uninstall(base: &Path) -> UninstallReport {
+    uninstall_to(base, None)
+}
+
+/// То же, но с явным местом для выгрузки таблицы.
+///
+/// `out` — папка, куда положить CSV. Без неё берётся Рабочий стол.
+///
+/// Место указывается извне не только для удобства: тесты и ручные проверки
+/// не должны писать на диск C:, а Рабочий стол там и находится. Плюс
+/// человеку полезно самому решить, куда уйдёт копия истории.
+pub fn uninstall_to(base: &Path, out: Option<&Path>) -> UninstallReport {
     let mut report = UninstallReport::default();
     crate::log::info(&format!(
         "деактивация запущена, каталог: {}",
@@ -272,7 +283,14 @@ pub fn uninstall(base: &Path) -> UninstallReport {
 
     // 1. Таблица сессий. Если человек её уже выгружал — удаляем копию и
     //    говорим, где она была. Если не выгружал — предлагаем сохранить.
-    match prepare_export_default(base, false) {
+    let plan = match out {
+        Some(dir) => {
+            let path = crate::export::unique_path(dir);
+            prepare_export(base, &path, true)
+        }
+        None => prepare_export_default(base, false),
+    };
+    match plan {
         Ok(ExportPlan::AlreadySaved(p)) => {
             crate::log::info(&format!("таблица уже была сохранена: {}", p.display()));
             if p.is_file() {
@@ -439,6 +457,29 @@ pub fn is_uninstaller() -> bool {
         .unwrap_or(false)
 }
 
+/// Ключ, которым задают папку для выгрузки таблицы сессий.
+pub const EXPORT_FLAG: &str = "--export-to";
+
+/// Папка из `--export-to`, если флаг задан.
+///
+/// Читается как есть: путь может быть ещё не существующим, его создаст
+/// `export::write_csv`. Несуществующий путь — не ошибка, а обычное дело
+/// для папки, которую человек указал впервые.
+pub fn export_dir(args: &[String]) -> PathBuf {
+    export_dir_opt(args).unwrap_or_else(crate::export::default_export_dir)
+}
+
+/// То же, но без умолчания: `None`, если флаг не задан.
+pub fn export_dir_opt(args: &[String]) -> Option<PathBuf> {
+    let i = args.iter().position(|a| a == EXPORT_FLAG)?;
+    args.get(i + 1).map(PathBuf::from)
+}
+
+/// Куда попадёт файл выгрузки с учётом `--export-to` (для сообщения).
+pub fn export_target(args: &[String]) -> PathBuf {
+    crate::export::unique_path(&export_dir(args))
+}
+
 /// Точка входа деактиватора. Вынесена, чтобы её мог вызвать и `main`,
 /// и тесты.
 pub fn run(args: &[String]) -> i32 {
@@ -487,7 +528,10 @@ pub fn run(args: &[String]) -> i32 {
                 println!();
                 println!("Таблица сессий ни разу не выгружалась.");
                 println!("Перед удалением она будет выгружена в:");
-                println!("  {}", crate::export::default_export_path().display());
+                println!(
+                    "  {}",
+                    export_target(args).display()
+                );
             }
         }
         print!("Удалить программу? (y/N) ");
@@ -505,7 +549,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    let report = uninstall(&base);
+    let report = uninstall_to(&base, Some(&export_dir(args)));
     println!();
     println!("{}", report.summary());
     for n in &report.notes {

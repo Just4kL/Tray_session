@@ -3,15 +3,9 @@
 use super::*;
 use std::path::PathBuf;
 
-/// Каталог для теста — внутри проекта, на его диске.
+/// Каталог для теста — `temp_test` рядом с программой (см. `testpaths`).
 fn tmp(tag: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp")
-        .join(format!("export_{tag}"));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("не создался каталог теста");
-    p
+    PathBuf::from(crate::testpaths::scratch(&format!("export_{tag}")))
 }
 
 #[test]

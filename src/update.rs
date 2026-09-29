@@ -895,9 +895,53 @@ pub fn run_updater(wait_secs: u64, channel: &str) -> i32 {
     crate::log::init(&base);
     let (code, aside) = run_updater_inner(&base, wait_secs, channel);
     if !aside.as_os_str().is_empty() {
-        let _ = remove_aside_delayed(&aside);
+        finish_aside(&base, &aside);
     }
     code
+}
+
+/// Что сделать с переименованной копией программы в конце работы.
+///
+/// Копию удаляем, только если новая сборка уже встала на своё место. Иначе
+/// переименованный файл — это и есть программа, и удаление оставляло бы
+/// человека вообще без программы: отменённое обновление, обрыв загрузки,
+/// нехватка прав — всё это стирало TraySession.exe безвозвратно.
+///
+/// Решение принимается по состоянию диска, а не по коду возврата: код
+/// отражает, на каком шаге остановились, а файл — на что реально можно
+/// опереться.
+pub fn finish_aside(base: &Path, aside: &Path) -> AsideOutcome {
+    let main = base.join(MAIN_EXE);
+    if main.is_file() {
+        let _ = remove_aside_delayed(aside);
+        return AsideOutcome::Deleted;
+    }
+    // Программы на месте нет — значит она всё ещё лежит под новым именем.
+    match std::fs::rename(aside, &main) {
+        Ok(()) => {
+            crate::log::info("старая программа возвращена на место");
+            AsideOutcome::Restored
+        }
+        Err(e) => {
+            crate::log::err(&format!(
+                "программа пропала: не смог вернуть {} на место: {e}",
+                aside.display()
+            ));
+            AsideOutcome::Lost
+        }
+    }
+}
+
+/// Что `finish_aside` сделал с копией.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsideOutcome {
+    /// Новая сборка встала на место, копия удалена — так и должно быть.
+    Deleted,
+    /// Обновление не вышло, копия возвращена под именем программы.
+    Restored,
+    /// Вернуть не удалось: копия осталась под служебным именем, и её надо
+    /// переименовать вручную.
+    Lost,
 }
 
 /// Основная работа обновления. Возвращает код и путь, под которым процесс
@@ -1100,16 +1144,22 @@ fn write_report(base: &Path, r: UpdateReport) -> std::io::Result<()> {
 pub fn wait_for_exit(base: &Path, wait_secs: u64) -> bool {
     let flag = base.join(READY_FLAG);
     let start = std::time::Instant::now();
-    while start.elapsed().as_secs() < wait_secs {
+    // Флаг проверяется ХОТЯ БЫ ОДИН РАЗ, даже если ждать нечего. Иначе
+    // `wait_secs = 0` означал бы «не смотреть вовсе», и программа, которая
+    // уже успела записать файл и выйти, считалась бы ещё работающей:
+    // обновление отменялось бы, а её файл так и лежал бы дальше.
+    loop {
         if flag.exists() {
             let _ = std::fs::remove_file(&flag);
             // Дать основному процессу дописать и выйти.
             std::thread::sleep(std::time::Duration::from_millis(600));
             return true;
         }
+        if start.elapsed().as_secs() >= wait_secs {
+            return false;
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    false
 }
 
 /// Попросить основную программу закрыться: записать файл-флаг.
@@ -1298,6 +1348,93 @@ mod real_manifest {
             "версия в манифесте ({}) не совпадает с Cargo.toml ({expected}). Перегенерируй: tools\\make-manifest.ps1",
             m.version
         );
+    }
+
+    #[test]
+    fn shipped_binary_really_contains_the_declared_version() {
+        // Ловушка, в которую попал релиз 0.7.30. Манифест объявлял 0.7.30,
+        // а в самом .exe был собран 0.7.29: релизную сборку сделали ДО
+        // поднятия версии, а манифест сгенерировали ПОСЛЕ. Оба файла —
+        // текстовые и согласованы между собой, поэтому прежние проверки
+        // были довольны, а пользователь получал программу, которая
+        // называет себя прошлой версией.
+        //
+        // Проверяем сам бинарник: в нём версия и номер сборки лежат
+        // открытым текстом. Если сборки ещё нет — тест пропускает молча,
+        // чтобы `cargo test` до `cargo build --release` не падал.
+        let exe = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("release")
+            .join("game-session-tracker.exe");
+        if !exe.is_file() {
+            eprintln!("релизной сборки нет — проверка пропущена: {}", exe.display());
+            return;
+        }
+        let bytes = std::fs::read(&exe).expect("не прочитан exe");
+        let text = String::from_utf8_lossy(&bytes);
+        let cargo = include_str!("../Cargo.toml");
+        let version = cargo
+            .lines()
+            .find(|l| l.trim_start().starts_with("version"))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("");
+        assert!(
+            !version.is_empty(),
+            "не нашёл версию в Cargo.toml"
+        );
+        assert!(
+            text.contains(version),
+            "в собранном .exe нет версии {version}. Значит, сборка сделана \
+             ДО поднятия версии, а манифест — после. Пересобери по порядку: \
+             cargo build --release -> make-manifest.ps1 -Archive -> \
+             make-setup.ps1 -> make-manifest.ps1"
+        );
+        // Номер сборки — тоже: он показывается в логах и в отчёте.
+        let build = include_str!("app.rs")
+            .lines()
+            .find(|l| l.contains("const BUILD"))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("");
+        if !build.is_empty() {
+            assert!(
+                text.contains(build),
+                "в собранном .exe нет номера сборки {build} — та же причина: \
+                 сборка старше, чем правка исходников"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_matches_the_file_actually_in_the_project_root() {
+        // Вторая половина той же ловушки. Манифест — текст, версия в нём —
+        // текст, они всегда согласованы между собой. Но он может быть
+        // посчитан по файлу, который в корне уже не тот: скрипт манифеста
+        // считал хеш от старой сборки, потому что новую в корень не
+        // положили. Тогда программа скачает ровно то, что уже стоит.
+        //
+        // Если файла в корне нет (чистая выгрузка репозитория) — проверка
+        // пропускается молча.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let m = Manifest::parse(REAL_MANIFEST).unwrap();
+        for f in &m.files {
+            let p = root.join(&f.name);
+            if !p.is_file() {
+                eprintln!("{} нет в корне — проверка пропущена", f.name);
+                continue;
+            }
+            let actual = sha256_file(&p)
+                .unwrap_or_else(|e| panic!("не посчитан хеш {}: {e}", p.display()));
+            assert_eq!(
+                actual, f.sha256,
+                "манифест описывает {name} с хешем {want}, а в корне лежит \
+                 другой файл ({got}). Пересобери по порядку: \
+                 cargo build --release -> make-manifest.ps1 -Archive -> \
+                 make-setup.ps1 -> make-manifest.ps1",
+                name = f.name,
+                want = &f.sha256[..12],
+                got = &actual[..12],
+            );
+        }
     }
 
     #[test]

@@ -17,10 +17,21 @@ Set-Location (Join-Path $PSScriptRoot '..')
 # для этого нужна программа, которую обновление ещё не заменило.
 $PrevDir = Join-Path (Get-Location) 'dist\old'
 
-# Сохраняем текущую сборку ДО подмены на новую. Вызывают так:
-#     copy target\release\game-session-tracker.exe TraySession.exe
+# Сохраняем прошлую сборку и подменяем текущую новой.
+#
+# Ключевой момент: раньше скрипт ТОЛЬКО архивировал, а новую сборку в корень
+# кто-то копировал вручную. Из-за этого однажды манифест был сгенерирован по
+# старому файлу, и релиз 0.7.30 объявлял версию 0.7.30, а внутри .exe был
+# собран 0.7.29. Оба файла — текстовые, поэтому проверки были довольны.
+# Теперь порядок один и он не нарушается: сначала архив, потом копирование.
+#
+# Вызывают так:
+#     cargo build --release
 #     tools\make-manifest.ps1 -Archive
-# Без -Archive скрипт ничего не архивирует (обычный пересбор манифеста).
+#     tools\make-setup.ps1
+#     tools\make-manifest.ps1
+# Без -Archive скрипт только пересобирает манифест (после make-setup).
+
 if ($args -contains '-Archive') {
     if (Test-Path 'TraySession.exe') {
         $oldVer = 'без-версии'
@@ -34,6 +45,16 @@ if ($args -contains '-Archive') {
         Copy-Item 'TraySession.exe' $dest -Force
         Write-Host "Прошлая сборка сохранена: $dest"
     }
+    # Копируем свежую сборку сами: иначе манифест соберётся по старому
+    # файлу, который остался в корне от прошлого раза.
+    $fresh = Join-Path (Get-Location) 'target\release\game-session-tracker.exe'
+    if (-not (Test-Path $fresh)) {
+        throw "Нет релизной сборки: $fresh (сначала cargo build --release)"
+    }
+    Copy-Item $fresh (Join-Path (Get-Location) 'TraySession.exe') -Force
+    # Деактиватор — тот же файл, он узнаёт себя по имени.
+    Copy-Item $fresh (Join-Path (Get-Location) '_uninstall.exe') -Force
+    Write-Host ("Свежая сборка в корне: {0}" -f (Get-FileHash 'TraySession.exe' -Algorithm SHA256).Hash.ToLower().Substring(0, 12))
 }
 
 # Файлы сборки, которые имеет смысл обновлять. Порядок не важен.

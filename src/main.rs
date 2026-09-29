@@ -8,6 +8,7 @@ mod log;
 mod monitor;
 mod shortcuts;
 mod sound;
+mod testpaths;
 mod update;
 mod uninstall;
 

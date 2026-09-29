@@ -5,10 +5,10 @@
 
 use super::*;
 
-/// Каталог для теста — внутри проекта, на его диске.
+/// Каталог для теста — `temp_test` рядом с программой (см. `testpaths`).
 ///
 /// Удаляется сам при выходе из теста, даже если тест упал с паникой: иначе
-/// в `target/test-tmp` копится мусор, а диск C:/F: человек трогать не должен.
+/// в папке копится мусор, и нельзя понять, что от какого теста.
 struct Sandbox(PathBuf);
 
 impl std::ops::Deref for Sandbox {
@@ -32,13 +32,9 @@ impl Drop for Sandbox {
 
 /// Создать каталог для теста.
 fn sandbox(tag: &str) -> Sandbox {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp")
-        .join(format!("uninst_{tag}"));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("не создался каталог теста");
-    Sandbox(p)
+    Sandbox(PathBuf::from(crate::testpaths::scratch(&format!(
+        "uninst_{tag}"
+    ))))
 }
 
 /// Разложить в каталоге правдоподобную установку: файлы программы,
@@ -333,21 +329,46 @@ fn mode_is_detected_by_file_name() {
     assert!("_UNINSTALL.EXE".to_ascii_lowercase().starts_with("_uninstall"));
 }
 
-/// Собрать настоящую тестовую установку в `test1` для ручной проверки.
+/// Расширенная папка для ручной проверки: `temp_test/<имя>`.
+///
+/// Всё живёт в `temp_test` рядом с программой (см. `testpaths`): тесты не
+/// пишут на диск C:, а после прогона папка вычищается целиком, и старые
+/// базы не путаются с новыми.
+fn manual_dir(name: &str) -> PathBuf {
+    let dir = crate::testpaths::test_root().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("не создалась папка ручной проверки");
+    dir
+}
+
+/// Общее наполнение установки: настройки, списки, логи, папка обновлений.
+fn fill_install(dir: &Path, config: &str) {
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    std::fs::write(dir.join("known_games.json"), "[]").unwrap();
+    std::fs::write(dir.join("shortcuts.json"), "{}").unwrap();
+    // Заглушка: программа всё равно качает манифест из репозитория и не
+    // должна доверять файлу на диске.
+    std::fs::write(dir.join("update_manifest.json"), "[]").unwrap();
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::write(dir.join("logs").join("tray.log"), "[INFO] test\n").unwrap();
+    std::fs::create_dir_all(dir.join("update_tmp")).unwrap();
+    std::fs::write(dir.join("update_tmp").join("payload.exe"), "X").unwrap();
+    // Живая база: без неё деактиватор скажет «выгружать нечего».
+    add_fake_sessions(dir);
+}
+
+/// Собрать готовую установку со СВЕЖЕЙ сборкой: `temp_test/uninstall`.
 ///
 /// Отдельный игнорируемый тест, а не скрипт: база сессий пишется тем же
 /// кодом, что и у программы. Скрипт не смог бы создать её без дублирования
 /// SQL, и через полгода схема изменилась бы, а скрипт остался бы старым.
 ///
-/// Запуск: `cargo test prepare_test1_install -- --ignored`
+/// Запуск: `cargo test prepare_uninstall_install -- --ignored --nocapture`
 #[test]
-#[ignore = "готовит папку test1 для ручной проверки, не запускать в обычном прогоне"]
-fn prepare_test1_install() {
+#[ignore = "готовит temp_test/uninstall для ручной проверки, не запускать в обычном прогоне"]
+fn prepare_uninstall_install() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dir = root.join("test1");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("не создалась test1");
-
+    let dir = manual_dir("uninstall");
     // Настоящая сборка, иначе проверять нечего.
     let exe = root.join("target").join("release").join("game-session-tracker.exe");
     assert!(exe.is_file(), "Сначала собери release: {}", exe.display());
@@ -355,23 +376,14 @@ fn prepare_test1_install() {
         std::fs::copy(&exe, dir.join(name)).expect("не скопирован исполняемый файл");
     }
     std::fs::copy(root.join("README.md"), dir.join("README.md")).ok();
-
-    // Настройки и прочие данные — чтобы деактиватору было что удалять.
-    std::fs::write(
-        dir.join("config.json"),
-        r#"{"day_start_hour":3,"update_freq":"weekly","update_auto":true,"update_channel":"beta"}"#,
-    )
-    .unwrap();
-    std::fs::write(dir.join("known_games.json"), "[]").unwrap();
-    std::fs::write(dir.join("shortcuts.json"), "{}").unwrap();
-    std::fs::write(dir.join("update_manifest.json"), "[]").unwrap();
-    std::fs::create_dir_all(dir.join("logs")).unwrap();
-    std::fs::write(dir.join("logs").join("tray.log"), "[INFO] test install\n").unwrap();
-    std::fs::create_dir_all(dir.join("update_tmp")).unwrap();
-    std::fs::write(dir.join("update_tmp").join("payload.exe"), "X").unwrap();
-
-    // Живая база с сессиями: без неё деактиватор скажет «выгружать нечего».
-    add_fake_sessions(&dir);
+    // Метка на НЕСУЩЕСТВУЮЩИЙ файл: деактиватор должен решить, что таблица
+    // ещё не выгружалась, и предложить сохранить её. Без метки проверять
+    // было бы нечего — он бы молча согласился на удаление.
+    fill_install(
+        &dir,
+        r#"{"day_start_hour":3,"update_freq":"weekly","update_auto":false,"update_channel":"beta"}"#,
+    );
+    std::fs::write(dir.join(LAST_EXPORT), r"C:\Users\X\Desktop\нет-такого.csv").unwrap();
 
     println!("Готово: {}", dir.display());
     for e in std::fs::read_dir(&dir).unwrap() {
@@ -379,26 +391,24 @@ fn prepare_test1_install() {
     }
 }
 
-/// Собрать `test2` — папку, где человек вручную проверяет удаление и
-/// обновление на ПРЕДЫДУЩЕЙ версии.
+/// Собрать установку с ПРЕДЫДУЩЕЙ сборкой: `temp_test/update`.
 ///
-/// Отличия от `test1`, и каждое существенное:
-/// * кладётся старая сборка `TraySession.exe` из корня репозитория, а не
-///   свежая — иначе обновлять нечего, программа сразу была бы новой;
+/// Здесь человек проверяет обновление по-настоящему, и каждое отличие
+/// существенно:
+/// * кладётся старая сборка — иначе обновлять нечего, программа сразу
+///   была бы новой;
 /// * в `config.json` прописан канал `beta` — иначе обновление пойдёт в
-///   стабильную ветку, где лежит другая (старая) сборка, и человек увидит
+///   стабильную ветку, где лежит другая сборка, и человек увидит
 ///   «обновлений нет» вместо проверки;
-/// * ставится метка `last_export.txt` с НЕСУЩЕСТВУЮЩИМ файлом: так
-///   проверяется первый вариант деактивации — «таблица ещё не выгружалась».
+/// * ставится метка `last_export.txt` на несуществующий файл — проверяется
+///   первый вариант деактивации, «таблица ещё не выгружалась».
 ///
-/// Запуск: `cargo test prepare_test2_install -- --ignored --nocapture`
+/// Запуск: `cargo test prepare_update_install -- --ignored --nocapture`
 #[test]
-#[ignore = "готовит папку test2 для ручной проверки, не запускать в обычном прогоне"]
-fn prepare_test2_install() {
+#[ignore = "готовит temp_test/update для ручной проверки, не запускать в обычном прогоне"]
+fn prepare_update_install() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dir = root.join("test2");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("не создалась test2");
+    let dir = manual_dir("update");
 
     // Именно ПРЕДЫДУЩАЯ сборка — та, чей хеш был в манифесте до бампа.
     // Копию делает tools\make-manifest.ps1 -Archive при пересборке,
@@ -427,28 +437,13 @@ fn prepare_test2_install() {
     assert!(fresh.is_file(), "Сначала собери release: {}", fresh.display());
     std::fs::copy(&fresh, dir.join("_uninstall.exe")).expect("не скопирован деактиватор");
     std::fs::copy(root.join("README.md"), dir.join("README.md")).ok();
-
-    // Канал beta — обязателен, см. описание теста.
-    std::fs::write(
-        dir.join("config.json"),
+    fill_install(
+        &dir,
         r#"{"day_start_hour":3,"update_freq":"weekly","update_auto":false,"update_channel":"beta"}"#,
-    )
-    .unwrap();
-    std::fs::write(dir.join("known_games.json"), "[]").unwrap();
-    std::fs::write(dir.join("shortcuts.json"), "{}").unwrap();
-    // Пустой манифест: программа не должна доверять файлу на диске, она
-    // качает манифест из репозитория. Здесь он нужен лишь как файл-заглушка.
-    std::fs::write(dir.join("update_manifest.json"), "[]").unwrap();
-    std::fs::create_dir_all(dir.join("logs")).unwrap();
-    std::fs::write(dir.join("logs").join("tray.log"), "[INFO] test2 install\n").unwrap();
-    std::fs::create_dir_all(dir.join("update_tmp")).unwrap();
-    // Метка на несуществующий файл: деактиватор должен решить, что
-    // таблица ещё не выгружалась, и предложить сохранить её.
-    std::fs::write(dir.join(LAST_EXPORT), r"C:\Users\Test\Desktop\old-export.csv").unwrap();
-    add_fake_sessions(&dir);
+    );
 
     println!("Готово: {}", dir.display());
-    println!("Версия в test2: предыдущая сборка, канал обновлений: beta");
+    println!("Версия: предыдущая сборка, канал обновлений: beta");
     for e in std::fs::read_dir(&dir).unwrap() {
         println!("  {}", e.unwrap().file_name().to_string_lossy());
     }
@@ -476,6 +471,53 @@ fn add_fake_sessions(base: &Path) {
             }
         }
     }
+}
+
+#[test]
+fn export_to_flag_redirects_the_backup() {
+    // Ручная проверка идёт в temp_test на диске проекта, а деактиватор по
+    // умолчанию пишет на Рабочий стол, то есть на C:. Флаг --export-to
+    // позволяет выбрать папку, иначе проверка нарушала бы правило
+    // «никаких тестов на C:».
+    let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+    // Без флага — умолчание, Рабочий стол.
+    assert!(export_dir_opt(&a(&[])).is_none());
+    assert!(export_dir_opt(&a(&["--yes"])).is_none());
+    // С флагом — указанная папка.
+    let got = export_dir_opt(&a(&["--yes", "--export-to", r"D:\backup"])).expect("флаг проигнорирован");
+    assert_eq!(got, PathBuf::from(r"D:\backup"));
+    // Флаг может стоять где угодно в списке, не обязательно последним.
+    let got = export_dir_opt(&a(&["--export-to", r"D:\b", "--yes"])).expect("флаг проигнорирован");
+    assert_eq!(got, PathBuf::from(r"D:\b"));
+    // Без значения после флага — молча берём умолчание, а не падаем.
+    assert!(export_dir_opt(&a(&["--export-to"])).is_none());
+    // Имя файла остаётся свободным, прошлая выгрузка не затирается.
+    let t = export_target(&a(&["--export-to", r"D:\b"]));
+    assert!(t.to_string_lossy().starts_with(r"D:\b"), "{t:?}");
+    assert!(t.to_string_lossy().ends_with(".csv"), "{t:?}");
+}
+
+#[test]
+fn export_to_dir_keeps_the_file_outside_the_program_folder() {
+    // Сценарий целиком: деактиватор с --export-to кладёт CSV куда сказали
+    // и не сносит его вместе с программой.
+    let dir = sandbox("exportto");
+    make_install(&dir);
+    std::fs::remove_file(dir.join("sessions.db")).unwrap();
+    add_fake_sessions(&dir);
+
+    let out_dir = dir.join("..").join("экспорт_на_диск_проекта");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let out = crate::export::unique_path(&out_dir);
+    let report = uninstall_to(&dir, Some(&out_dir));
+    assert!(report.is_clean(), "{:?}", report.failed);
+    assert!(out.is_file(), "выгрузка не создана: {}", out.display());
+    assert!(is_outside(&out, &dir), "выгрузка внутри удаляемой папки");
+    // Таблица не пустая: заголовок плюс хотя бы одна игра.
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.starts_with("№,Игра"), "нет заголовка: {text}");
+    assert!(text.lines().count() >= 2, "в выгрузке только заголовок");
+    let _ = std::fs::remove_dir_all(&out_dir);
 }
 
 #[test]

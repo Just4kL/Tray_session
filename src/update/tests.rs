@@ -105,27 +105,14 @@ fn manifest_drops_duplicate_files() {
 // План обновления
 // ---------------------------------------------------------------------------
 
-/// Каталог для временных файлов тестов — внутри проекта, на диске с
-/// исходниками, а НЕ в системном `%TEMP%` на C:.
-///
-/// Причина: C: может быть почти заполнен, а тесты создают там каталоги с
-/// файлами-«пользователями» (sessions.db и прочее). Плюс рядом с тестами
-/// проще потом подчистить. `target/` в `.gitignore`, поэтому мусор в
-/// репозиторий не попадает.
-pub(super) fn temp_root() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp");
-    std::fs::create_dir_all(&p).expect("не создался target/test-tmp");
-    p
-}
-
 /// Временный каталог теста, который удаляется сам — в том числе если тест
 /// упал на `assert!`.
 ///
 /// Обычный `remove_dir_all` в конце теста не срабатывает при панике, и
 /// мусор копится. Здесь за удаление отвечает `Drop`, который вызывается и
-/// при раскрутке стека.
+/// при раскрутке стека. Каталог берётся из `testpaths` — он лежит в
+/// `temp_test` рядом с программой: правило владельца проекта, никаких
+/// тестов на диске C:.
 pub(super) struct TempDir(pub(super) PathBuf);
 
 /// Список аргументов командной строки из среза строк.
@@ -134,17 +121,9 @@ fn args(v: &[&str]) -> Vec<String> {
 }
 
 impl TempDir {
-    /// Создать каталог с уникальным именем внутри `temp_root`.
+    /// Создать каталог с уникальным именем внутри `temp_test`.
     pub(super) fn new(tag: &str) -> TempDir {
-        // Имя включает поток и мгновение: параллельные прогоны не схлопываются.
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = temp_root().join(format!("{tag}_{}_{}", std::process::id(), stamp));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).expect("не создался временный каталог теста");
-        TempDir(p)
+        TempDir(PathBuf::from(crate::testpaths::scratch(tag)))
     }
     /// Путь внутри каталога.
     fn join(&self, name: &str) -> PathBuf {
@@ -544,9 +523,65 @@ fn temp_dir_is_beside_program_not_system_temp() {
     let t = tmp_dir(&base);
     assert_eq!(t, base.join("update_tmp"));
     assert_eq!(t.parent().unwrap(), base, "папка загрузки вне каталога программы");
-    // И это точно не системный TEMP.
-    let sys = std::env::temp_dir();
+    // И это точно не системный TEMP. Здесь %TEMP% только ЧИТАЕТСЯ, чтобы
+    // доказать, что путь загрузки с ним не совпадает; ничего туда не
+    // пишется. Маркер testpaths:allow-system-temp-read снимает вопрос
+    // сторожу, который иначе принял бы это за нарушение.
+    let sys = std::env::temp_dir(); // testpaths:allow-system-temp-read
     assert!(!t.starts_with(&sys), "путь загрузки попал в системный TEMP: {t:?}");
+}
+
+#[test]
+fn cancelled_update_puts_the_program_back() {
+    // Критично. Фоновый процесс переименовывает программу, чтобы освободить
+    // имя под новую сборку. Если обновление сорвалось, копия — это и есть
+    // программа. Раньше она удалялась в любом случае, и человек оставался
+    // вообще без программы: отмена обновления стоила ему установки.
+    let dir = TempDir::new("aside_restore");
+    let main = dir.join(MAIN_EXE);
+    dir.write(MAIN_EXE, b"OLD PROGRAM");
+    // Так выглядит состояние после переименования: программы на месте нет.
+    let aside = dir.0.join(UPDATER_NAME);
+    std::fs::rename(&main, &aside).expect("не переименовали");
+    assert!(!main.is_file(), "исходник не ушёл");
+
+    let out = finish_aside(&dir.0, &aside);
+    assert_eq!(out, AsideOutcome::Restored, "копия не вернулась на место");
+    assert!(main.is_file(), "программа не появилась под своим именем");
+    assert_eq!(std::fs::read(&main).unwrap(), b"OLD PROGRAM", "программа повреждена");
+    assert!(!aside.exists(), "служебная копия осталась");
+}
+
+#[test]
+fn successful_update_deletes_the_copy() {
+    // Обратный случай: новая сборка встала на место — тогда копию удаляем,
+    // иначе в папке обновлений навсегда остался бы _updater_running.exe.
+    let dir = TempDir::new("aside_delete");
+    let main = dir.join(MAIN_EXE);
+    dir.write(MAIN_EXE, b"NEW PROGRAM");
+    let aside = dir.0.join(UPDATER_NAME);
+    std::fs::write(&aside, b"OLD PROGRAM").unwrap();
+
+    let out = finish_aside(&dir.0, &aside);
+    assert_eq!(out, AsideOutcome::Deleted);
+    assert_eq!(std::fs::read(&main).unwrap(), b"NEW PROGRAM", "новая сборка затёрта");
+    // Удаление отложенное (через cmd), поэтому сразу может ещё лежать.
+    let _ = std::fs::remove_file(&aside);
+}
+
+#[test]
+fn ready_flag_is_checked_even_with_zero_wait() {
+    // При wait_secs = 0 цикл ожидания не выполнялся ни разу, и флаг не
+    // смотрели вообще. Программа, которая уже записала файл и вышла,
+    // считалась работающей: обновление отменялось, а её файл оставался
+    // лежать и в следующий раз разрешил бы замену файлов на живых.
+    let dir = TempDir::new("zero_wait");
+    assert!(signal_ready_to_exit(&dir.0).is_ok());
+    assert!(wait_for_exit(&dir.0, 0), "флаг не увидели при нулевом ожидании");
+    // Файл-флаг при этом убирается, чтобы не разрешить замену позже.
+    assert!(!dir.0.join(READY_FLAG).exists(), "файл-флаг остался");
+    // Без флага при нулевом ожидании — отмена, и это правильно.
+    assert!(!wait_for_exit(&dir.0, 0), "отмена без флага не сработала");
 }
 
 #[test]

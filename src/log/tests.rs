@@ -3,16 +3,9 @@
 
 use super::*;
 
-/// Каталог для тестов — внутри проекта, на его диске (см. замечание в
-/// `update::tests` про %TEMP% на C:).
+/// Каталог для тестов — `temp_test` рядом с программой (см. `testpaths`).
 fn test_dir(tag: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp")
-        .join(format!("log_{tag}"));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).expect("не создался каталог теста");
-    p
+    PathBuf::from(crate::testpaths::scratch(&format!("log_{tag}")))
 }
 
 #[test]

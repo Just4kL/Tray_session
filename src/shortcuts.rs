@@ -564,7 +564,11 @@ mod tests {
 
     #[test]
     fn store_roundtrip_and_filtering() {
-        let path = std::env::temp_dir().join("tray_session_shortcuts_test.json");
+        // Не системный %TEMP%: он на диске C:, а тесты туда не пишут.
+        // Каталог убирается сам, даже если тест упадёт на assert! — иначе
+        // после каждого прогона в temp_test остаётся мусор.
+        let dir = crate::testpaths::scratch_guard("shortcuts");
+        let path = dir.join("store.json");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let mut st = ShortcutStore::load_from(&path);
