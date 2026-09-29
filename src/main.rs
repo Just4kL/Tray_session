@@ -1,4 +1,5 @@
 mod app;
+mod app_state;
 mod config;
 mod db;
 mod detector;
@@ -9,10 +10,12 @@ mod monitor;
 mod shortcuts;
 mod sound;
 mod testpaths;
+mod ui;
 mod update;
 mod uninstall;
 
-use app::{initial_games, AppCmd, TrackerApp, TrayCmd, VERSION};
+use app::{initial_games, TrackerApp, VERSION};
+use app_state::{AppCmd, TrayCmd};
 use config::AppConfig;
 use std::sync::{mpsc, Arc, RwLock};
 

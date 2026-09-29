@@ -553,7 +553,7 @@ fn no_explorer_when_table_was_already_saved() {
     crate::export::test_reset_reveal_count();
     let dir = sandbox("nosave");
     make_install(&dir);
-    let exported = dir.join("..").join(format!("выгрузка_{}.csv", std::process::id()));
+    let exported = dir.join("..").join(format!("выгрузка_уже_{}.csv", std::process::id()));
     std::fs::write(&exported, "№,Игра\n1,A\n").unwrap();
     std::fs::write(dir.join(LAST_EXPORT), exported.to_string_lossy().as_bytes()).unwrap();
 

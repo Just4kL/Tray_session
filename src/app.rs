@@ -1,5 +1,7 @@
+use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateInfo};
 use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, save_known_games, AppConfig, TrackedGame};
-use crate::db::{AggRow, AlarmRow, Db};
+use crate::ui::{theme::ThemeManager, views::Views};
+use crate::db::{AlarmRow, Db};
 use crate::detector;
 use crate::gpu::query_gpu;
 use crate::monitor::{ActiveInfo, MonitorEvent, SharedActive, SharedConfig, SharedGames};
@@ -291,56 +293,6 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
         "New: Сессии, будильники, таймер, трей, Steam API, экспорт CSV.",
     ]),
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Sessions,
-    Games,
-    Alarms,
-    Timer,
-    Shortcuts,
-    About,
-}
-
-impl Tab {
-    fn as_str(self) -> &'static str {
-        match self {
-            Tab::Sessions => "sessions",
-            Tab::Games => "games",
-            Tab::Alarms => "alarms",
-            Tab::Timer => "timer",
-            Tab::Shortcuts => "shortcuts",
-            Tab::About => "about",
-        }
-    }
-
-    fn from_str(s: &str) -> Self {
-        match s {
-            "games" => Tab::Games,
-            "alarms" => Tab::Alarms,
-            "timer" => Tab::Timer,
-            "shortcuts" => Tab::Shortcuts,
-            "about" => Tab::About,
-            _ => Tab::Sessions,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum AppCmd {
-    Show,
-    Quit,
-    StopwatchToggle,
-    StopwatchLap,
-    StopwatchStop,
-    StopwatchPin,
-    /// Шаг прозрачности окошка секундомера (+5/-5), только когда Pinned.
-    OpacityDelta(i32),
-    /// Сдвиг полоски по сетке 3×3: −1 = к предыдущей позиции, +1 = к следующей.
-    StripStep(i32),
-    /// Прозрачность мини-трея ±5 (стрелки RShift+↑/↓ при закрытом секундомере).
-    StripOpacity(i32),
-}
 
 /// Пункты боковой навигации: вкладка, иконка, подпись.
 ///
@@ -708,16 +660,6 @@ fn png_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Ответ фоновой нити, которая проверяет обновления.
-#[derive(Debug, Clone, Default)]
-pub struct UpdateInfo {
-    /// Текст для раздела «О программе».
-    pub msg: String,
-    /// Версия найденного обновления, если оно есть. Пока она задана,
-    /// в правом верхнем углу показывается кнопка скачивания.
-    pub new_version: Option<String>,
-}
-
 /// Сторона кнопки-уведомления об обновлении (квадратная).
 pub const UPDATE_BTN: f32 = 40.0;
 /// Радиус скругления кнопки.
@@ -1024,13 +966,6 @@ fn ui_bg(ctx: &egui::Context) -> egui::Color32 {
     ctx.style().visuals.window_fill
 }
 
-#[derive(Debug, Clone)]
-pub enum TrayCmd {
-    Tooltip(String),
-    /// Глобальные хоткеи секундомера (пусто = снять все).
-    StopwatchHotkeys(Vec<crate::shortcuts::HotkeyReg>),
-}
-
 /// Относительная яркость цвета по WCAG 2.1.
 ///
 /// Нужна, чтобы проверять контраст текста на кнопке: цифра проверяемая, в
@@ -1191,152 +1126,20 @@ fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     )
 }
 
+/// Приложение: тонкая оболочка eframe поверх состояния и представлений.
+///
+/// Этап 3.0: бизнес-состояние целиком лежит в `state: AppState`
+/// (модуль `app_state`), представления — в `views: Views`, тема — в
+/// `theme: ThemeManager` (оба пока пустые, наполняются в фазах 3 и 1).
+/// Методы `impl TrackerApp` обращаются к полям через `self.state.*`:
+/// замена механическая, выполнена скриптом `tools/split-state-3.0.ps1`.
 pub struct TrackerApp {
-    pub db: Arc<Db>,
-    pub games: SharedGames,
-    pub active: SharedActive,
-    pub cfg: SharedConfig,
-    cfg_handle: AppConfig,
-    rx_monitor: mpsc::Receiver<MonitorEvent>,
-    rx_appcmd: mpsc::Receiver<AppCmd>,
-    tx_tray: mpsc::Sender<TrayCmd>,
-    tab: Tab,
-    agg: Vec<AggRow>,
-    last_agg_refresh: Instant,
-    session_id_by_exe: HashMap<String, i64>,
-    // sessions ui
-    show_id_col: bool,
-    show_pct_col: bool,
-    show_last_col: bool,
-    show_runs_col: bool,
-    detail_game: Option<String>,
-    edit_session: Option<(i64, i32, i32, i32)>, // id,h,m,s
-    // games ui
-    search: String,
-    api_key: String,
-    steam_id: String,
-    scan_msg: String,
-    // process picker
-    show_picker: bool,
-    picker_search: String,
-    picker_list: Vec<detector::ProcInfo>,
-    picker_refresh_at: Instant,
-    // folder candidates
-    show_folder: bool,
-    folder_candidates: Vec<(String, u64)>,
-    folder_name: String,
-    // alarms ui
-    alarms: Vec<AlarmRow>,
-    alarm_h: i32,
-    alarm_m: i32,
-    /// Дни недели нового будильника галочками (Пн..Вс). Пусто = разовый.
-    alarm_days: [bool; 7],
-    alarm_url: String,
-    alarm_sound: String,
-    alarm_std: String,
-    alarm_dialog: Option<AlarmRow>,
-    /// Редактирование будильника (id, часы, минуты, дни Пн..Вс).
-    /// Доступно в любой момент, в том числе для неактивных будильников.
-    edit_alarm: Option<(i64, i32, i32, [bool; 7])>,
-    /// Показывать ли аналоговые часы для активного будильника.
-    show_analog: bool,
-    /// Какой будильник выведен на аналоговые часы (id). None = ближайший.
-    analog_alarm_id: Option<i64>,
-    // timer ui
-    timer_url: String,
-    timer_sound: String,
-    timer_std: String,
-    timer_min: i32,
-    timer_end: Option<Instant>,
-    timer_total: u64,
-    timer_data: (Option<String>, Option<String>, Option<String>),
-    timer_dialog: bool,
-    // misc
-    sound: SoundPlayer,
-    last_alarm_min: String,
-    morning_shown: bool,
-    started_at: Instant,
-    last_autoscan: Instant,
-    quit_requested: bool,
-    gpu_usable_cache: bool,
-    gpu_util_cache: u32,
-    last_gpu_check: Instant,
-    status_msg: String,
-    /// Черновик масштаба интерфейса: правится ползунком без перестройки UI,
-    /// применяется (commit_scale) при отпускании ползунка или кнопками.
-    scale_draft: Option<f32>,
-    /// Пользовательские шорткаты (shortcuts.json, автосохранение).
-    shortcuts: ShortcutStore,
-    /// Захват нового шортката: id действия + время старта (анти-дребезг).
-    capture_action: Option<String>,
-    capture_armed_at: f64,
-    /// Быстрый будильник (Ctrl+}): разовый, звук BEEP.
-    quick_alarm_open: bool,
-    quick_alarm_text: String,
-    quick_alarm_focus: bool,
-    /// Быстрый таймер (Ctrl+{): минуты 1–999, Enter — старт.
-    quick_timer_open: bool,
-    quick_timer_text: String,
-    quick_timer_focus: bool,
-    /// Секундомер: идёт ли отсчёт + накопленное время + круги (до 99 за забег).
-    stopwatch_running: bool,
-    stopwatch_start: Option<Instant>,
-    stopwatch_base: Duration,
-    stopwatch_laps: Vec<Duration>,
-    /// Маленькое окошко секундомера поверх всех окон + его прозрачность 2–100%.
-    stopwatch_overlay: bool,
-    stopwatch_opacity_pct: f32,
-    /// Окошко секундомера развёрнуто (кнопка расширения): двойной размер
-    /// плюс таймер обратного отсчёта. Запоминается, как и прочие настройки.
-    stopwatch_expanded: bool,
-    /// Последняя командная позиция окошка при перетаскивании (анти-лаг).
-    stopwatch_drag_pos: Option<egui::Pos2>,
-    /// Поставить окошко на запомненную позицию первым кадром.
-    overlay_place_pending: bool,
-    /// ppp при прошлой синхронизации рамок плавающих окон.
-    last_ppp: f32,
-    /// Смещение скролла списка кругов (кнопки ▲▼ + колесо).
-    laps_scroll: f32,
-    /// Тонкая полоска сессии (стиль uTorrent): открыта / позиция 0–8 (3×3) /
-    /// drag / закреплена (PIN) / прозрачность 5–100%.
-    strip_open: bool,
-    strip_pos: u8,
-    strip_drag_pos: Option<egui::Pos2>,
-    strip_pinned: bool,
-    strip_opacity_pct: f32,
-    /// Отложить прижатие полоски к краю до первого кадра вьюпорта.
-    strip_snap_pending: bool,
-    /// Когда последний раз проверяли, что окна не уехали за границы экрана
-    /// (мониторы могли переподключиться или сменить разрешение).
-    last_edge_check: Instant,
-    /// Текущий размер окошка секундомера в пикселях — общий источник правды
-    /// для проверок границ экрана (не пересчитываем на месте).
-    last_stopwatch_size: egui::Vec2,
-    /// PIN: окно нельзя перетащить; Ctrl+Num+/Num− меняют прозрачность ±5%.
-    stopwatch_pinned: bool,
-    /// Тонкая инфопанель игровой сессии (стиль uTorrent) + её размещение.
-    infobar_open: bool,
-    infobar_placed: bool,
-    /// Проверка обновлений: приёмник результата, статус, флаг процесса.
-    update_rx: Option<std::sync::mpsc::Receiver<UpdateInfo>>,
-    update_status: String,
-    update_checking: bool,
-    /// Версия найденного обновления, если оно есть. Пока задана — в правом
-    /// верхнем углу висит жёлтая кнопка со стрелкой вниз.
-    update_available: Option<String>,
-    /// Момент запуска проверки обновлений (время egui) — для защиты от
-    /// повторного автозапуска при каждом кадре раздела «О программе».
-    update_window_opened_at: f64,
-    /// Последний отправленный в трей набор глобальных хоткеев (без дублей).
-    last_hotkeys: Vec<crate::shortcuts::HotkeyReg>,
-    /// Последний тултип трея (вместо static mut).
-    last_tooltip: Instant,
-    /// Подраздел «О программе» (0–3).
-    about_sub: u8,
-    /// Последний сохранённый в файл слепок конфига (для автоперсиста).
-    last_saved: AppConfig,
-    /// Вкладка прошлого кадра: при переходе на Сессии/Будильники обновляем данные.
-    prev_tab: Tab,
+    pub state: AppState,
+    pub views: Views,
+    pub theme: ThemeManager,
+    /// Id текущего скина: `ctx.set_style` вызывается только при смене,
+    /// а не каждый кадр (иначе ломаются анимации).
+    last_skin_id: &'static str,
 }
 
 impl TrackerApp {
@@ -1351,106 +1154,111 @@ impl TrackerApp {
     ) -> Self {
         let cfg_handle = cfg.read().unwrap().clone();
         let mut app = Self {
-            db,
-            games,
-            active,
-            cfg,
-            cfg_handle: cfg_handle.clone(),
-            rx_monitor,
-            rx_appcmd,
-            tx_tray,
-            tab: Tab::from_str(&cfg_handle.last_tab),
-            agg: Vec::new(),
-            last_agg_refresh: Instant::now() - Duration::from_secs(99),
-            session_id_by_exe: HashMap::new(),
-            show_id_col: cfg_handle.show_cols[0],
-            show_pct_col: cfg_handle.show_cols[1],
-            show_last_col: cfg_handle.show_cols[2],
-            show_runs_col: cfg_handle.show_cols[3],
-            detail_game: None,
-            edit_session: None,
-            search: String::new(),
-            api_key: cfg_handle.api_key.clone(),
-            steam_id: cfg_handle.steam_id.clone(),
-            scan_msg: String::new(),
-            show_picker: false,
-            picker_search: String::new(),
-            picker_list: Vec::new(),
-            picker_refresh_at: Instant::now() - Duration::from_secs(99),
-            show_folder: false,
-            folder_candidates: Vec::new(),
-            folder_name: String::new(),
-            alarms: Vec::new(),
-            alarm_h: cfg_handle.alarm_h,
-            alarm_m: cfg_handle.alarm_m,
-            alarm_days: cfg_handle.alarm_days,
-            alarm_url: String::new(),
-            alarm_sound: String::new(),
-            alarm_std: "Нет".to_string(),
-            alarm_dialog: None,
-            edit_alarm: None,
-            show_analog: cfg_handle.show_analog,
-            analog_alarm_id: None,
-            timer_url: String::new(),
-            timer_sound: String::new(),
-            timer_std: "Нет".to_string(),
-            timer_min: cfg_handle.timer_min,
-            timer_end: None,
-            timer_total: 0,
-            timer_data: (None, None, None),
-            timer_dialog: false,
-            sound: SoundPlayer::default(),
-            last_alarm_min: String::new(),
-            morning_shown: false,
-            started_at: Instant::now(),
-            last_autoscan: Instant::now(),
-            quit_requested: false,
-            gpu_usable_cache: false,
-            gpu_util_cache: 0,
-            last_gpu_check: Instant::now() - Duration::from_secs(99),
-            status_msg: String::new(),
-            scale_draft: None,
-            shortcuts: ShortcutStore::load(),
-            capture_action: None,
-            capture_armed_at: 0.0,
-            quick_alarm_open: false,
-            quick_alarm_text: String::new(),
-            quick_alarm_focus: false,
-            quick_timer_open: false,
-            quick_timer_text: String::new(),
-            quick_timer_focus: false,
-            stopwatch_running: false,
-            stopwatch_start: None,
-            stopwatch_base: Duration::ZERO,
-            stopwatch_laps: Vec::new(),
-            stopwatch_overlay: cfg_handle.stopwatch_overlay,
-            stopwatch_opacity_pct: cfg_handle.stopwatch_opacity_pct,
-            stopwatch_expanded: cfg_handle.stopwatch_expanded,
-            stopwatch_drag_pos: None,
-            overlay_place_pending: false,
-            last_ppp: 0.0,
-            laps_scroll: 0.0,
-            strip_open: cfg_handle.strip_open,
-            strip_pos: cfg_handle.strip_pos,
-            strip_drag_pos: None,
-            strip_pinned: cfg_handle.strip_pinned,
-            strip_opacity_pct: cfg_handle.strip_opacity_pct,
-            strip_snap_pending: false,
-            last_edge_check: Instant::now(),
-            last_stopwatch_size: egui::Vec2::new(175.0, 170.0),
-            stopwatch_pinned: false,
-            infobar_open: false,
-            infobar_placed: false,
-            update_rx: None,
-            update_status: String::new(),
-            update_checking: false,
-            update_available: None,
-            update_window_opened_at: 0.0,
-            last_hotkeys: Vec::new(),
-            last_tooltip: Instant::now() - Duration::from_secs(99),
-            prev_tab: Tab::from_str(&cfg_handle.last_tab),
-            about_sub: 0,
-            last_saved: cfg_handle.clone(),
+            state: AppState {
+                db,
+                games,
+                active,
+                cfg,
+                cfg_handle: cfg_handle.clone(),
+                rx_monitor,
+                rx_appcmd,
+                tx_tray,
+                tab: Tab::from_str(&cfg_handle.last_tab),
+                agg: Vec::new(),
+                last_agg_refresh: Instant::now() - Duration::from_secs(99),
+                session_id_by_exe: HashMap::new(),
+                show_id_col: cfg_handle.show_cols[0],
+                show_pct_col: cfg_handle.show_cols[1],
+                show_last_col: cfg_handle.show_cols[2],
+                show_runs_col: cfg_handle.show_cols[3],
+                detail_game: None,
+                edit_session: None,
+                search: String::new(),
+                api_key: cfg_handle.api_key.clone(),
+                steam_id: cfg_handle.steam_id.clone(),
+                scan_msg: String::new(),
+                show_picker: false,
+                picker_search: String::new(),
+                picker_list: Vec::new(),
+                picker_refresh_at: Instant::now() - Duration::from_secs(99),
+                show_folder: false,
+                folder_candidates: Vec::new(),
+                folder_name: String::new(),
+                alarms: Vec::new(),
+                alarm_h: cfg_handle.alarm_h,
+                alarm_m: cfg_handle.alarm_m,
+                alarm_days: cfg_handle.alarm_days,
+                alarm_url: String::new(),
+                alarm_sound: String::new(),
+                alarm_std: "Нет".to_string(),
+                alarm_dialog: None,
+                edit_alarm: None,
+                show_analog: cfg_handle.show_analog,
+                analog_alarm_id: None,
+                timer_url: String::new(),
+                timer_sound: String::new(),
+                timer_std: "Нет".to_string(),
+                timer_min: cfg_handle.timer_min,
+                timer_end: None,
+                timer_total: 0,
+                timer_data: (None, None, None),
+                timer_dialog: false,
+                sound: SoundPlayer::default(),
+                last_alarm_min: String::new(),
+                morning_shown: false,
+                started_at: Instant::now(),
+                last_autoscan: Instant::now(),
+                quit_requested: false,
+                gpu_usable_cache: false,
+                gpu_util_cache: 0,
+                last_gpu_check: Instant::now() - Duration::from_secs(99),
+                status_msg: String::new(),
+                scale_draft: None,
+                shortcuts: ShortcutStore::load(),
+                capture_action: None,
+                capture_armed_at: 0.0,
+                quick_alarm_open: false,
+                quick_alarm_text: String::new(),
+                quick_alarm_focus: false,
+                quick_timer_open: false,
+                quick_timer_text: String::new(),
+                quick_timer_focus: false,
+                stopwatch_running: false,
+                stopwatch_start: None,
+                stopwatch_base: Duration::ZERO,
+                stopwatch_laps: Vec::new(),
+                stopwatch_overlay: cfg_handle.stopwatch_overlay,
+                stopwatch_opacity_pct: cfg_handle.stopwatch_opacity_pct,
+                stopwatch_expanded: cfg_handle.stopwatch_expanded,
+                stopwatch_drag_pos: None,
+                overlay_place_pending: false,
+                last_ppp: 0.0,
+                laps_scroll: 0.0,
+                strip_open: cfg_handle.strip_open,
+                strip_pos: cfg_handle.strip_pos,
+                strip_drag_pos: None,
+                strip_pinned: cfg_handle.strip_pinned,
+                strip_opacity_pct: cfg_handle.strip_opacity_pct,
+                strip_snap_pending: false,
+                last_edge_check: Instant::now(),
+                last_stopwatch_size: egui::Vec2::new(175.0, 170.0),
+                stopwatch_pinned: false,
+                infobar_open: false,
+                infobar_placed: false,
+                update_rx: None,
+                update_status: String::new(),
+                update_checking: false,
+                update_available: None,
+                update_window_opened_at: 0.0,
+                last_hotkeys: Vec::new(),
+                last_tooltip: Instant::now() - Duration::from_secs(99),
+                prev_tab: Tab::from_str(&cfg_handle.last_tab),
+                about_sub: 0,
+                last_saved: cfg_handle.clone(),
+            },
+            views: Views::default(),
+            theme: ThemeManager::default(),
+            last_skin_id: "default",
         };
         app.refresh_agg();
         app.refresh_alarms();
@@ -1460,74 +1268,74 @@ impl TrackerApp {
 
     /// Собрать полный конфиг из текущего состояния интерфейса.
     fn collect_config(&self) -> AppConfig {
-        let mut c = self.cfg_handle.clone();
+        let mut c = self.state.cfg_handle.clone();
         c.show_cols = [
-            self.show_id_col,
-            self.show_pct_col,
-            self.show_last_col,
-            self.show_runs_col,
+            self.state.show_id_col,
+            self.state.show_pct_col,
+            self.state.show_last_col,
+            self.state.show_runs_col,
         ];
-        c.show_analog = self.show_analog;
-        c.strip_open = self.strip_open;
-        c.strip_pos = self.strip_pos;
-        c.strip_pinned = self.strip_pinned;
-        c.strip_opacity_pct = self.strip_opacity_pct;
-        c.stopwatch_overlay = self.stopwatch_overlay;
-        c.stopwatch_opacity_pct = self.stopwatch_opacity_pct;
-        c.stopwatch_expanded = self.stopwatch_expanded;
-        c.alarm_h = self.alarm_h;
-        c.alarm_m = self.alarm_m;
-        c.alarm_days = self.alarm_days;
-        c.timer_min = self.timer_min;
-        c.last_tab = self.tab.as_str().to_string();
+        c.show_analog = self.state.show_analog;
+        c.strip_open = self.state.strip_open;
+        c.strip_pos = self.state.strip_pos;
+        c.strip_pinned = self.state.strip_pinned;
+        c.strip_opacity_pct = self.state.strip_opacity_pct;
+        c.stopwatch_overlay = self.state.stopwatch_overlay;
+        c.stopwatch_opacity_pct = self.state.stopwatch_opacity_pct;
+        c.stopwatch_expanded = self.state.stopwatch_expanded;
+        c.alarm_h = self.state.alarm_h;
+        c.alarm_m = self.state.alarm_m;
+        c.alarm_days = self.state.alarm_days;
+        c.timer_min = self.state.timer_min;
+        c.last_tab = self.state.tab.as_str().to_string();
         c
     }
 
     /// Запомнить все изменения пользователя в файл (при отличии от слепка).
     fn persist_if_changed(&mut self) {
         let cur = self.collect_config();
-        if cur != self.last_saved {
+        if cur != self.state.last_saved {
             cur.save();
-            *self.cfg.write().unwrap() = cur.clone();
-            self.last_saved = cur;
+            *self.state.cfg.write().unwrap() = cur.clone();
+            self.state.last_saved = cur;
         }
     }
 
     fn refresh_agg(&mut self) {
-        self.agg = self.db.aggregated();
-        self.last_agg_refresh = Instant::now();
+        self.state.agg = self.state.db.aggregated();
+        self.state.last_agg_refresh = Instant::now();
     }
 
     /// Применить масштаб интерфейса и сохранить в config.json.
     fn commit_scale(&mut self, v: f32) {
         let v = v.clamp(0.8, 2.0);
-        self.scale_draft = None;
-        if (v - self.cfg_handle.ui_scale).abs() < f32::EPSILON {
+        self.state.scale_draft = None;
+        if (v - self.state.cfg_handle.ui_scale).abs() < f32::EPSILON {
             return;
         }
-        self.cfg_handle.ui_scale = v;
-        *self.cfg.write().unwrap() = self.cfg_handle.clone();
-        self.cfg_handle.save();
+        self.state.cfg_handle.ui_scale = v;
+        *self.state.cfg.write().unwrap() = self.state.cfg_handle.clone();
+        self.state.cfg_handle.save();
     }
 
     fn refresh_alarms(&mut self) {
-        self.alarms = self.db.alarms();
+        self.state.alarms = self.state.db.alarms();
     }
 
     /// Открыть раздел «О программе» и сразу запустить проверку обновлений.
     /// Вызывается кликом по версии внизу сайдбара. Отдельного окна нет:
     /// результат показывается в самом разделе (подраздел «О программе»).
     fn start_update_check(&mut self, ctx: &egui::Context) {
-        self.tab = Tab::About;
-        self.about_sub = 0;
-        self.update_window_opened_at = ctx.input(|i| i.time);
-        if self.update_checking {
+        self.state.tab = Tab::About;
+        self.state.about_sub = 0;
+        self.state.update_window_opened_at = ctx.input(|i| i.time);
+        if self.state.update_checking {
             return;
         }
-        self.update_checking = true;
-        self.update_status = "Проверяю GitHub…".to_string();
+        self.state.update_checking = true;
+        self.state.update_status = "Проверяю GitHub…".to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        self.update_rx = Some(rx);
+        self.state.update_rx = Some(rx);
         std::thread::spawn(move || {
             // Настоящая сверка: тянем манифест и сравниваем с диском.
             // Раньше здесь проверялось только соединение с api.github.com,
@@ -1592,25 +1400,25 @@ impl TrackerApp {
     fn start_update_install(&mut self) {
         let exe = std::env::current_exe().unwrap_or_default();
         if exe.as_os_str().is_empty() {
-            self.update_status = "Не удалось найти файл программы.".to_string();
+            self.state.update_status = "Не удалось найти файл программы.".to_string();
             return;
         }
         // Канал берём из настроек: бета должна обновляться по бета-ветке,
         // иначе установленная бета молча возвращается на старую версию.
-        let channel = crate::update::normalize_channel(&self.cfg_handle.update_channel);
+        let channel = crate::update::normalize_channel(&self.state.cfg_handle.update_channel);
         match crate::update::spawn_updater(&exe, 20, channel) {
             Ok(()) => {
-                self.update_checking = false;
-                self.status_msg = "Обновление ставится, программа сейчас закроется…"
+                self.state.update_checking = false;
+                self.state.status_msg = "Обновление ставится, программа сейчас закроется…"
                     .to_string();
                 self.notify("Tray Session", "Ставим обновление, программа сейчас закроется.");
                 // Сообщаем фоновому процессу, что можно заменять файлы, и
                 // выходим. Файл-флаг читает updater.
                 let _ = crate::update::signal_ready_to_exit(&crate::update::program_dir());
-                self.quit_requested = true;
+                self.state.quit_requested = true;
             }
             Err(e) => {
-                self.update_status = format!("Не удалось запустить обновление: {e}");
+                self.state.update_status = format!("Не удалось запустить обновление: {e}");
             }
         }
     }
@@ -1618,27 +1426,27 @@ impl TrackerApp {
     /// Автоматическая проверка по расписанию (каждый час / сутки / неделю).
     /// Молча скачивает, только если пользователь разрешил `update_silent`.
     fn maybe_scheduled_update(&mut self) {
-        let freq = crate::update::UpdateFreq::from_code(self.cfg_handle.update_freq);
-        if !self.cfg_handle.update_auto || self.update_checking {
+        let freq = crate::update::UpdateFreq::from_code(self.state.cfg_handle.update_freq);
+        if !self.state.cfg_handle.update_auto || self.state.update_checking {
             return;
         }
         let Some(interval) = freq.interval_secs() else { return };
         let now = chrono::Local::now().timestamp();
-        if self.cfg_handle.update_last_check != 0
-            && now - self.cfg_handle.update_last_check < interval as i64
+        if self.state.cfg_handle.update_last_check != 0
+            && now - self.state.cfg_handle.update_last_check < interval as i64
         {
             return;
         }
-        self.cfg_handle.update_last_check = now;
+        self.state.cfg_handle.update_last_check = now;
         // Проверяем в фоне, не блокируя отрисовку.
-        self.update_checking = true;
-        self.update_status = "Проверяю обновления по расписанию…".to_string();
+        self.state.update_checking = true;
+        self.state.update_status = "Проверяю обновления по расписанию…".to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        self.update_rx = Some(rx);
-        let silent = self.cfg_handle.update_silent;
+        self.state.update_rx = Some(rx);
+        let silent = self.state.cfg_handle.update_silent;
         // Канал тоже уходит в поток: проверка по расписанию обязана смотреть
         // ту же ветку, что и ручное обновление.
-        let channel = crate::update::normalize_channel(&self.cfg_handle.update_channel);
+        let channel = crate::update::normalize_channel(&self.state.cfg_handle.update_channel);
         std::thread::spawn(move || {
             let info = match crate::update::fetch_manifest_for(channel) {
                 Ok(m) => {
@@ -1689,7 +1497,7 @@ impl TrackerApp {
     }
 
     fn persist_games(&self) {
-        let g = self.games.read().unwrap().clone();
+        let g = self.state.games.read().unwrap().clone();
         save_known_games(&g);
     }
 
@@ -1700,11 +1508,11 @@ impl TrackerApp {
     /// Опрос шорткатов: захват нового, Enter быстрых диалогов, глобальные.
     fn poll_shortcuts(&mut self, ctx: &egui::Context) {
         // 1) Режим переназначения: ждём клавиши или кнопку мыши.
-        if let Some(id) = self.capture_action.clone() {
+        if let Some(id) = self.state.capture_action.clone() {
             let now = ctx.input(|i| i.time);
-            if now >= self.capture_armed_at + 0.25 {
+            if now >= self.state.capture_armed_at + 0.25 {
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.capture_action = None; // Esc — отмена захвата
+                    self.state.capture_action = None; // Esc — отмена захвата
                 } else {
                     let (ctrl, mut shift, alt) = ctx.input(|i| {
                         let m = &i.modifiers;
@@ -1735,9 +1543,9 @@ impl TrackerApp {
                         }
                     }
                     if let Some(b) = bound {
-                        self.shortcuts.set(&id, b);
-                        self.status_msg = format!("«{}» теперь: {}", action_label(&id), crate::shortcuts::display(&b));
-                        self.capture_action = None;
+                        self.state.shortcuts.set(&id, b);
+                        self.state.status_msg = format!("«{}» теперь: {}", action_label(&id), crate::shortcuts::display(&b));
+                        self.state.capture_action = None;
                         self.push_stopwatch_hotkeys();
                     }
                 }
@@ -1745,11 +1553,11 @@ impl TrackerApp {
             return; // пока идёт захват — остальные шорткаты молчат
         }
         // 2) Enter подтверждает быстрые диалоги (даже из поля ввода).
-        if self.quick_alarm_open && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if self.state.quick_alarm_open && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             self.confirm_quick_alarm();
             return;
         }
-        if self.quick_timer_open && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if self.state.quick_timer_open && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             self.confirm_quick_timer();
             return;
         }
@@ -1757,7 +1565,7 @@ impl TrackerApp {
         let typing = ctx.wants_keyboard_input();
         let mut fired: Vec<&'static str> = Vec::new();
         for a in crate::shortcuts::ACTIONS {
-            let b = self.shortcuts.binding(a.id);
+            let b = self.state.shortcuts.binding(a.id);
             if let Some(code) = b.mouse {
                 // Кнопки мыши — всегда (включая дополнительные).
                 if let Some(btn) = crate::shortcuts::mouse_button(code) {
@@ -1793,12 +1601,12 @@ impl TrackerApp {
         }
         for id in fired {
             match id {
-                "tab_sessions" => self.tab = Tab::Sessions,
-                "tab_games" => self.tab = Tab::Games,
-                "tab_alarms" => self.tab = Tab::Alarms,
-                "tab_timer" => self.tab = Tab::Timer,
-                "tab_shortcuts" => self.tab = Tab::Shortcuts,
-                "tab_about" => self.tab = Tab::About,
+                "tab_sessions" => self.state.tab = Tab::Sessions,
+                "tab_games" => self.state.tab = Tab::Games,
+                "tab_alarms" => self.state.tab = Tab::Alarms,
+                "tab_timer" => self.state.tab = Tab::Timer,
+                "tab_shortcuts" => self.state.tab = Tab::Shortcuts,
+                "tab_about" => self.state.tab = Tab::About,
                 "quick_alarm" => self.open_quick_alarm(),
                 "quick_timer" => self.open_quick_timer(),
                 "stopwatch_toggle" => self.stopwatch_toggle(),
@@ -1821,44 +1629,44 @@ impl TrackerApp {
 
     /// Закрыть верхний открытый диалог (Esc). Возвращает false, если нечего закрывать.
     fn close_top_dialog(&mut self) -> bool {
-        if self.quick_timer_open {
-            self.quick_timer_open = false;
+        if self.state.quick_timer_open {
+            self.state.quick_timer_open = false;
             return true;
         }
-        if self.quick_alarm_open {
-            self.quick_alarm_open = false;
+        if self.state.quick_alarm_open {
+            self.state.quick_alarm_open = false;
             return true;
         }
-        if self.alarm_dialog.is_some() {
-            self.alarm_dialog = None;
-            self.sound.stop();
+        if self.state.alarm_dialog.is_some() {
+            self.state.alarm_dialog = None;
+            self.state.sound.stop();
             return true;
         }
-        if self.edit_alarm.is_some() {
-            self.edit_alarm = None;
+        if self.state.edit_alarm.is_some() {
+            self.state.edit_alarm = None;
             return true;
         }
-        if self.edit_session.is_some() {
-            self.edit_session = None;
+        if self.state.edit_session.is_some() {
+            self.state.edit_session = None;
             self.refresh_agg();
             return true;
         }
-        if self.timer_dialog {
-            self.timer_dialog = false;
-            self.sound.stop();
+        if self.state.timer_dialog {
+            self.state.timer_dialog = false;
+            self.state.sound.stop();
             return true;
         }
-        if self.detail_game.is_some() {
-            self.detail_game = None;
+        if self.state.detail_game.is_some() {
+            self.state.detail_game = None;
             self.refresh_agg();
             return true;
         }
-        if self.show_picker {
-            self.show_picker = false;
+        if self.state.show_picker {
+            self.state.show_picker = false;
             return true;
         }
-        if self.show_folder {
-            self.show_folder = false;
+        if self.state.show_folder {
+            self.state.show_folder = false;
             return true;
         }
         false
@@ -1866,13 +1674,13 @@ impl TrackerApp {
 
     /// Быстрый будильник: разовый, звук BEEP.
     fn open_quick_alarm(&mut self) {
-        self.quick_alarm_open = true;
-        self.quick_alarm_text.clear();
-        self.quick_alarm_focus = true;
+        self.state.quick_alarm_open = true;
+        self.state.quick_alarm_text.clear();
+        self.state.quick_alarm_focus = true;
     }
 
     fn confirm_quick_alarm(&mut self) {
-        let t = self.quick_alarm_text.trim().replace(' ', "");
+        let t = self.state.quick_alarm_text.trim().replace(' ', "");
         let parsed = t.split_once(':').and_then(|(h, m)| {
             let h: u32 = h.parse().ok()?;
             let m: u32 = m.parse().ok()?;
@@ -1881,46 +1689,46 @@ impl TrackerApp {
         match parsed {
             Some((h, m)) => {
                 let ts = format!("{h:02}:{m:02}");
-                match self.db.add_alarm(&ts, false, None, None, Some("beep"), None) {
-                    Ok(()) => self.status_msg = format!("Быстрый будильник на {ts}: звук BEEP, разовый."),
-                    Err(e) => self.status_msg = format!("Не удалось добавить: {e}"),
+                match self.state.db.add_alarm(&ts, false, None, None, Some("beep"), None) {
+                    Ok(()) => self.state.status_msg = format!("Быстрый будильник на {ts}: звук BEEP, разовый."),
+                    Err(e) => self.state.status_msg = format!("Не удалось добавить: {e}"),
                 }
                 self.refresh_alarms();
-                self.quick_alarm_open = false;
+                self.state.quick_alarm_open = false;
             }
-            None => self.status_msg = "Формат времени: ЧЧ:ММ (например 07:30).".to_string(),
+            None => self.state.status_msg = "Формат времени: ЧЧ:ММ (например 07:30).".to_string(),
         }
     }
 
     /// Быстрый таймер: минуты 1–999, Enter — старт.
     fn open_quick_timer(&mut self) {
-        self.quick_timer_open = true;
-        self.quick_timer_text.clear();
-        self.quick_timer_focus = true;
+        self.state.quick_timer_open = true;
+        self.state.quick_timer_text.clear();
+        self.state.quick_timer_focus = true;
     }
 
     fn confirm_quick_timer(&mut self) {
-        match self.quick_timer_text.trim().parse::<i64>() {
+        match self.state.quick_timer_text.trim().parse::<i64>() {
             Ok(v) => {
                 let mins = v.clamp(1, 999) as u64;
                 self.start_timer(mins * 60);
-                self.status_msg = format!("Быстрый таймер: {mins} мин.");
-                self.quick_timer_open = false;
+                self.state.status_msg = format!("Быстрый таймер: {mins} мин.");
+                self.state.quick_timer_open = false;
             }
-            Err(_) => self.status_msg = "Минуты: число 1–999, Enter — старт.".to_string(),
+            Err(_) => self.state.status_msg = "Минуты: число 1–999, Enter — старт.".to_string(),
         }
     }
 
     // ---------- секундомер ----------
     fn stopwatch_elapsed(&self) -> Duration {
-        match (self.stopwatch_running, self.stopwatch_start) {
-            (true, Some(t)) => self.stopwatch_base + t.elapsed(),
-            _ => self.stopwatch_base,
+        match (self.state.stopwatch_running, self.state.stopwatch_start) {
+            (true, Some(t)) => self.state.stopwatch_base + t.elapsed(),
+            _ => self.state.stopwatch_base,
         }
     }
 
     fn stopwatch_toggle(&mut self) {
-        if self.stopwatch_running {
+        if self.state.stopwatch_running {
             self.stopwatch_pause();
         } else {
             self.stopwatch_start();
@@ -1929,33 +1737,33 @@ impl TrackerApp {
 
     /// Старт/продолжить (без сброса). No-op, если уже идёт.
     fn stopwatch_start(&mut self) {
-        if !self.stopwatch_running {
-            self.stopwatch_start = Some(Instant::now());
-            self.stopwatch_running = true;
+        if !self.state.stopwatch_running {
+            self.state.stopwatch_start = Some(Instant::now());
+            self.state.stopwatch_running = true;
         }
     }
 
     /// Пауза (время и круги сохраняются). No-op, если стоит.
     fn stopwatch_pause(&mut self) {
-        if self.stopwatch_running {
-            self.stopwatch_base = self.stopwatch_elapsed();
-            self.stopwatch_running = false;
-            self.stopwatch_start = None;
+        if self.state.stopwatch_running {
+            self.state.stopwatch_base = self.stopwatch_elapsed();
+            self.state.stopwatch_running = false;
+            self.state.stopwatch_start = None;
         }
     }
 
     /// Стоп завершает забег: останавливаем и обнуляем текущее время,
     /// круги остаются итогом. Дальнейший старт — с нуля.
     fn stopwatch_stop(&mut self) {
-        self.stopwatch_running = false;
-        self.stopwatch_start = None;
-        self.stopwatch_base = Duration::ZERO;
+        self.state.stopwatch_running = false;
+        self.state.stopwatch_start = None;
+        self.state.stopwatch_base = Duration::ZERO;
     }
 
     /// Закрепить/открепить окошко (Pin). Закреплённое нельзя таскать.
     fn toggle_stopwatch_pin(&mut self) {
-        self.stopwatch_pinned = !self.stopwatch_pinned;
-        self.status_msg = if self.stopwatch_pinned {
+        self.state.stopwatch_pinned = !self.state.stopwatch_pinned;
+        self.state.status_msg = if self.state.stopwatch_pinned {
             "Секундомер закреплён (PIN): перетаскивание заблокировано, Ctrl+Num+/Num− — прозрачность.".to_string()
         } else {
             "Секундомер откреплён: окно снова можно таскать.".to_string()
@@ -1965,15 +1773,15 @@ impl TrackerApp {
     /// Шаг прозрачности ±5%: сначала окошко секундомера (если закреплено
     /// и открыто), иначе полоска (если закреплена и открыта).
     fn apply_opacity_delta(&mut self, delta: i32) {
-        if self.stopwatch_pinned && self.stopwatch_overlay {
-            self.stopwatch_opacity_pct = step_opacity(self.stopwatch_opacity_pct, delta as f32);
+        if self.state.stopwatch_pinned && self.state.stopwatch_overlay {
+            self.state.stopwatch_opacity_pct = step_opacity(self.state.stopwatch_opacity_pct, delta as f32);
             return;
         }
-        if self.strip_pinned && self.strip_open {
-            self.strip_opacity_pct = step_opacity5(self.strip_opacity_pct, delta as f32);
+        if self.state.strip_pinned && self.state.strip_open {
+            self.state.strip_opacity_pct = step_opacity5(self.state.strip_opacity_pct, delta as f32);
             return;
         }
-        self.status_msg = "Прозрачность меняется только у закреплённого (PIN) открытого окошка.".to_string();
+        self.state.status_msg = "Прозрачность меняется только у закреплённого (PIN) открытого окошка.".to_string();
     }
 
     /// Развернуть/свернуть окошко секундомера. Развёрнутое — вдвое шире и
@@ -1981,14 +1789,14 @@ impl TrackerApp {
     /// вкладке «Таймер» — одна сущность, два места показа).
     /// Размер шлём сразу, иначе egui ждёт следующего кадра и окно «прыгает».
     fn set_stopwatch_expanded(&mut self, ctx: &egui::Context, expanded: bool) {
-        self.stopwatch_expanded = expanded;
+        self.state.stopwatch_expanded = expanded;
         // Размер шлём сразу, иначе egui ждёт следующего кадра и окно «прыгает».
         // ВInnerSize передаются ПОИНТЫ — egui переведёт их в пиксели сам.
         ctx.send_viewport_cmd_to(
             stopwatch_viewport_id(),
             egui::ViewportCommand::InnerSize(stopwatch_window_size(expanded)),
         );
-        self.status_msg = if expanded {
+        self.state.status_msg = if expanded {
             "Окошко секундомера развёрнуто: снизу таймер обратного отсчёта.".to_string()
         } else {
             "Окошко секундомера свёрнуто.".to_string()
@@ -1998,13 +1806,13 @@ impl TrackerApp {
     /// Открыть/закрыть окошко + переслать глобальные хоткеи в поток трея
     /// (пусто = снять все).
     fn set_stopwatch_overlay(&mut self, open: bool) {
-        self.stopwatch_overlay = open;
+        self.state.stopwatch_overlay = open;
         if !open {
-            self.stopwatch_drag_pos = None;
+            self.state.stopwatch_drag_pos = None;
             forget_style_patch(STOPWATCH_TITLE);
         } else {
             // При открытии встаём на запомненное место (если монитор жив).
-            self.overlay_place_pending = true;
+            self.state.overlay_place_pending = true;
         }
         self.push_stopwatch_hotkeys();
     }
@@ -2031,9 +1839,9 @@ impl TrackerApp {
         // регистрируется ровно один набор: приоритет у окошка секундомера.
         // Раньше условием был только он, и при открытой полоске стрелки
         // не работали вовсе.
-        let ids: &[(&str, u32)] = if self.stopwatch_overlay {
+        let ids: &[(&str, u32)] = if self.state.stopwatch_overlay {
             &SW_IDS
-        } else if self.strip_open {
+        } else if self.state.strip_open {
             &STRIP_IDS
         } else {
             &[]
@@ -2041,7 +1849,7 @@ impl TrackerApp {
         let regs = ids
             .iter()
             .filter_map(|(id, uid)| {
-                let b = self.shortcuts.binding(id);
+                let b = self.state.shortcuts.binding(id);
                 let vk = b.key.and_then(crate::shortcuts::key_to_vk)?;
                 if b.mouse.is_some() {
                     return None; // мышь глобально не регистрируется
@@ -2065,20 +1873,20 @@ impl TrackerApp {
                 })
             })
             .collect();
-        let _ = self.tx_tray.send(TrayCmd::StopwatchHotkeys(regs));
+        let _ = self.state.tx_tray.send(TrayCmd::StopwatchHotkeys(regs));
     }
 
     fn stopwatch_reset(&mut self) {
-        self.stopwatch_running = false;
-        self.stopwatch_start = None;
-        self.stopwatch_base = Duration::ZERO;
-        self.stopwatch_laps.clear();
+        self.state.stopwatch_running = false;
+        self.state.stopwatch_start = None;
+        self.state.stopwatch_base = Duration::ZERO;
+        self.state.stopwatch_laps.clear();
     }
 
     fn stopwatch_lap(&mut self) {
         let cur = self.stopwatch_elapsed();
-        if !push_lap_capped(&mut self.stopwatch_laps, cur) {
-            self.status_msg = "Секундомер: уже 99 кругов — сбросьте для нового забега.".to_string();
+        if !push_lap_capped(&mut self.state.stopwatch_laps, cur) {
+            self.state.status_msg = "Секундомер: уже 99 кругов — сбросьте для нового забега.".to_string();
         }
     }
 
@@ -2088,12 +1896,12 @@ impl TrackerApp {
     /// Зоны разделены явно: тонкая рамка + разделитель между табло и кнопками.
     fn draw_stopwatch_mini(&mut self, ui: &mut egui::Ui, vp_id: egui::ViewportId) {
         // PIN: окно никак нельзя перетащить, только открепить повторным Pin.
-        if !self.stopwatch_pinned {
+        if !self.state.stopwatch_pinned {
             viewport_drag(
                 ui,
                 vp_id,
                 egui::Id::new(("stopwatch_overlay", "drag")),
-                &mut self.stopwatch_drag_pos,
+                &mut self.state.stopwatch_drag_pos,
                 STOPWATCH_TITLE,
             );
         }
@@ -2119,11 +1927,11 @@ impl TrackerApp {
         // Текст кнопок БЕЗ своего цвета: свой цвет перекрывает fg_stroke
         // темы, и при нажатии (фон темнеет) текст оставался бледным.
         ui.horizontal(|ui| {
-            if chip_button(ui, "PIN", self.stopwatch_pinned).clicked() {
+            if chip_button(ui, "PIN", self.state.stopwatch_pinned).clicked() {
                 self.toggle_stopwatch_pin();
             }
             ui.label(
-                egui::RichText::new(format!("{}/99", self.stopwatch_laps.len()))
+                egui::RichText::new(format!("{}/99", self.state.stopwatch_laps.len()))
                     .small()
                     .weak(),
             );
@@ -2132,9 +1940,9 @@ impl TrackerApp {
                     self.set_stopwatch_overlay(false);
                 }
                 // Расширение: двойной размер окна + таймер обратного отсчёта.
-                let exp = if self.stopwatch_expanded { "⤡" } else { "⤢" };
-                if chip_button(ui, exp, self.stopwatch_expanded)
-                    .on_hover_text(if self.stopwatch_expanded {
+                let exp = if self.state.stopwatch_expanded { "⤡" } else { "⤢" };
+                if chip_button(ui, exp, self.state.stopwatch_expanded)
+                    .on_hover_text(if self.state.stopwatch_expanded {
                         "Свернуть окошко"
                     } else {
                         "Развернуть: добавится таймер обратного отсчёта"
@@ -2142,7 +1950,7 @@ impl TrackerApp {
                     .clicked()
                 {
                     let ctx = ui.ctx().clone();
-                    let want = !self.stopwatch_expanded;
+                    let want = !self.state.stopwatch_expanded;
                     self.set_stopwatch_expanded(&ctx, want);
                 }
             });
@@ -2156,7 +1964,7 @@ impl TrackerApp {
             );
             // Дублируем 3 последних круга: номер, сплит, общее.
             // Строго одна строка без переносов (обрезка при узком окне).
-            for (num, split, total) in last_laps(&self.stopwatch_laps) {
+            for (num, split, total) in last_laps(&self.state.stopwatch_laps) {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(format_lap_line(num, split, total))
@@ -2170,7 +1978,7 @@ impl TrackerApp {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .small_button(if self.stopwatch_running { "Пауза" } else { "Старт" })
+                    .small_button(if self.state.stopwatch_running { "Пауза" } else { "Старт" })
                     .clicked()
                 {
                     self.stopwatch_toggle();
@@ -2184,7 +1992,7 @@ impl TrackerApp {
             });
             // Развёрнутое окошко: снизу таймер обратного отсчёта — тот же,
             // что на вкладке «Таймер» (одна сущность, два места показа).
-            if self.stopwatch_expanded {
+            if self.state.stopwatch_expanded {
                 ui.separator();
                 self.draw_overlay_countdown(ui);
             }
@@ -2192,8 +2000,8 @@ impl TrackerApp {
         // Запоминаем место окна (восстановим на том же мониторе при открытии).
         if let Some(min) = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min) {
             let p = [min.x, min.y];
-            if self.cfg_handle.stopwatch_pos != Some(p) {
-                self.cfg_handle.stopwatch_pos = Some(p);
+            if self.state.cfg_handle.stopwatch_pos != Some(p) {
+                self.state.cfg_handle.stopwatch_pos = Some(p);
             }
         }
     }
@@ -2202,11 +2010,10 @@ impl TrackerApp {
     /// Крупные цифры + пресеты + стоп, всё в одну/две линии без переносов.
     /// Ширина не задаётся жёстко — окно само ресайзит пользователь.
     fn draw_overlay_countdown(&mut self, ui: &mut egui::Ui) {
-        let rem_d = self
-            .timer_end
+        let rem_d = self.state.timer_end
             .map(|e| e.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::ZERO);
-        let running = self.timer_end.is_some();
+        let running = self.state.timer_end.is_some();
         let rem = rem_d.as_secs();
         let txt = if running {
             format!("{:02}:{:02}", rem / 60, rem % 60)
@@ -2228,8 +2035,8 @@ impl TrackerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if running {
                     if ui.small_button("Стоп").clicked() {
-                        self.timer_end = None;
-                        self.sound.stop();
+                        self.state.timer_end = None;
+                        self.state.sound.stop();
                     }
                 } else {
                     for (label, secs) in
@@ -2243,8 +2050,8 @@ impl TrackerApp {
             });
         });
         // Тонкий индикатор хода: без него длинный таймер «теряется» в окне.
-        let frac = if self.timer_total > 0 {
-            (rem as f32 / self.timer_total as f32).clamp(0.0, 1.0)
+        let frac = if self.state.timer_total > 0 {
+            (rem as f32 / self.state.timer_total as f32).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -2269,17 +2076,17 @@ impl TrackerApp {
     fn show_stopwatch_overlay(&mut self, ctx: &egui::Context) {
         let vp_id = stopwatch_viewport_id();
         // Восстановление позиции: только на живом мониторе, иначе — как даст ОС.
-        if self.overlay_place_pending {
-            self.overlay_place_pending = false;
+        if self.state.overlay_place_pending {
+            self.state.overlay_place_pending = false;
             self.place_overlay_on_saved_mon(ctx, vp_id);
         }
         ensure_thickframe(STOPWATCH_TITLE);
-        apply_overlay_opacity(self.stopwatch_opacity_pct / 100.0);
-        let size = stopwatch_window_size(self.stopwatch_expanded);
+        apply_overlay_opacity(self.state.stopwatch_opacity_pct / 100.0);
+        let size = stopwatch_window_size(self.state.stopwatch_expanded);
         // Размер в поинтах держим в одном состоянии: сведения о нём читают и
         // place_overlay_on_saved_mon, и проверка границ экрана, поэтому
         // берём его из одного места, а не пересчитываем на трёх.
-        self.last_stopwatch_size = size;
+        self.state.last_stopwatch_size = size;
         ctx.show_viewport_immediate(
             vp_id,
             egui::ViewportBuilder::default()
@@ -2299,9 +2106,9 @@ impl TrackerApp {
                 // (Запрос без id уходил главному окну — окно двоилось и ползло.)
                 // С живым таймером обратного отсчёта — 100 мс, чтобы цифры шли
                 // ровно (33 мс нужны только тысячным секундомера).
-                let tick = if self.stopwatch_running {
+                let tick = if self.state.stopwatch_running {
                     33
-                } else if self.stopwatch_expanded && self.timer_end.is_some() {
+                } else if self.state.stopwatch_expanded && self.state.timer_end.is_some() {
                     100
                 } else {
                     100
@@ -2316,14 +2123,14 @@ impl TrackerApp {
     /// (или отключения экрана) угол попадает в невидимую область и окно
     /// «уезжает» за край. Проверка идёт по пересечению с рабочей областью.
     fn place_overlay_on_saved_mon(&mut self, ctx: &egui::Context, vp_id: egui::ViewportId) {
-        let Some(p) = self.cfg_handle.stopwatch_pos else { return };
+        let Some(p) = self.state.cfg_handle.stopwatch_pos else { return };
         #[cfg(windows)]
         {
             let mons = enum_monitor_work_areas();
             if mons.is_empty() {
                 return;
             }
-            let size = stopwatch_window_size(self.stopwatch_expanded);
+            let size = stopwatch_window_size(self.state.stopwatch_expanded);
             // Поинты → пиксели: экранные координаты и рабочие области
             // мониторов всегда в пикселях.
             let ppp = ctx.pixels_per_point();
@@ -2353,31 +2160,31 @@ impl TrackerApp {
     /// Вставить URL из буфера обмена в поле будильника/таймера (Ctrl+Shift+V).
     /// Работает на вкладках «Будильники» и «Таймер»; мусор из буфера отклоняется.
     fn paste_url_to_alarm(&mut self) {
-        if self.tab != Tab::Alarms && self.tab != Tab::Timer {
-            self.status_msg = "Вставка URL: откройте вкладку «Будильники» или «Таймер».".to_string();
+        if self.state.tab != Tab::Alarms && self.state.tab != Tab::Timer {
+            self.state.status_msg = "Вставка URL: откройте вкладку «Будильники» или «Таймер».".to_string();
             return;
         }
         let text = arboard::Clipboard::new()
             .and_then(|mut c| c.get_text())
             .unwrap_or_default();
         if !looks_like_url(&text) {
-            self.status_msg = "В буфере обмена нет URL-ссылки.".to_string();
+            self.state.status_msg = "В буфере обмена нет URL-ссылки.".to_string();
             return;
         }
         let url = text.trim().to_string();
-        if self.tab == Tab::Timer {
-            self.timer_url = url;
+        if self.state.tab == Tab::Timer {
+            self.state.timer_url = url;
         } else {
-            self.alarm_url = url;
+            self.state.alarm_url = url;
         }
-        self.status_msg = "URL вставлен из буфера обмена.".to_string();
+        self.state.status_msg = "URL вставлен из буфера обмена.".to_string();
     }
 
     /// Открыть/закрыть полоску сессии (+ поставить на выбранную позицию 3×3).
     fn set_strip_open(&mut self, open: bool) {
-        self.strip_open = open;
+        self.state.strip_open = open;
         if !open {
-            self.strip_drag_pos = None;
+            self.state.strip_drag_pos = None;
             // Окно скоро уничтожит egui; снять отметку о правке стиля, чтобы
             // при следующем открытии новое окно снова получило ресайз.
             forget_style_patch(STRIP_TITLE);
@@ -2391,13 +2198,13 @@ impl TrackerApp {
     /// (−1 назад, +1 вперёд). Работает сразу по глобальным стрелкам —
     /// кнопки сетки в главном окне недоступны, пока полоска поверх всего.
     fn move_strip_step(&mut self, delta: i32) {
-        let next = strip_step(self.strip_pos, delta);
-        if next != self.strip_pos {
-            self.strip_pos = next;
-            if self.strip_open {
+        let next = strip_step(self.state.strip_pos, delta);
+        if next != self.state.strip_pos {
+            self.state.strip_pos = next;
+            if self.state.strip_open {
                 self.snap_strip();
             }
-            self.status_msg = format!("Мини-трей: позиция {next} (сетка 3×3).");
+            self.state.status_msg = format!("Мини-трей: позиция {next} (сетка 3×3).");
         }
     }
 
@@ -2405,18 +2212,18 @@ impl TrackerApp {
     /// стрелки RShift+↑/↓ работают всегда: полоска часто не закреплена, а
     /// управлять ей с клавиатуры иначе нечем.
     fn apply_strip_opacity_delta(&mut self, delta: i32) {
-        if !self.strip_open {
-            self.status_msg = "Мини-трей закрыт — прозрачность менять нечего.".to_string();
+        if !self.state.strip_open {
+            self.state.status_msg = "Мини-трей закрыт — прозрачность менять нечего.".to_string();
             return;
         }
-        self.strip_opacity_pct = step_opacity5(self.strip_opacity_pct, delta as f32);
-        self.status_msg =
-            format!("Мини-трей: прозрачность {}%.", self.strip_opacity_pct.round() as i32);
+        self.state.strip_opacity_pct = step_opacity5(self.state.strip_opacity_pct, delta as f32);
+        self.state.status_msg =
+            format!("Мини-трей: прозрачность {}%.", self.state.strip_opacity_pct.round() as i32);
     }
 
     /// Поставить полоску на позицию (первым кадром вьюпорта через флаг).
     fn snap_strip(&mut self) {
-        self.strip_snap_pending = true;
+        self.state.strip_snap_pending = true;
     }
 
     /// Тонкая полочка текущей сессии (стиль uTorrent). Показывает ОДИН
@@ -2431,12 +2238,12 @@ impl TrackerApp {
     /// в одной горизонтальной строке.
     fn draw_session_strip(&mut self, ui: &mut egui::Ui, vp_id: egui::ViewportId) {
         // PIN: закреплённую полоску нельзя таскать.
-        if !self.strip_pinned {
+        if !self.state.strip_pinned {
             viewport_drag(
                 ui,
                 vp_id,
                 egui::Id::new(("session_strip", "drag")),
-                &mut self.strip_drag_pos,
+                &mut self.state.strip_drag_pos,
                 STRIP_TITLE,
             );
         }
@@ -2445,7 +2252,7 @@ impl TrackerApp {
         // Данные собираем ДО отрисовки: блокировка RwLock не должна
         // удерживаться во время вёрстки виджетов.
         let (name, secs, pending) = {
-            let act = self.active.read().unwrap();
+            let act = self.state.active.read().unwrap();
             let mut cur = act.values().filter(|a| !a.pending).next();
             if cur.is_none() {
                 cur = act.values().next();
@@ -2470,7 +2277,7 @@ impl TrackerApp {
                 Some((name.as_str(), secs, pending))
             };
             let mut state = StripUiState {
-                pinned: self.strip_pinned,
+                pinned: self.state.strip_pinned,
                 close_clicked: false,
                 pin_toggled: false,
             };
@@ -2486,15 +2293,15 @@ impl TrackerApp {
                 self.set_strip_open(false);
             }
             if state.pin_toggled {
-                self.strip_pinned = !self.strip_pinned;
+                self.state.strip_pinned = !self.state.strip_pinned;
             }
         });
 
         // Запоминаем место полоски (восстановим при открытии).
         if let Some(min) = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min) {
             let p = [min.x, min.y];
-            if self.cfg_handle.strip_pos_manual != Some(p) {
-                self.cfg_handle.strip_pos_manual = Some(p);
+            if self.state.cfg_handle.strip_pos_manual != Some(p) {
+                self.state.cfg_handle.strip_pos_manual = Some(p);
             }
         }
     }
@@ -2502,7 +2309,7 @@ impl TrackerApp {
     /// Показать полоску сессии поверх всех окон.
     fn show_session_strip(&mut self, ctx: &egui::Context) {
         ensure_thickframe(STRIP_TITLE);
-        apply_window_opacity(STRIP_TITLE, self.strip_opacity_pct / 100.0, 0.05);
+        apply_window_opacity(STRIP_TITLE, self.state.strip_opacity_pct / 100.0, 0.05);
         let vp_id = strip_viewport_id();
         ctx.show_viewport_immediate(
             vp_id,
@@ -2518,8 +2325,8 @@ impl TrackerApp {
                 // Позиционирование — ЗДЕСЬ, в колбэке полоски: input(c)
                 // принадлежит вьюпорту полоски (а не главному окну), поэтому
                 // монитор определяется по месту самой полоски.
-                if self.strip_snap_pending {
-                    self.strip_snap_pending = false;
+                if self.state.strip_snap_pending {
+                    self.state.strip_snap_pending = false;
                     self.snap_strip_now(c, vp_id);
                 }
                 // Панель без полей: CentralPanel по умолчанию добавляет
@@ -2560,8 +2367,8 @@ impl TrackerApp {
             // Позицию и размер спрашиваем у ОС по заголовку окна: outer_rect
             // из input() у main-контекста описывает главное окно, а не окошки.
             for (open, vp_id, title) in [
-                (self.stopwatch_overlay, stopwatch_viewport_id(), STOPWATCH_TITLE),
-                (self.strip_open, strip_viewport_id(), STRIP_TITLE),
+                (self.state.stopwatch_overlay, stopwatch_viewport_id(), STOPWATCH_TITLE),
+                (self.state.strip_open, strip_viewport_id(), STRIP_TITLE),
             ] {
                 if !open {
                     continue;
@@ -2629,7 +2436,7 @@ impl TrackerApp {
             // 1) Запомненное вручную место — если окно целиком влезает
             //    в рабочую область какого-то живого монитора.
             let mut placed: Option<(f32, f32)> = None;
-            if let Some(p) = self.cfg_handle.strip_pos_manual {
+            if let Some(p) = self.state.cfg_handle.strip_pos_manual {
                 if nearest_monitor_for_rect(&mons, p[0] as i32, p[1] as i32, w, h).is_some() {
                     placed = Some((p[0], p[1]));
                 }
@@ -2647,7 +2454,7 @@ impl TrackerApp {
                 let (x, y) = strip_pos_coords(
                     ((r - l) as f32, (b - t) as f32),
                     size,
-                    self.strip_pos,
+                    self.state.strip_pos,
                 );
                 placed = Some(((l as f32) + x, (t as f32) + y));
             }
@@ -2664,13 +2471,13 @@ impl TrackerApp {
         }
         #[cfg(not(windows))]
         {
-            if let Some(p) = self.cfg_handle.strip_pos_manual {
+            if let Some(p) = self.state.cfg_handle.strip_pos_manual {
                 c.send_viewport_cmd_to(
                     vp_id,
                     egui::ViewportCommand::OuterPosition([p[0], p[1]].into()),
                 );
             } else if let Some(m) = c.input(|i| i.viewport().monitor_size) {
-                let (x, y) = strip_pos_coords((m.x, m.y), size, self.strip_pos);
+                let (x, y) = strip_pos_coords((m.x, m.y), size, self.state.strip_pos);
                 c.send_viewport_cmd_to(
                     vp_id,
                     egui::ViewportCommand::OuterPosition([x, y].into()),
@@ -2680,14 +2487,14 @@ impl TrackerApp {
     }
 
     fn poll_monitor(&mut self) {
-        while let Ok(ev) = self.rx_monitor.try_recv() {
+        while let Ok(ev) = self.state.rx_monitor.try_recv() {
             match ev {
                 MonitorEvent::Started { game_name, exe_path } => {
                     let now = Local::now();
-                    match self.db.add_session(&game_name, &exe_path, &now) {
+                    match self.state.db.add_session(&game_name, &exe_path, &now) {
                         Ok(id) => {
-                            self.session_id_by_exe.insert(exe_path.clone(), id);
-                            if let Ok(mut act) = self.active.write() {
+                            self.state.session_id_by_exe.insert(exe_path.clone(), id);
+                            if let Ok(mut act) = self.state.active.write() {
                                 if let Some(a) = act.get_mut(&exe_path) {
                                     a.session_id = Some(id);
                                 }
@@ -2698,19 +2505,19 @@ impl TrackerApp {
                             );
                         }
                         Err(e) => {
-                            self.status_msg = format!("Ошибка старта сессии: {e}");
+                            self.state.status_msg = format!("Ошибка старта сессии: {e}");
                         }
                     }
                     self.refresh_agg();
                 }
                 MonitorEvent::Ended { exe_key } => {
-                    if let Some(id) = self.session_id_by_exe.remove(&exe_key) {
+                    if let Some(id) = self.state.session_id_by_exe.remove(&exe_key) {
                         let now = Local::now();
-                        let dur = self.db.end_session(id, &now).unwrap_or(0);
+                        let dur = self.state.db.end_session(id, &now).unwrap_or(0);
                         // сводка сегодня/вчера по игровому дню
-                        let day = self.cfg_handle.day_start_hour;
+                        let day = self.state.cfg_handle.day_start_hour;
                         let today_key = game_day_key(&now, day);
-                        let today: i64 = self.db.sessions_for_day(&today_key).iter().map(|(_, d)| *d).sum();
+                        let today: i64 = self.state.db.sessions_for_day(&today_key).iter().map(|(_, d)| *d).sum();
                         self.notify(
                             "Игровая сессия завершена",
                             &format!(
@@ -2744,11 +2551,11 @@ impl TrackerApp {
     }
 
     fn poll_appcmd(&mut self, ctx: &egui::Context) {
-        while let Ok(cmd) = self.rx_appcmd.try_recv() {
+        while let Ok(cmd) = self.state.rx_appcmd.try_recv() {
             match cmd {
                 AppCmd::Show => self.show_main_window(ctx),
                 AppCmd::Quit => {
-                    self.quit_requested = true;
+                    self.state.quit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 AppCmd::StopwatchToggle => self.stopwatch_toggle(),
@@ -2761,7 +2568,7 @@ impl TrackerApp {
             }
         }
         // Скрытие в трей вместо закрытия
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.state.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -2770,10 +2577,10 @@ impl TrackerApp {
     fn check_alarms_timer(&mut self) {
         let now = Local::now();
         let hm = now.format("%H:%M").to_string();
-        if hm != self.last_alarm_min {
-            self.last_alarm_min = hm.clone();
+        if hm != self.state.last_alarm_min {
+            self.state.last_alarm_min = hm.clone();
             let wday = now.weekday().num_days_from_monday() as usize; // Пн=0..Вс=6
-            for a in self.db.alarms() {
+            for a in self.state.db.alarms() {
                 if a.enabled && a.time == hm {
                     // Дни недели: разовый срабатывает всегда, повторяемый —
                     // только в отмеченные дни.
@@ -2795,24 +2602,24 @@ impl TrackerApp {
                         }
                     } else if let Some(s) = &a.standard_sound {
                         if !s.is_empty() && s != "Нет" {
-                            self.sound.play_standard(&s.to_lowercase().replace("beep", "beep"), 180);
+                            self.state.sound.play_standard(&s.to_lowercase().replace("beep", "beep"), 180);
                         }
                     }
-                    self.alarm_dialog = Some(a.clone());
+                    self.state.alarm_dialog = Some(a.clone());
                     // Разовый будильник после срабатывания выключается,
                     // повторяемый по дням остаётся включённым.
                     if effective_mask(&a).is_none() {
-                        let _ = self.db.set_alarm_enabled(a.id, false);
+                        let _ = self.state.db.set_alarm_enabled(a.id, false);
                     }
                     self.refresh_alarms();
                 }
             }
         }
         // Таймер
-        if let Some(end) = self.timer_end {
+        if let Some(end) = self.state.timer_end {
             if Instant::now() >= end {
-                self.timer_end = None;
-                let (u, f, s) = self.timer_data.clone();
+                self.state.timer_end = None;
+                let (u, f, s) = self.state.timer_data.clone();
                 if let Some(uu) = u {
                     if !uu.is_empty() {
                         SoundPlayer::open_url(&uu);
@@ -2824,41 +2631,41 @@ impl TrackerApp {
                     }
                 } else if let Some(ss) = s {
                     if !ss.is_empty() && ss != "Нет" {
-                        self.sound.play_standard("beep", 180);
+                        self.state.sound.play_standard("beep", 180);
                     }
                 }
-                self.timer_dialog = true;
+                self.state.timer_dialog = true;
             }
         }
         // Утренняя сводка один раз
-        if !self.morning_shown && self.started_at.elapsed() > Duration::from_secs(2) {
-            self.morning_shown = true;
-            let day = self.cfg_handle.day_start_hour;
+        if !self.state.morning_shown && self.state.started_at.elapsed() > Duration::from_secs(2) {
+            self.state.morning_shown = true;
+            let day = self.state.cfg_handle.day_start_hour;
             let key = game_day_key(&now, day);
-            let total: i64 = self.db.sessions_for_day(&key).iter().map(|(_, d)| *d).sum();
+            let total: i64 = self.state.db.sessions_for_day(&key).iter().map(|(_, d)| *d).sum();
             if total > 0 {
                 self.notify("Ежедневная сводка", &format!("В прошлый игровой день: {}", format_duration(total)));
             }
         }
         // Автоскан каждые 60 минут
-        if self.cfg_handle.auto_scan_enabled && self.last_autoscan.elapsed() > Duration::from_secs(60 * 60) {
-            self.last_autoscan = Instant::now();
+        if self.state.cfg_handle.auto_scan_enabled && self.state.last_autoscan.elapsed() > Duration::from_secs(60 * 60) {
+            self.state.last_autoscan = Instant::now();
             self.spawn_autoscan();
         }
         // GPU-кэш для вкладки Активные
-        if self.last_gpu_check.elapsed() > Duration::from_secs(5) {
+        if self.state.last_gpu_check.elapsed() > Duration::from_secs(5) {
             let snap = query_gpu();
-            self.gpu_usable_cache = snap.usable;
-            self.gpu_util_cache = snap.gpu_util_pct;
-            self.last_gpu_check = Instant::now();
+            self.state.gpu_usable_cache = snap.usable;
+            self.state.gpu_util_cache = snap.gpu_util_pct;
+            self.state.last_gpu_check = Instant::now();
         }
     }
 
     fn spawn_autoscan(&mut self) {
-        let games = self.games.clone();
-        let cfg = self.cfg.clone();
-        let api_key = self.cfg_handle.api_key.clone();
-        let steam_id = self.cfg_handle.steam_id.clone();
+        let games = self.state.games.clone();
+        let cfg = self.state.cfg.clone();
+        let api_key = self.state.cfg_handle.api_key.clone();
+        let steam_id = self.state.cfg_handle.steam_id.clone();
         std::thread::spawn(move || {
             let steam = detector::scan_steam_games(None);
             let win = detector::scan_windows_games();
@@ -2899,11 +2706,11 @@ impl TrackerApp {
             *games.write().unwrap() = final_list.clone();
             save_known_games(&final_list);
         });
-        self.scan_msg = "Автосканирование запущено в фоне…".to_string();
+        self.state.scan_msg = "Автосканирование запущено в фоне…".to_string();
     }
 
     fn update_tray_tooltip(&self) {
-        let act = self.active.read().unwrap();
+        let act = self.state.active.read().unwrap();
         let text = if act.is_empty() {
             "Tray Session".to_string()
         } else {
@@ -2922,7 +2729,7 @@ impl TrackerApp {
             }
             lines.join("\n")
         };
-        let _ = self.tx_tray.send(TrayCmd::Tooltip(text));
+        let _ = self.state.tx_tray.send(TrayCmd::Tooltip(text));
     }
 }
 
@@ -2935,24 +2742,24 @@ impl eframe::App for TrackerApp {
         self.check_alarms_timer();
         self.poll_shortcuts(ctx);
         // Подхватить флаг Steam-синхронизации из фонового автоскана.
-        let synced = self.cfg.read().unwrap().steam_synced;
-        if synced != self.cfg_handle.steam_synced {
-            self.cfg_handle.steam_synced = synced;
+        let synced = self.state.cfg.read().unwrap().steam_synced;
+        if synced != self.state.cfg_handle.steam_synced {
+            self.state.cfg_handle.steam_synced = synced;
         }
         // Автозапоминание всех изменений пользователя в файл.
         self.persist_if_changed();
         // Проверка обновлений по расписанию (раз в час / сутки / неделю).
         self.maybe_scheduled_update();
         // Ответ проверки обновлений (фоновая нить модуля update).
-        if let Some(rx) = &self.update_rx {
+        if let Some(rx) = &self.state.update_rx {
             if let Ok(info) = rx.try_recv() {
-                self.update_status = info.msg;
-                self.update_rx = None;
-                self.update_checking = false;
+                self.state.update_status = info.msg;
+                self.state.update_rx = None;
+                self.state.update_checking = false;
                 // Нашли обновление — включаем кнопку в правом верхнем углу.
                 if let Some(v) = info.new_version {
-                    if self.update_available.as_deref() != Some(v.as_str()) {
-                        self.update_available = Some(v.clone());
+                    if self.state.update_available.as_deref() != Some(v.as_str()) {
+                        self.state.update_available = Some(v.clone());
                         self.notify(
                             "Доступно обновление",
                             &format!("Tray Session {v} — нажмите жёлтую кнопку, чтобы поставить."),
@@ -2962,39 +2769,39 @@ impl eframe::App for TrackerApp {
                 // Пока показываем раздел «О программе» — продолжаем
                 // перерисовывать его, иначе результат может остаться
                 // неотображённым (окошко одно, и оно в фокусе).
-                if self.tab == Tab::About && self.about_sub == 0 {
+                if self.state.tab == Tab::About && self.state.about_sub == 0 {
                     ctx.request_repaint_after(Duration::from_millis(250));
                 }
             }
         }
-        if self.quit_requested {
+        if self.state.quit_requested {
             return;
         }
 
-        if self.last_agg_refresh.elapsed() > Duration::from_secs(3) {
+        if self.state.last_agg_refresh.elapsed() > Duration::from_secs(3) {
             self.refresh_agg();
         }
         // Тултип трея (дешёвый, раз в 5 сек)
-        if self.last_tooltip.elapsed() > Duration::from_secs(5) {
+        if self.state.last_tooltip.elapsed() > Duration::from_secs(5) {
             self.update_tray_tooltip();
-            self.last_tooltip = Instant::now();
+            self.state.last_tooltip = Instant::now();
         }
         // При переходе на Сессии/Будильники данные обновляем сразу
         // (вместо постоянного опроса).
-        if self.prev_tab != self.tab {
-            if self.tab == Tab::Sessions {
+        if self.state.prev_tab != self.state.tab {
+            if self.state.tab == Tab::Sessions {
                 self.refresh_agg();
             }
-            if self.tab == Tab::Alarms {
+            if self.state.tab == Tab::Alarms {
                 self.refresh_alarms();
             }
-            self.prev_tab = self.tab;
+            self.state.prev_tab = self.state.tab;
         }
 
         // Тема в цветах клиента Steam (окошко секундомера красится тоже — общий ctx)
         ctx.set_visuals(steam_visuals());
         // Масштаб интерфейса (читаемость на больших мониторах)
-        ctx.set_pixels_per_point(self.cfg_handle.ui_scale.clamp(0.8, 2.0));
+        ctx.set_pixels_per_point(self.state.cfg_handle.ui_scale.clamp(0.8, 2.0));
 
         // Левая панель навигации (компактно, как в PC Manager):
         // иконка + подпись, три состояния (неактивна / наведение / активна).
@@ -3004,8 +2811,8 @@ impl eframe::App for TrackerApp {
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 for (t, label) in NAV_ITEMS {
-                    if self.nav_item(ui, t, label, self.tab == t) {
-                        self.tab = t;
+                    if self.nav_item(ui, t, label, self.state.tab == t) {
+                        self.state.tab = t;
                     }
                     ui.add_space(4.0);
                 }
@@ -3027,7 +2834,7 @@ impl eframe::App for TrackerApp {
                         let ctx = ui.ctx().clone();
                         self.start_update_check(&ctx);
                     }
-                    let n_active = self
+                    let n_active = self.state
                         .active
                         .read()
                         .unwrap()
@@ -3061,8 +2868,8 @@ impl eframe::App for TrackerApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(m);
-                    if !self.status_msg.is_empty() {
-                        ui.colored_label(egui::Color32::YELLOW, &self.status_msg);
+                    if !self.state.status_msg.is_empty() {
+                        ui.colored_label(egui::Color32::YELLOW, &self.state.status_msg);
                     } else {
                         ui.colored_label(
                             ui.visuals().weak_text_color(),
@@ -3079,7 +2886,7 @@ impl eframe::App for TrackerApp {
             // и стоит в отдельной строке, а не поверх текста: так ничего
             // не перекрывается. Если обновления нет — строка не занимает
             // места вовсе.
-            let notice = self
+            let notice = self.state
                 .update_available
                 .clone()
                 .filter(|v| should_show_update_notice(Some(v)));
@@ -3111,7 +2918,7 @@ impl eframe::App for TrackerApp {
                             // разделов разъезжаются по ширине.
                             ui.set_min_width(inner_w);
                             ui.set_max_width(inner_w);
-                            match self.tab {
+                            match self.state.tab {
                                 Tab::Sessions => self.ui_sessions(ui),
                                 Tab::Games => self.ui_games(ui),
                                 Tab::Alarms => self.ui_alarms(ui),
@@ -3128,12 +2935,12 @@ impl eframe::App for TrackerApp {
         self.windows(ctx);
 
         // Маленькое окошко секундомера поверх всех окон.
-        if self.stopwatch_overlay {
+        if self.state.stopwatch_overlay {
             self.show_stopwatch_overlay(ctx);
         }
 
         // Тонкая полоска сессии поверх всех окон.
-        if self.strip_open {
+        if self.state.strip_open {
             self.show_session_strip(ctx);
         }
 
@@ -3142,10 +2949,10 @@ impl eframe::App for TrackerApp {
         // границы. Раз в 2 секунды проверяем положение обоих окошек и, если
         // они больше не помещаются целиком ни на одном мониторе, прижимаем их
         // к ближайшему видимому краю.
-        if (self.stopwatch_overlay || self.strip_open)
-            && self.last_edge_check.elapsed() > Duration::from_secs(2)
+        if (self.state.stopwatch_overlay || self.state.strip_open)
+            && self.state.last_edge_check.elapsed() > Duration::from_secs(2)
         {
-            self.last_edge_check = Instant::now();
+            self.state.last_edge_check = Instant::now();
             self.keep_windows_on_screen(ctx);
         }
 
@@ -3153,17 +2960,17 @@ impl eframe::App for TrackerApp {
         // поэтому при смене масштаба шлём размер в поинтах (без умножения
         // на ppp — иначе окно растёт в ppp раз больше нужного).
         let ppp = ctx.pixels_per_point();
-        if (ppp - self.last_ppp).abs() > 0.0001 {
-            self.last_ppp = ppp;
-            if self.stopwatch_overlay {
+        if (ppp - self.state.last_ppp).abs() > 0.0001 {
+            self.state.last_ppp = ppp;
+            if self.state.stopwatch_overlay {
                 ctx.send_viewport_cmd_to(
                     stopwatch_viewport_id(),
                     egui::ViewportCommand::InnerSize(
-                        stopwatch_window_size(self.stopwatch_expanded),
+                        stopwatch_window_size(self.state.stopwatch_expanded),
                     ),
                 );
             }
-            if self.strip_open {
+            if self.state.strip_open {
                 ctx.send_viewport_cmd_to(
                     strip_viewport_id(),
                     egui::ViewportCommand::InnerSize(strip_window_size()),
@@ -3175,24 +2982,24 @@ impl eframe::App for TrackerApp {
         // Секундомер с тысячными — 33 мс, иначе цифры стоят. Живые стрелки —
         // 250 мс, тикающие счётчики — 1 с. Открытый (но скрытый) оверлей держит
         // главное окно на 500 мс ради монитора сессий и фоновых задач.
-        let sw_running = self.stopwatch_running;
-        let sw_live = sw_running || self.stopwatch_overlay;
-        let any_enabled_alarm = self.alarms.iter().any(|a| a.enabled);
-        let any_active = !self.active.read().unwrap().is_empty();
+        let sw_running = self.state.stopwatch_running;
+        let sw_live = sw_running || self.state.stopwatch_overlay;
+        let any_enabled_alarm = self.state.alarms.iter().any(|a| a.enabled);
+        let any_active = !self.state.active.read().unwrap().is_empty();
         // Развёрнутое окошко секундомера показывает обратный отсчёт — ему
         // нужен свой непрерывный темп, иначе цифры стоят.
-        let fast = (self.tab == Tab::Alarms && self.show_analog && any_enabled_alarm)
-            || (self.tab == Tab::Timer && self.timer_end.is_some())
-            || (self.stopwatch_expanded && self.stopwatch_overlay && self.timer_end.is_some())
+        let fast = (self.state.tab == Tab::Alarms && self.state.show_analog && any_enabled_alarm)
+            || (self.state.tab == Tab::Timer && self.state.timer_end.is_some())
+            || (self.state.stopwatch_expanded && self.state.stopwatch_overlay && self.state.timer_end.is_some())
             // Проверка обновлений: крутим спиннер в разделе «О программе».
-            || (self.tab == Tab::About && self.about_sub == 0 && self.update_checking);
+            || (self.state.tab == Tab::About && self.state.about_sub == 0 && self.state.update_checking);
         // Мини-трей тикает по секундам, поэтому 1 с; при активной игре — чаще.
-        let slow = (self.tab == Tab::Sessions && any_active)
-            || (self.tab == Tab::Alarms && any_enabled_alarm)
-            || self.strip_open
+        let slow = (self.state.tab == Tab::Sessions && any_active)
+            || (self.state.tab == Tab::Alarms && any_enabled_alarm)
+            || self.state.strip_open
             // Живой обратный отсчёт в развёрнутом окошке секундомера.
-            || (self.stopwatch_expanded && self.stopwatch_overlay);
-        if sw_running && self.tab == Tab::Timer {
+            || (self.state.stopwatch_expanded && self.state.stopwatch_overlay);
+        if sw_running && self.state.tab == Tab::Timer {
             ctx.request_repaint_after(Duration::from_millis(33));
         } else if sw_live {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -3200,9 +3007,9 @@ impl eframe::App for TrackerApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         } else if slow {
             ctx.request_repaint_after(Duration::from_millis(1000));
-        } else if !self.morning_shown {
+        } else if !self.state.morning_shown {
             ctx.request_repaint_after(Duration::from_millis(2000));
-        } else if self.cfg_handle.auto_scan_enabled {
+        } else if self.state.cfg_handle.auto_scan_enabled {
             ctx.request_repaint_after(Duration::from_secs(60));
         }
     }
@@ -3280,7 +3087,7 @@ impl TrackerApp {
         page_title(ui, "Сессии");
         // Живые сессии сверху (компактно, бывшая вкладка «Активные»).
         let now = Local::now();
-        let act: Vec<ActiveInfo> = self.active.read().unwrap().values().cloned().collect();
+        let act: Vec<ActiveInfo> = self.state.active.read().unwrap().values().cloned().collect();
         card(ui, "Сейчас идёт", |ui| {
             if act.is_empty() {
                 ui.weak("Нет активных сессий — запустите игру, подсчёт стартует сам.");
@@ -3307,15 +3114,15 @@ impl TrackerApp {
         }});
         card(ui, "Полоска сессии и GPU", |ui| {
             ui.horizontal_wrapped(|ui| {
-                let mut open = self.strip_open;
+                let mut open = self.state.strip_open;
                 ui.checkbox(&mut open, "Тонкая полоска сессии (как в uTorrent)");
-                if open != self.strip_open {
+                if open != self.state.strip_open {
                     self.set_strip_open(open);
                 }
-                let mut pinned = self.strip_pinned;
+                let mut pinned = self.state.strip_pinned;
                 ui.checkbox(&mut pinned, "Закреплена (PIN)");
-                if pinned != self.strip_pinned {
-                    self.strip_pinned = pinned;
+                if pinned != self.state.strip_pinned {
+                    self.state.strip_pinned = pinned;
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -3340,11 +3147,11 @@ impl TrackerApp {
                                     7 => "↓",
                                     _ => "↘",
                                 };
-                                if ui.selectable_label(self.strip_pos == idx, label).clicked()
-                                    && self.strip_pos != idx
+                                if ui.selectable_label(self.state.strip_pos == idx, label).clicked()
+                                    && self.state.strip_pos != idx
                                 {
-                                    self.strip_pos = idx;
-                                    if self.strip_open {
+                                    self.state.strip_pos = idx;
+                                    if self.state.strip_open {
                                         self.snap_strip();
                                         // Мгновенный отклик пресетов.
                                         ui.ctx().request_repaint_after_for(
@@ -3359,12 +3166,12 @@ impl TrackerApp {
                     });
                 ui.label("Прозрачность:");
                 ui.add(
-                    egui::Slider::new(&mut self.strip_opacity_pct, 5.0..=100.0)
+                    egui::Slider::new(&mut self.state.strip_opacity_pct, 5.0..=100.0)
                         .fixed_decimals(0)
                         .show_value(false),
                 );
-                self.strip_opacity_pct = self.strip_opacity_pct.clamp(5.0, 100.0);
-                ui.label(format!("{}%", self.strip_opacity_pct.round() as i32));
+                self.state.strip_opacity_pct = self.state.strip_opacity_pct.clamp(5.0, 100.0);
+                ui.label(format!("{}%", self.state.strip_opacity_pct.round() as i32));
             });
             // Полоска живёт поверх всех окон, поэтому кликнуть кнопки сетки
             // и слайдер, пока она открыта, нельзя. Дублируем управление
@@ -3376,12 +3183,12 @@ impl TrackerApp {
             .small());
             ui.label(format!(
                 "GPU-детект: {} | utilization: {}% | гейт: {} | VRAM≥{}МБ, fallback CPU≥{:.1}%/RAM≥{}МБ",
-                if self.gpu_usable_cache { "NVML доступен" } else { "NVML нет (fallback CPU/RAM)" },
-                self.gpu_util_cache,
-                if self.cfg_handle.require_gpu { "строгий (игра=GPU)" } else { "мягкий" },
-                self.cfg_handle.min_vram_mb,
-                self.cfg_handle.min_cpu_pct,
-                self.cfg_handle.min_ram_mb,
+                if self.state.gpu_usable_cache { "NVML доступен" } else { "NVML нет (fallback CPU/RAM)" },
+                self.state.gpu_util_cache,
+                if self.state.cfg_handle.require_gpu { "строгий (игра=GPU)" } else { "мягкий" },
+                self.state.cfg_handle.min_vram_mb,
+                self.state.cfg_handle.min_cpu_pct,
+                self.state.cfg_handle.min_ram_mb,
             ));
         });
         card(ui, "Таблица сессий", |ui| {
@@ -3396,20 +3203,20 @@ impl TrackerApp {
                     if ui.button("Экспорт CSV").clicked() {
                         self.export_csv();
                     }
-                    ui.checkbox(&mut self.show_id_col, "№");
-                    ui.checkbox(&mut self.show_pct_col, "%");
-                    ui.checkbox(&mut self.show_last_col, "Запускал");
-                    ui.checkbox(&mut self.show_runs_col, "Сессий");
+                    ui.checkbox(&mut self.state.show_id_col, "№");
+                    ui.checkbox(&mut self.state.show_pct_col, "%");
+                    ui.checkbox(&mut self.state.show_last_col, "Запускал");
+                    ui.checkbox(&mut self.state.show_runs_col, "Сессий");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(CARD_INNER);
-                    let total: i64 = self.agg.iter().map(|r| r.total_duration).sum();
+                    let total: i64 = self.state.agg.iter().map(|r| r.total_duration).sum();
                     ui.label(format!("Общее время: {}", format_duration(total)));
                 });
             });
             page_rule(ui);
-        let total_all: i64 = self.agg.iter().map(|r| r.total_duration).sum();
-        let active_map = self.active.read().unwrap().clone();
+        let total_all: i64 = self.state.agg.iter().map(|r| r.total_duration).sum();
+        let active_map = self.state.active.read().unwrap().clone();
 
         table_scroll(ui, "sess_scroll", 220.0, |ui| {
             // Ширины колонок — доли ширины блока (как в таблицах игр и
@@ -3422,16 +3229,16 @@ impl TrackerApp {
             let (w_game, w_total, w_pct, w_last, w_runs) =
                 (ws[0], ws[1], ws[2], ws[3], ws[4]);
             egui::Grid::new("sess_grid").num_columns(6).striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
-                if self.show_id_col { tcell(ui, w_id, |ui| { ui.strong("№"); }); }
+                if self.state.show_id_col { tcell(ui, w_id, |ui| { ui.strong("№"); }); }
                 tcell(ui, w_game, |ui| { ui.strong("Игра"); });
                 tcell(ui, w_total, |ui| { ui.strong("Общее время"); });
-                if self.show_pct_col { tcell(ui, w_pct, |ui| { ui.strong("% от общего"); }); }
-                if self.show_last_col { tcell(ui, w_last, |ui| { ui.strong("Запускал"); }); }
-                if self.show_runs_col { tcell(ui, w_runs, |ui| { ui.strong("Сессий"); }); }
+                if self.state.show_pct_col { tcell(ui, w_pct, |ui| { ui.strong("% от общего"); }); }
+                if self.state.show_last_col { tcell(ui, w_last, |ui| { ui.strong("Запускал"); }); }
+                if self.state.show_runs_col { tcell(ui, w_runs, |ui| { ui.strong("Сессий"); }); }
                 tcell(ui, ACTIONS_W, |_ui| {});
                 ui.end_row();
-                for (i, row) in self.agg.clone().iter().enumerate() {
-                    if self.show_id_col { tcell(ui, w_id, |ui| { ui.label(format!("{}", i + 1)); }); }
+                for (i, row) in self.state.agg.clone().iter().enumerate() {
+                    if self.state.show_id_col { tcell(ui, w_id, |ui| { ui.label(format!("{}", i + 1)); }); }
                     let is_live = active_map.values().any(|a| !a.pending && a.game_name == row.game_name);
                     tcell(ui, w_game, |ui| {
                         if is_live {
@@ -3444,13 +3251,13 @@ impl TrackerApp {
                     tcell(ui, w_total, |ui| {
                         ui.label(format_duration(row.total_duration));
                     });
-                    if self.show_pct_col {
+                    if self.state.show_pct_col {
                         let pct = if total_all > 0 { row.total_duration as f64 / total_all as f64 * 100.0 } else { 0.0 };
                         tcell(ui, w_pct, |ui| {
                             ui.label(format!("{pct:.2}%"));
                         });
                     }
-                    if self.show_last_col {
+                    if self.state.show_last_col {
                         let s = if row.last_start.is_empty() { "—".to_string() } else {
                             chrono::DateTime::parse_from_rfc3339(&row.last_start)
                                 .map(|d| d.with_timezone(&Local).format("%H:%M %Y-%m-%d").to_string())
@@ -3460,7 +3267,7 @@ impl TrackerApp {
                             ui.add(egui::Label::new(s).truncate());
                         });
                     }
-                    if self.show_runs_col {
+                    if self.state.show_runs_col {
                         let runs = format!("{}", row.runs);
                         tcell(ui, w_runs, |ui| {
                             ui.label(runs);
@@ -3468,7 +3275,7 @@ impl TrackerApp {
                     }
                     tcell(ui, ACTIONS_W, |ui| {
                         if ui.small_button("Детали").clicked() {
-                            self.detail_game = Some(row.game_name.clone());
+                            self.state.detail_game = Some(row.game_name.clone());
                         }
                     });
                     ui.end_row();
@@ -3490,7 +3297,7 @@ impl TrackerApp {
             if ui.button("Сканировать Windows").clicked() {
                 let found = detector::scan_windows_games();
                 if found.is_empty() {
-                    self.scan_msg = "В реестре ничего игрового не найдено.".to_string();
+                    self.state.scan_msg = "В реестре ничего игрового не найдено.".to_string();
                 } else {
                     self.merge_scan(found, "Windows");
                 }
@@ -3499,29 +3306,29 @@ impl TrackerApp {
                 self.pick_folder();
             }
             if ui.button("Из активных процессов").clicked() {
-                self.show_picker = true;
+                self.state.show_picker = true;
                 self.refresh_picker_list();
             }
             if ui.button("Вручную (exe)").clicked() {
                 self.pick_exe_manual();
             }
             });
-            if !self.scan_msg.is_empty() {
-                ui.colored_label(egui::Color32::LIGHT_BLUE, &self.scan_msg);
+            if !self.state.scan_msg.is_empty() {
+                ui.colored_label(egui::Color32::LIGHT_BLUE, &self.state.scan_msg);
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Поиск:");
-                ui.text_edit_singleline(&mut self.search);
+                ui.text_edit_singleline(&mut self.state.search);
             });
-            let games = self.games.read().unwrap().clone();
-            let q = self.search.to_lowercase();
+            let games = self.state.games.read().unwrap().clone();
+            let q = self.state.search.to_lowercase();
             // Наши сессии по играм: дельты, прибавляемые к общему Steam.
-            let ours: std::collections::HashMap<String, i64> = self
+            let ours: std::collections::HashMap<String, i64> = self.state
                 .agg
                 .iter()
                 .map(|r| (r.game_name.clone(), r.total_duration))
                 .collect();
-            let synced = self.cfg_handle.steam_synced;
+            let synced = self.state.cfg_handle.steam_synced;
             // Отзывчивая таблица: колонки — доли ширины окна, длинные пути режутся
             // многоточием (полные — в ховере). При сужении окна таблица сжимается.
             table_scroll(ui, "games_scroll", 320.0, |ui| {
@@ -3588,16 +3395,16 @@ impl TrackerApp {
         // Подраздел 2: Steam Web API + общее время.
         card(ui, "Steam Web API и общее время", |ui| {
             ui.label("API key:");
-            ui.text_edit_singleline(&mut self.api_key);
+            ui.text_edit_singleline(&mut self.state.api_key);
             ui.label("SteamID64:");
-            ui.text_edit_singleline(&mut self.steam_id);
+            ui.text_edit_singleline(&mut self.state.steam_id);
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Сохранить").clicked() {
-                    self.cfg_handle.api_key = self.api_key.clone();
-                    self.cfg_handle.steam_id = self.steam_id.clone();
-                    *self.cfg.write().unwrap() = self.cfg_handle.clone();
-                    self.cfg_handle.save();
-                    self.scan_msg = "API-настройки сохранены.".to_string();
+                    self.state.cfg_handle.api_key = self.state.api_key.clone();
+                    self.state.cfg_handle.steam_id = self.state.steam_id.clone();
+                    *self.state.cfg.write().unwrap() = self.state.cfg_handle.clone();
+                    self.state.cfg_handle.save();
+                    self.state.scan_msg = "API-настройки сохранены.".to_string();
                 }
                 if ui.button("Сканировать через Steam API").clicked() {
                     self.scan_api();
@@ -3636,7 +3443,7 @@ impl TrackerApp {
                 }
                 tcell(ui, 205.0, |_ui| {});
                 ui.end_row();
-                for a in self.alarms.clone() {
+                for a in self.state.alarms.clone() {
                     let mask = effective_mask(&a);
                     trunc_cell(ui, ws[0], &a.time, &a.time);
                     // Анимированный обратный отсчёт (ч, м, с) для активных
@@ -3671,16 +3478,16 @@ impl TrackerApp {
                         let mut en = a.enabled;
                         if ui.small_button(if en { "Выкл" } else { "Вкл" }).clicked() {
                             en = !en;
-                            let _ = self.db.set_alarm_enabled(a.id, en);
+                            let _ = self.state.db.set_alarm_enabled(a.id, en);
                             self.refresh_alarms();
                         }
                         // Изменение времени и дней — в любой момент, в т.ч. для неактивных
                         if ui.small_button("Изменить").clicked() {
                             let (h, m) = parse_hm(&a.time).unwrap_or((8, 0));
-                            self.edit_alarm = Some((a.id, h as i32, m as i32, mask.unwrap_or([false; 7])));
+                            self.state.edit_alarm = Some((a.id, h as i32, m as i32, mask.unwrap_or([false; 7])));
                         }
                         if ui.small_button("Удалить").clicked() {
-                            let _ = self.db.delete_alarm(a.id);
+                            let _ = self.state.db.delete_alarm(a.id);
                             self.refresh_alarms();
                         }
                         });
@@ -3693,14 +3500,14 @@ impl TrackerApp {
         card(ui, "Новый будильник", |ui| {
         ui.horizontal(|ui| {
             ui.label("Час:");
-            time_field(ui, &mut self.alarm_h, 23);
+            time_field(ui, &mut self.state.alarm_h, 23);
             ui.label("Мин:");
-            time_field(ui, &mut self.alarm_m, 59);
+            time_field(ui, &mut self.state.alarm_m, 59);
         });
         // Дни недели галочками + пресеты. Ничего не отмечено = разовый.
         ui.horizontal_wrapped(|ui| {
             ui.label("Дни:");
-            Self::day_picker(ui, &mut self.alarm_days);
+            Self::day_picker(ui, &mut self.state.alarm_days);
         });
         ui.horizontal_wrapped(|ui| {
             // Подпись+поле — неразрывный модуль: при переносе уходят вместе.
@@ -3714,7 +3521,7 @@ impl TrackerApp {
             ui.horizontal(|ui| {
                 ui.label("URL:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.alarm_url)
+                    egui::TextEdit::singleline(&mut self.state.alarm_url)
                         .hint_text("Вставьте URL (Ctrl+Shift+V)")
                         .desired_width(url_w),
                 );
@@ -3722,7 +3529,7 @@ impl TrackerApp {
             ui.horizontal(|ui| {
                 ui.label("Звук:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.alarm_sound)
+                    egui::TextEdit::singleline(&mut self.state.alarm_sound)
                         .hint_text("Медиафайл")
                         .desired_width(snd_w),
                 );
@@ -3739,53 +3546,53 @@ impl TrackerApp {
                         )
                         .pick_file()
                     {
-                        self.alarm_sound = p.to_string_lossy().to_string();
+                        self.state.alarm_sound = p.to_string_lossy().to_string();
                     }
                 }
             });
             ui.label("Станд.:").on_hover_text(STD_SOUND_TIP);
             egui::ComboBox::from_id_source("alarm_std_combo")
-                .selected_text(&self.alarm_std)
+                .selected_text(&self.state.alarm_std)
                 .show_ui(ui, |ui| {
                 for s in ["Нет", "Beep", "Bell"] {
-                    ui.selectable_value(&mut self.alarm_std, s.to_string(), s);
+                    ui.selectable_value(&mut self.state.alarm_std, s.to_string(), s);
                 }
             });
             if ui.button("Добавить").clicked() {
-                let t = format!("{:02}:{:02}", self.alarm_h, self.alarm_m);
-                let std = if self.alarm_std == "Нет" { None } else { Some(self.alarm_std.as_str()) };
+                let t = format!("{:02}:{:02}", self.state.alarm_h, self.state.alarm_m);
+                let std = if self.state.alarm_std == "Нет" { None } else { Some(self.state.alarm_std.as_str()) };
                 let days_str;
-                let (daily, days) = if self.alarm_days.iter().any(|x| *x) {
-                    days_str = bools_to_mask(&self.alarm_days);
+                let (daily, days) = if self.state.alarm_days.iter().any(|x| *x) {
+                    days_str = bools_to_mask(&self.state.alarm_days);
                     (days_str == "1111111", Some(days_str.as_str()))
                 } else {
                     (false, None)
                 };
-                let _ = self.db.add_alarm(
+                let _ = self.state.db.add_alarm(
                     &t, daily,
-                    if self.alarm_url.is_empty() { None } else { Some(self.alarm_url.as_str()) },
-                    if self.alarm_sound.is_empty() { None } else { Some(self.alarm_sound.as_str()) },
+                    if self.state.alarm_url.is_empty() { None } else { Some(self.state.alarm_url.as_str()) },
+                    if self.state.alarm_sound.is_empty() { None } else { Some(self.state.alarm_sound.as_str()) },
                     std,
                     days,
                 );
                 self.refresh_alarms();
-                self.alarm_url.clear();
-                self.alarm_sound.clear();
+                self.state.alarm_url.clear();
+                self.state.alarm_sound.clear();
             }
         });
         });
 
         // --- Аналоговые часы активного будильника: НИЖЕ списка,
         // --- чтобы таблица и все кнопки действий всегда оставались на месте.
-        let enabled: Vec<AlarmRow> = self.alarms.iter().filter(|a| a.enabled).cloned().collect();
+        let enabled: Vec<AlarmRow> = self.state.alarms.iter().filter(|a| a.enabled).cloned().collect();
         if !enabled.is_empty() {
         card(ui, "Аналоговые часы", |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.show_analog, "Аналоговые часы для активного будильника");
+                ui.checkbox(&mut self.state.show_analog, "Аналоговые часы для активного будильника");
             });
-            if self.show_analog {
+            if self.state.show_analog {
             // Выбор будильника для часов: закреплённый или ближайший
-            let chosen_id = match self.analog_alarm_id {
+            let chosen_id = match self.state.analog_alarm_id {
                 Some(id) if enabled.iter().any(|a| a.id == id) => id,
                 _ => nearest_alarm_id(&enabled).unwrap_or(enabled[0].id),
             };
@@ -3812,7 +3619,7 @@ impl TrackerApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("{} ({}) — {}", a.time, mask_label(a), rem_txt));
                             if ui.small_button("На часы").clicked() {
-                                self.analog_alarm_id = Some(a.id);
+                                self.state.analog_alarm_id = Some(a.id);
                             }
                         });
                     }
@@ -3864,14 +3671,14 @@ impl TrackerApp {
         });
         ui.horizontal(|ui| {
             ui.label("Минуты:");
-            time_field(ui, &mut self.timer_min, 1440);
-            self.timer_min = self.timer_min.max(1);
+            time_field(ui, &mut self.state.timer_min, 1440);
+            self.state.timer_min = self.state.timer_min.max(1);
             if ui.button("Запустить").clicked() {
-                self.start_timer(self.timer_min as u64 * 60);
+                self.start_timer(self.state.timer_min as u64 * 60);
             }
             if ui.button("Стоп").clicked() {
-                self.timer_end = None;
-                self.sound.stop();
+                self.state.timer_end = None;
+                self.state.sound.stop();
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -3883,7 +3690,7 @@ impl TrackerApp {
             ui.horizontal(|ui| {
                 ui.label("URL:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.timer_url)
+                    egui::TextEdit::singleline(&mut self.state.timer_url)
                         .hint_text("Вставьте URL (Ctrl+Shift+V)")
                         .desired_width(url_w),
                 );
@@ -3891,36 +3698,36 @@ impl TrackerApp {
             ui.horizontal(|ui| {
                 ui.label("Звук:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.timer_sound)
+                    egui::TextEdit::singleline(&mut self.state.timer_sound)
                         .hint_text("Медиафайл")
                         .desired_width(snd_w),
                 );
             });
             ui.label("Станд.:").on_hover_text(STD_SOUND_TIP);
             egui::ComboBox::from_id_source("timer_std_combo")
-                .selected_text(&self.timer_std)
+                .selected_text(&self.state.timer_std)
                 .show_ui(ui, |ui| {
                 for s in ["Нет", "Beep", "Bell"] {
-                    ui.selectable_value(&mut self.timer_std, s.to_string(), s);
+                    ui.selectable_value(&mut self.state.timer_std, s.to_string(), s);
                 }
             });
         });
-        if let Some(end) = self.timer_end {
+        if let Some(end) = self.state.timer_end {
             let rem_d = end.saturating_duration_since(Instant::now());
             let rem = rem_d.as_secs();
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.strong("Аналоговый таймер:");
-                    draw_timer_dial(ui, 180.0, rem_d, self.timer_total);
+                    draw_timer_dial(ui, 180.0, rem_d, self.state.timer_total);
                 });
                 ui.separator();
                 ui.vertical(|ui| {
                     ui.heading(format!("Осталось: {:02}:{:02}", rem / 60, rem % 60));
-                    ui.label(format!("Всего: {} мин", self.timer_total / 60));
+                    ui.label(format!("Всего: {} мин", self.state.timer_total / 60));
                     if ui.button("Стоп").clicked() {
-                        self.timer_end = None;
-                        self.sound.stop();
+                        self.state.timer_end = None;
+                        self.state.sound.stop();
                     }
                 });
             });
@@ -3950,20 +3757,20 @@ impl TrackerApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let mut ov = self.stopwatch_overlay;
+            let mut ov = self.state.stopwatch_overlay;
             ui.checkbox(&mut ov, "Окошко поверх всех окон (минимум, таскается за фон)");
-            if ov != self.stopwatch_overlay {
+            if ov != self.state.stopwatch_overlay {
                 self.set_stopwatch_overlay(ov);
             }
-            let mut pinned = self.stopwatch_pinned;
+            let mut pinned = self.state.stopwatch_pinned;
             ui.checkbox(&mut pinned, "Закреплено (PIN): не таскается");
-            if pinned != self.stopwatch_pinned {
+            if pinned != self.state.stopwatch_pinned {
                 self.toggle_stopwatch_pin();
             }
             // Расширение имеет смысл только у открытого окошка.
-            let mut exp = self.stopwatch_expanded;
+            let mut exp = self.state.stopwatch_expanded;
             ui.checkbox(&mut exp, "Развёрнутое: вдвое больше + таймер обратного отсчёта");
-            if exp != self.stopwatch_expanded {
+            if exp != self.state.stopwatch_expanded {
                 let ctx = ui.ctx().clone();
                 self.set_stopwatch_expanded(&ctx, exp);
             }
@@ -3971,36 +3778,36 @@ impl TrackerApp {
         ui.horizontal_wrapped(|ui| {
             ui.label("Прозрачность окошка:");
             ui.add(
-                egui::Slider::new(&mut self.stopwatch_opacity_pct, 2.0..=100.0)
+                egui::Slider::new(&mut self.state.stopwatch_opacity_pct, 2.0..=100.0)
                     .fixed_decimals(0)
                     .show_value(false),
             );
-            ui.label(format!("{}%", self.stopwatch_opacity_pct.round() as i32));
+            ui.label(format!("{}%", self.state.stopwatch_opacity_pct.round() as i32));
             ui.label(egui::RichText::new("(Ctrl+Num+/Num− — только когда закреплено)").weak());
         });
         ui.label(format!(
             "Шорткаты: старт/пауза — {}, круг — {}, стоп — {}, Pin — {} (до 99 кругов за один забег).",
-            self.shortcuts.binding_str("stopwatch_toggle"),
-            self.shortcuts.binding_str("stopwatch_lap"),
-            self.shortcuts.binding_str("stopwatch_stop"),
-            self.shortcuts.binding_str("stopwatch_pin")
+            self.state.shortcuts.binding_str("stopwatch_toggle"),
+            self.state.shortcuts.binding_str("stopwatch_lap"),
+            self.state.shortcuts.binding_str("stopwatch_stop"),
+            self.state.shortcuts.binding_str("stopwatch_pin")
         ));
-        if !self.stopwatch_laps.is_empty() {
+        if !self.state.stopwatch_laps.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Круги: {} / 99", self.stopwatch_laps.len()));
+                ui.strong(format!("Круги: {} / 99", self.state.stopwatch_laps.len()));
                 // Явные стрелки прокрутки (колесо мыши тоже работает).
                 if ui.small_button("▲").clicked() {
-                    self.laps_scroll = (self.laps_scroll - 60.0).max(0.0);
+                    self.state.laps_scroll = (self.state.laps_scroll - 60.0).max(0.0);
                 }
                 if ui.small_button("▼").clicked() {
-                    self.laps_scroll += 60.0;
+                    self.state.laps_scroll += 60.0;
                 }
             });
             let lw = ui.available_width();
             let laps_out = egui::ScrollArea::vertical()
                 .max_height(220.0)
                 .auto_shrink([false, false])
-                .vertical_scroll_offset(self.laps_scroll)
+                .vertical_scroll_offset(self.state.laps_scroll)
                 .show(ui, |ui| {
                     // Фиксированная ширина: сетка по содержимому вылезала
                     // за край карточки на длинных значениях времени.
@@ -4012,7 +3819,7 @@ impl TrackerApp {
                         ui.strong("Общее");
                         ui.end_row();
                         let mut prev = Duration::ZERO;
-                        for (i, lap) in self.stopwatch_laps.clone().iter().enumerate() {
+                        for (i, lap) in self.state.stopwatch_laps.clone().iter().enumerate() {
                             ui.label(format!("{}", i + 1));
                             ui.label(format_stopwatch(lap.saturating_sub(prev)));
                             ui.label(format_stopwatch(*lap));
@@ -4021,7 +3828,7 @@ impl TrackerApp {
                         }
                     });
                 });
-            self.laps_scroll = laps_out.state.offset.y;
+            self.state.laps_scroll = laps_out.state.offset.y;
         }
         });
     }
@@ -4037,17 +3844,17 @@ impl TrackerApp {
             }
             // Слева меньше, справа больше: [−][ползунок][+].
             if ui.small_button("−").clicked() {
-                self.commit_scale(self.cfg_handle.ui_scale - 0.05);
+                self.commit_scale(self.state.cfg_handle.ui_scale - 0.05);
             }
-            let committed = self.cfg_handle.ui_scale.clamp(0.8, 2.0);
-            let mut draft = self.scale_draft.unwrap_or(committed);
+            let committed = self.state.cfg_handle.ui_scale.clamp(0.8, 2.0);
+            let mut draft = self.state.scale_draft.unwrap_or(committed);
             let resp = ui.add(
                 egui::Slider::new(&mut draft, 0.8..=2.0)
                     .fixed_decimals(2)
                     .show_value(false),
             );
             if resp.changed() {
-                self.scale_draft = Some(draft);
+                self.state.scale_draft = Some(draft);
                 if !resp.dragged() {
                     // Изменение не перетаскиванием (клавиатура) —
                     // дискретный шаг, применяем сразу.
@@ -4058,16 +3865,16 @@ impl TrackerApp {
                 self.commit_scale(draft);
             }
             if ui.small_button("+").clicked() {
-                self.commit_scale(self.cfg_handle.ui_scale + 0.05);
+                self.commit_scale(self.state.cfg_handle.ui_scale + 0.05);
             }
-            let shown = self.scale_draft.unwrap_or(committed);
+            let shown = self.state.scale_draft.unwrap_or(committed);
             ui.label(format!("{}%", (shown / BASE_SCALE * 100.0).round() as i32))
                 .on_hover_text("100% = базовый масштаб (бывшие 130%)");
         });
         });
         // Обновления: частота, автоматическая проверка, «ставить молча».
         card(ui, "Обновления", |ui| {
-            let mut c = self.cfg_handle.clone();
+            let mut c = self.state.cfg_handle.clone();
             // Сравниваем с черновиком `c`, а не с сохранённым значением:
             // иначе выбранный вариант не подсвечивался бы до нажатия
             // «Сохранить» — список как будто не реагирует на клик.
@@ -4123,27 +3930,27 @@ impl TrackerApp {
                 )
                 .wrap(),
             );
-            let changed = c.update_freq != self.cfg_handle.update_freq
-                || c.update_auto != self.cfg_handle.update_auto
-                || c.update_silent != self.cfg_handle.update_silent
+            let changed = c.update_freq != self.state.cfg_handle.update_freq
+                || c.update_auto != self.state.cfg_handle.update_auto
+                || c.update_silent != self.state.cfg_handle.update_silent
                 || crate::update::normalize_channel(&c.update_channel)
-                    != crate::update::normalize_channel(&self.cfg_handle.update_channel);
+                    != crate::update::normalize_channel(&self.state.cfg_handle.update_channel);
             if ui
                 .add_enabled(changed, egui::Button::new("Сохранить настройки обновлений"))
                 .clicked()
             {
-                if let Ok(mut g) = self.cfg.write() {
+                if let Ok(mut g) = self.state.cfg.write() {
                     *g = c.clone();
                 }
-                self.cfg_handle = c.clone();
+                self.state.cfg_handle = c.clone();
                 self.persist_if_changed();
-                self.status_msg = "Настройки обновлений сохранены.".to_string();
+                self.state.status_msg = "Настройки обновлений сохранены.".to_string();
             }
         });
         // Авто-трекинг живёт здесь (переехал из вкладки «Игры»).
         card(ui, "Авто-трекинг (GPU-гейт)", |ui| {
         ui.collapsing("Настройки", |ui| {
-            let mut c = self.cfg_handle.clone();
+            let mut c = self.state.cfg_handle.clone();
             ui.checkbox(&mut c.require_gpu, "Требовать нагрузку на видеокарту (лаунчер без VRAM игнорируется)");
             ui.add(egui::Slider::new(&mut c.min_vram_mb, 0..=2000).text("Мин. VRAM процесса (МБ)"));
             ui.add(egui::Slider::new(&mut c.min_cpu_pct, 0.0..=50.0).text("Мин. CPU для fallback (%, без NVML)"));
@@ -4154,21 +3961,21 @@ impl TrackerApp {
             ui.add(egui::Slider::new(&mut c.day_start_hour, 0..=23).text("Начало игровых суток (час)"));
             ui.checkbox(&mut c.auto_scan_enabled, "Автосканирование каждый час");
             if ui.button("Применить").clicked() {
-                if let Ok(mut g) = self.cfg.write() {
+                if let Ok(mut g) = self.state.cfg.write() {
                     *g = c.clone();
                 }
                 // day_start_hour влияет на БД
-                self.db.set_day_start_hour(c.day_start_hour);
-                self.cfg_handle = c.clone();
+                self.state.db.set_day_start_hour(c.day_start_hour);
+                self.state.cfg_handle = c.clone();
                 c.save();
-                self.scan_msg = "Настройки трекинга применены.".to_string();
+                self.state.scan_msg = "Настройки трекинга применены.".to_string();
             }
             ui.label("Как это работает: каждый опрос сверяем процессы с вашим списком игр; PID проверяем в NVML. Есть VRAM выше порога — идёт игра, стартует/продолжается сессия. Нет — это лаунчер/фон, сессия не пишется.");
         });
         });
         card(ui, "Горячие клавиши и кнопки мыши", |ui| {
         ui.label("Нажмите «Изменить», затем клавиши (с Ctrl/Alt/Shift) или кнопку мыши — подойдут и дополнительные Mouse4/Mouse5. Сохраняется автоматически в shortcuts.json. Esc в режиме захвата — отмена (поэтому Esc назначить нельзя).");
-        if let Some(id) = self.capture_action.clone() {
+        if let Some(id) = self.state.capture_action.clone() {
             ui.colored_label(
                 egui::Color32::YELLOW,
                 format!("Нажмите клавиши или кнопку мыши для «{}»… (Esc — отмена)", action_label(&id)),
@@ -4196,17 +4003,17 @@ impl TrackerApp {
                     for a in crate::shortcuts::ACTIONS {
                         // Название действия переносится по словам.
                         wrap_cell(ui, cols[0], a.label);
-                        let mut txt = self.shortcuts.binding_str(a.id);
-                        if self.shortcuts.is_custom(a.id) {
+                        let mut txt = self.state.shortcuts.binding_str(a.id);
+                        if self.state.shortcuts.is_custom(a.id) {
                             txt += " *";
                         }
                         wrap_cell(ui, cols[1], &txt);
                         if ui.small_button("Изменить").clicked() {
-                            self.capture_action = Some(a.id.to_string());
-                            self.capture_armed_at = ui.ctx().input(|i| i.time);
+                            self.state.capture_action = Some(a.id.to_string());
+                            self.state.capture_armed_at = ui.ctx().input(|i| i.time);
                         }
                         if ui.small_button("Сброс").clicked() {
-                            self.shortcuts.reset(a.id);
+                            self.state.shortcuts.reset(a.id);
                         }
                         ui.end_row();
                     }
@@ -4214,8 +4021,8 @@ impl TrackerApp {
         });
         ui.horizontal_wrapped(|ui| {
             if ui.button("Сбросить всё").clicked() {
-                self.shortcuts.reset_all();
-                self.status_msg = "Шорткаты сброшены к умолчаниям.".to_string();
+                self.state.shortcuts.reset_all();
+                self.state.status_msg = "Шорткаты сброшены к умолчаниям.".to_string();
             }
             ui.label("* — своё назначение.");
         });
@@ -4229,7 +4036,7 @@ impl TrackerApp {
             "Горячие клавиши (настраиваются во вкладке «Параметры», сохраняются автоматически — этот список обновляется сам):\n",
         );
         for a in crate::shortcuts::ACTIONS {
-            s += &format!("• {} — {}\n", a.label, self.shortcuts.binding_str(a.id));
+            s += &format!("• {} — {}\n", a.label, self.state.shortcuts.binding_str(a.id));
         }
         s += "Шорткаты с буквами работают, когда фокус не в поле ввода; Alt+цифры, мышь и закрытие диалогов — всегда. В диалогах быстрого будильника/таймера Enter подтверждает, Esc закрывает. Можно назначать дополнительные кнопки мыши (Mouse4/Mouse5).";
         s
@@ -4247,15 +4054,15 @@ impl TrackerApp {
                     (2, "Журнал изменений"),
                     (3, "Горячие клавиши"),
                 ] {
-                    if ui.selectable_label(self.about_sub == i, label).clicked() {
-                        self.about_sub = i;
+                    if ui.selectable_label(self.state.about_sub == i, label).clicked() {
+                        self.state.about_sub = i;
                     }
                 }
             });
         });
         page_rule(ui);
         egui::ScrollArea::vertical().show(ui, |ui| {
-            match self.about_sub {
+            match self.state.about_sub {
                 0 => self.about_program(ui),
                 1 => self.about_docs(ui),
                 2 => self.about_changelog(ui),
@@ -4296,7 +4103,7 @@ impl TrackerApp {
                 }
                 ui.label(egui::RichText::new(format!(
                     "Проверка: {}",
-                    crate::update::UpdateFreq::from_code(self.cfg_handle.update_freq).label()
+                    crate::update::UpdateFreq::from_code(self.state.cfg_handle.update_freq).label()
                 ))
                 .weak());
             });
@@ -4317,16 +4124,16 @@ impl TrackerApp {
             // Статус может быть длинным (строка ошибки reqwest) — даём
             // выделить и скопировать.
             ui.add(
-                egui::Label::new(if self.update_checking {
+                egui::Label::new(if self.state.update_checking {
                     "Идёт проверка соединения с GitHub…".to_string()
-                } else if self.update_status.is_empty() {
+                } else if self.state.update_status.is_empty() {
                     "Проверка ещё не запускалась.".to_string()
                 } else {
-                    self.update_status.clone()
+                    self.state.update_status.clone()
                 })
                 .selectable(true),
             );
-            if self.update_checking {
+            if self.state.update_checking {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(egui::RichText::new("Проверяем…").weak());
@@ -4408,14 +4215,14 @@ impl TrackerApp {
         else {
             return;
         };
-        let rows: Vec<(String, i64, String, i64, i64)> = self
+        let rows: Vec<(String, i64, String, i64, i64)> = self.state
             .agg
             .iter()
             .map(|r| {
                 // AggRow не хранит числа сессий, а в таблице есть такой
                 // столбец. Считаем из базы: там sessions_by_game отдаёт все
                 // сессии игры, а не только те, что попали в текущую сводку.
-                let sessions = self.db.sessions_by_game(&r.game_name).len() as i64;
+                let sessions = self.state.db.sessions_by_game(&r.game_name).len() as i64;
                 (
                     r.game_name.clone(),
                     r.total_duration,
@@ -4434,47 +4241,47 @@ impl TrackerApp {
                     crate::log::err(&format!("метка о выгрузке не записана: {e}"));
                 }
                 crate::log::info(&format!("выгружено {n} строк в {}", path.display()));
-                self.status_msg = format!("Сохранено: {}", path.to_string_lossy());
+                self.state.status_msg = format!("Сохранено: {}", path.to_string_lossy());
             }
             Err(e) => {
-                self.status_msg = format!("Не могу сохранить файл: {e}");
+                self.state.status_msg = format!("Не могу сохранить файл: {e}");
             }
         }
     }
 
     fn merge_scan(&mut self, found: Vec<TrackedGame>, label: &str) {
         if found.is_empty() {
-            self.scan_msg = format!("{label}: ничего не найдено.");
+            self.state.scan_msg = format!("{label}: ничего не найдено.");
             return;
         }
-        let current = self.games.read().unwrap().clone();
+        let current = self.state.games.read().unwrap().clone();
         let merged = merge_games(vec![found.clone(), current]);
-        *self.games.write().unwrap() = merged.clone();
+        *self.state.games.write().unwrap() = merged.clone();
         self.persist_games();
-        self.scan_msg = format!("{label}: добавлено/обновлено {n} (всего {t}).", n = found.len(), t = merged.len());
+        self.state.scan_msg = format!("{label}: добавлено/обновлено {n} (всего {t}).", n = found.len(), t = merged.len());
     }
 
     fn scan_api(&mut self) {
-        self.cfg_handle.api_key = self.api_key.clone();
-        self.cfg_handle.steam_id = self.steam_id.clone();
-        let api_key = self.api_key.trim().to_string();
-        let mut sid = self.steam_id.trim().to_string();
+        self.state.cfg_handle.api_key = self.state.api_key.clone();
+        self.state.cfg_handle.steam_id = self.state.steam_id.clone();
+        let api_key = self.state.api_key.trim().to_string();
+        let mut sid = self.state.steam_id.trim().to_string();
         if api_key.is_empty() {
-            self.scan_msg = "Введите Steam API Key.".to_string();
+            self.state.scan_msg = "Введите Steam API Key.".to_string();
             return;
         }
         if sid.is_empty() || sid == "auto" {
             sid = detector::local_steam_id(&detector::steam_install_path()).unwrap_or_default();
             if sid.is_empty() {
-                self.scan_msg = "Не удалось определить SteamID64, введите вручную.".to_string();
+                self.state.scan_msg = "Не удалось определить SteamID64, введите вручную.".to_string();
                 return;
             }
-            self.steam_id = sid.clone();
+            self.state.steam_id = sid.clone();
         }
         match detector::scan_steam_games_via_api(&api_key, &sid, None) {
             Ok(found) => {
                 if found.is_empty() {
-                    self.scan_msg = "Steam API: установленных игр не найдено.".to_string();
+                    self.state.scan_msg = "Steam API: установленных игр не найдено.".to_string();
                 } else {
                     // Часы с серверов — истина про владение: накатываем минуты
                     // поверх слияния (порядок merge значения не имеет), а всё,
@@ -4485,32 +4292,32 @@ impl TrackerApp {
                         .collect();
                     self.merge_scan(found, "Steam API");
                     {
-                        let mut games = self.games.write().unwrap();
+                        let mut games = self.state.games.write().unwrap();
                         for g in games.iter_mut() {
                             g.steam_minutes = fresh_min.get(&g.key()).copied();
                         }
                     }
                     self.persist_games();
-                    self.cfg_handle.steam_synced = true;
-                    self.scan_msg = format!(
+                    self.state.cfg_handle.steam_synced = true;
+                    self.state.scan_msg = format!(
                         "Steam API: часы с серверов подтянуты для {} игр. Наши сессии прибавляются к этому общему.",
                         fresh_min.len()
                     );
                 }
             }
             Err(e) => {
-                self.scan_msg = format!("Ошибка Steam API: {e}");
+                self.state.scan_msg = format!("Ошибка Steam API: {e}");
             }
         }
-        self.cfg_handle.api_key = self.api_key.clone();
-        self.cfg_handle.steam_id = self.steam_id.clone();
-        *self.cfg.write().unwrap() = self.cfg_handle.clone();
-        self.cfg_handle.save();
+        self.state.cfg_handle.api_key = self.state.api_key.clone();
+        self.state.cfg_handle.steam_id = self.state.steam_id.clone();
+        *self.state.cfg.write().unwrap() = self.state.cfg_handle.clone();
+        self.state.cfg_handle.save();
     }
 
     fn remove_game(&mut self, exe_path: &str) {
         let key = exe_path.replace('/', "\\").to_lowercase();
-        let mut g = self.games.write().unwrap();
+        let mut g = self.state.games.write().unwrap();
         g.retain(|x| x.key() != key);
         drop(g);
         self.persist_games();
@@ -4520,13 +4327,13 @@ impl TrackerApp {
         if let Some(p) = rfd::FileDialog::new().add_filter("exe", &["exe"]).pick_file() {
             let exe = p.to_string_lossy().to_string();
             let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-            let mut g = self.games.write().unwrap();
+            let mut g = self.state.games.write().unwrap();
             if !g.iter().any(|x| x.key() == exe.replace('/', "\\").to_lowercase()) {
                 g.push(TrackedGame { name: stem, exe_path: exe, source: "Manual".to_string(), steam_minutes: None });
             }
             drop(g);
             self.persist_games();
-            self.scan_msg = "Добавлено вручную.".to_string();
+            self.state.scan_msg = "Добавлено вручную.".to_string();
         }
     }
 
@@ -4534,25 +4341,25 @@ impl TrackerApp {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
             let exes = detector::scan_folder_for_exes(&folder, 4);
             if exes.is_empty() {
-                self.scan_msg = "В папке нет .exe файлов.".to_string();
+                self.state.scan_msg = "В папке нет .exe файлов.".to_string();
                 return;
             }
-            self.folder_candidates = exes.into_iter().take(30).map(|(p, s)| (p.to_string_lossy().to_string(), s)).collect();
-            self.folder_name = folder.file_name().and_then(|n| n.to_str()).unwrap_or("game").to_string();
-            self.show_folder = true;
+            self.state.folder_candidates = exes.into_iter().take(30).map(|(p, s)| (p.to_string_lossy().to_string(), s)).collect();
+            self.state.folder_name = folder.file_name().and_then(|n| n.to_str()).unwrap_or("game").to_string();
+            self.state.show_folder = true;
         }
     }
 
     fn refresh_picker_list(&mut self) {
-        self.picker_list = detector::list_running_processes();
-        self.picker_refresh_at = Instant::now();
+        self.state.picker_list = detector::list_running_processes();
+        self.state.picker_refresh_at = Instant::now();
     }
 
     fn start_timer(&mut self, secs: u64) {
-        self.timer_end = Some(Instant::now() + Duration::from_secs(secs));
-        self.timer_total = secs;
+        self.state.timer_end = Some(Instant::now() + Duration::from_secs(secs));
+        self.state.timer_total = secs;
         let opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
-        self.timer_data = (opt(&self.timer_url), opt(&self.timer_sound), opt(&self.timer_std));
+        self.state.timer_data = (opt(&self.state.timer_url), opt(&self.state.timer_sound), opt(&self.state.timer_std));
     }
 
     // ---------- всплывающие окна ----------
@@ -4564,10 +4371,10 @@ impl TrackerApp {
 
         // Детали игры
         let mut close_detail = false;
-        if let Some(game) = self.detail_game.clone() {
+        if let Some(game) = self.state.detail_game.clone() {
             let mut open = true;
             egui::Window::new(format!("Сессии: {game}")).open(&mut open).min_size([560.0, 380.0]).show(ctx, |ui| {
-                let sessions = self.db.sessions_by_game(&game);
+                let sessions = self.state.db.sessions_by_game(&game);
                 ui.label(format!("Всего сессий: {}", sessions.len()));
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                     egui::Grid::new("detail_grid").num_columns(5).striped(true).show(ui, |ui| {
@@ -4590,15 +4397,15 @@ impl TrackerApp {
                             let resp = ui.label(&dlabel);
                             if resp.double_clicked() {
                                 let d = s.duration.unwrap_or(0);
-                                self.edit_session = Some((s.id, (d / 3600) as i32, ((d % 3600) / 60) as i32, (d % 60) as i32));
+                                self.state.edit_session = Some((s.id, (d / 3600) as i32, ((d % 3600) / 60) as i32, (d % 60) as i32));
                             }
                             ui.horizontal_wrapped(|ui| {
                                 if ui.small_button("Изм.").clicked() {
                                     let d = s.duration.unwrap_or(0);
-                                    self.edit_session = Some((s.id, (d / 3600) as i32, ((d % 3600) / 60) as i32, (d % 60) as i32));
+                                    self.state.edit_session = Some((s.id, (d / 3600) as i32, ((d % 3600) / 60) as i32, (d % 60) as i32));
                                 }
                                 if ui.small_button("Удал.").clicked() {
-                                    let _ = self.db.delete_session(s.id);
+                                    let _ = self.state.db.delete_session(s.id);
                                     self.refresh_agg();
                                 }
                             });
@@ -4612,13 +4419,13 @@ impl TrackerApp {
             }
         }
         if close_detail {
-            self.detail_game = None;
+            self.state.detail_game = None;
             self.refresh_agg();
         }
 
         // Редактирование длительности
         let mut close_edit = false;
-        if let Some((id, mut h, mut m, mut s)) = self.edit_session {
+        if let Some((id, mut h, mut m, mut s)) = self.state.edit_session {
             let mut open = true;
             egui::Window::new("Изменение длительности").open(&mut open).show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -4630,7 +4437,7 @@ impl TrackerApp {
                     if ui.button("OK").clicked() {
                         let dur = (h as i64) * 3600 + (m as i64) * 60 + s as i64;
                         // end = start + dur
-                        let _ = self.db.update_session_duration(id, dur, &Local::now());
+                        let _ = self.state.db.update_session_duration(id, dur, &Local::now());
                         self.refresh_agg();
                         close_edit = true;
                     }
@@ -4638,39 +4445,39 @@ impl TrackerApp {
                         close_edit = true;
                     }
                 });
-                self.edit_session = Some((id, h, m, s));
+                self.state.edit_session = Some((id, h, m, s));
             });
             if !open {
                 close_edit = true;
             }
         }
         if close_edit {
-            self.edit_session = None;
+            self.state.edit_session = None;
             // обновить детали
             self.refresh_agg();
         }
 
         // Выбор из активных процессов
-        if self.show_picker {
+        if self.state.show_picker {
             let mut open = true;
             egui::Window::new("Добавить из активных процессов").open(&mut open).min_size([600.0, 420.0]).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Поиск:");
-                    ui.text_edit_singleline(&mut self.picker_search);
+                    ui.text_edit_singleline(&mut self.state.picker_search);
                     if ui.button("Обновить").clicked() {
                         self.refresh_picker_list();
                     }
                 });
-                if self.picker_refresh_at.elapsed() > Duration::from_secs(4) {
+                if self.state.picker_refresh_at.elapsed() > Duration::from_secs(4) {
                     self.refresh_picker_list();
                 }
-                let q = self.picker_search.to_lowercase();
-                let known: std::collections::HashSet<String> = self.games.read().unwrap().iter().map(|g| g.file_name()).collect();
+                let q = self.state.picker_search.to_lowercase();
+                let known: std::collections::HashSet<String> = self.state.games.read().unwrap().iter().map(|g| g.file_name()).collect();
                 egui::ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
                     egui::Grid::new("proc_grid").num_columns(5).striped(true).show(ui, |ui| {
                         ui.strong("PID"); ui.strong("Имя"); ui.strong("CPU/RAM"); ui.strong("exe"); ui.strong("");
                         ui.end_row();
-                        for p in self.picker_list.clone().iter().filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q) || p.exe.to_lowercase().contains(&q)).take(200) {
+                        for p in self.state.picker_list.clone().iter().filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q) || p.exe.to_lowercase().contains(&q)).take(200) {
                             ui.label(format!("{}", p.pid));
                             ui.label(&p.name);
                             ui.label(format!("{:.1}% / {}МБ", p.cpu, p.mem_mb));
@@ -4681,11 +4488,11 @@ impl TrackerApp {
                                 ui.label("уже есть");
                             } else if ui.small_button("Отслеживать").clicked() {
                                 if !p.exe.is_empty() {
-                                    let mut g = self.games.write().unwrap();
+                                    let mut g = self.state.games.write().unwrap();
                                     g.push(TrackedGame { name: p.name.clone(), exe_path: p.exe.clone(), source: "Process".to_string(), steam_minutes: None });
                                     drop(g);
                                     self.persist_games();
-                                    self.scan_msg = format!("Добавлено из процессов: {}", p.name);
+                                    self.state.scan_msg = format!("Добавлено из процессов: {}", p.name);
                                 }
                             }
                             ui.end_row();
@@ -4694,130 +4501,130 @@ impl TrackerApp {
                 });
             });
             if !open {
-                self.show_picker = false;
+                self.state.show_picker = false;
             }
         }
 
         // Кандидаты из папки
-        if self.show_folder {
+        if self.state.show_folder {
             let mut open = true;
             egui::Window::new("Папка с игрой — выбор exe").open(&mut open).min_size([560.0, 380.0]).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Название:");
-                    ui.text_edit_singleline(&mut self.folder_name);
+                    ui.text_edit_singleline(&mut self.state.folder_name);
                 });
                 ui.label("Найденные .exe (первые — самые большие, это обычно и есть игра, а не лаунчер):");
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for (exe, size) in self.folder_candidates.clone() {
+                    for (exe, size) in self.state.folder_candidates.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("{:.1} МБ", size as f64 / 1024.0 / 1024.0));
                             let short = if exe.len() > 70 { format!("…{}", &exe[exe.len()-70..]) } else { exe.clone() };
                             ui.label(short).on_hover_text(&exe);
                             if ui.small_button("Выбрать").clicked() {
-                                let mut g = self.games.write().unwrap();
+                                let mut g = self.state.games.write().unwrap();
                                 let key = exe.replace('/', "\\").to_lowercase();
                                 if !g.iter().any(|x| x.key() == key) {
-                                    g.push(TrackedGame { name: self.folder_name.clone(), exe_path: exe.clone(), source: "Folder".to_string(), steam_minutes: None });
+                                    g.push(TrackedGame { name: self.state.folder_name.clone(), exe_path: exe.clone(), source: "Folder".to_string(), steam_minutes: None });
                                 }
                                 drop(g);
                                 self.persist_games();
-                                self.scan_msg = format!("Добавлено из папки: {}", self.folder_name);
-                                self.show_folder = false;
+                                self.state.scan_msg = format!("Добавлено из папки: {}", self.state.folder_name);
+                                self.state.show_folder = false;
                             }
                         });
                     }
                 });
             });
             if !open {
-                self.show_folder = false;
+                self.state.show_folder = false;
             }
         }
 
         // Быстрый будильник (Ctrl+}): разовый, звук BEEP, Enter — добавить.
-        if self.quick_alarm_open {
+        if self.state.quick_alarm_open {
             let mut open = true;
             egui::Window::new("Быстрый будильник").open(&mut open).show(ctx, |ui| {
                 ui.label("Разовый будильник, звук BEEP.");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.quick_alarm_text)
+                    egui::TextEdit::singleline(&mut self.state.quick_alarm_text)
                         .hint_text("ЧЧ:ММ")
                         .id(egui::Id::new("quick_alarm_input")),
                 );
-                if self.quick_alarm_focus {
+                if self.state.quick_alarm_focus {
                     ui.memory_mut(|m| m.request_focus(egui::Id::new("quick_alarm_input")));
-                    self.quick_alarm_focus = false;
+                    self.state.quick_alarm_focus = false;
                 }
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("OK (Enter)").clicked() {
                         self.confirm_quick_alarm();
                     }
                     if ui.button("Отмена (Esc)").clicked() {
-                        self.quick_alarm_open = false;
+                        self.state.quick_alarm_open = false;
                     }
                 });
             });
             if !open {
-                self.quick_alarm_open = false;
+                self.state.quick_alarm_open = false;
             }
         }
 
         // Быстрый таймер (Ctrl+{): минуты 1–999, Enter — старт.
-        if self.quick_timer_open {
+        if self.state.quick_timer_open {
             let mut open = true;
             egui::Window::new("Быстрый таймер").open(&mut open).show(ctx, |ui| {
                 ui.label("Минуты 1–999, Enter — старт.");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.quick_timer_text)
+                    egui::TextEdit::singleline(&mut self.state.quick_timer_text)
                         .hint_text("Минуты")
                         .id(egui::Id::new("quick_timer_input")),
                 );
-                if self.quick_timer_focus {
+                if self.state.quick_timer_focus {
                     ui.memory_mut(|m| m.request_focus(egui::Id::new("quick_timer_input")));
-                    self.quick_timer_focus = false;
+                    self.state.quick_timer_focus = false;
                 }
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Старт (Enter)").clicked() {
                         self.confirm_quick_timer();
                     }
                     if ui.button("Отмена (Esc)").clicked() {
-                        self.quick_timer_open = false;
+                        self.state.quick_timer_open = false;
                     }
                 });
             });
             if !open {
-                self.quick_timer_open = false;
+                self.state.quick_timer_open = false;
             }
         }
 
         // Диалог будильника
-        if let Some(a) = self.alarm_dialog.clone() {
+        if let Some(a) = self.state.alarm_dialog.clone() {
             let mut open = true;
             egui::Window::new("Будильник").open(&mut open).show(ctx, |ui| {
                 ui.label(format!("Сработал будильник на {}", a.time));
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Через 10 минут").clicked() {
                         let nt = (Local::now() + chrono::Duration::minutes(10)).format("%H:%M").to_string();
-                        let _ = self.db.add_alarm(&nt, false, a.url.as_deref(), a.sound_file.as_deref(), a.standard_sound.as_deref(), None);
+                        let _ = self.state.db.add_alarm(&nt, false, a.url.as_deref(), a.sound_file.as_deref(), a.standard_sound.as_deref(), None);
                         self.refresh_alarms();
-                        self.alarm_dialog = None;
-                        self.sound.stop();
+                        self.state.alarm_dialog = None;
+                        self.state.sound.stop();
                     }
                     if ui.button("Заканчиваю").clicked() {
-                        self.alarm_dialog = None;
-                        self.sound.stop();
+                        self.state.alarm_dialog = None;
+                        self.state.sound.stop();
                     }
                 });
             });
             if !open {
-                self.alarm_dialog = None;
-                self.sound.stop();
+                self.state.alarm_dialog = None;
+                self.state.sound.stop();
             }
         }
 
         // Редактирование будильника (время + дни) — доступно в любой момент,
         // в том числе для неактивных будильников.
         let mut close_alarm_edit = false;
-        if let Some((id, mut h, mut m, mut days)) = self.edit_alarm {
+        if let Some((id, mut h, mut m, mut days)) = self.state.edit_alarm {
             let mut open = true;
             egui::Window::new("Изменить будильник").open(&mut open).show(ctx, |ui| {
                 ui.label(format!("Будильник #{id}"));
@@ -4846,16 +4653,16 @@ impl TrackerApp {
                             None
                         };
                         let mut ok = true;
-                        if let Err(e) = self.db.set_alarm_time(id, &t) {
-                            self.status_msg = format!("Не удалось изменить время: {e}");
+                        if let Err(e) = self.state.db.set_alarm_time(id, &t) {
+                            self.state.status_msg = format!("Не удалось изменить время: {e}");
                             ok = false;
                         }
-                        if let Err(e) = self.db.set_alarm_days(id, days_opt) {
-                            self.status_msg = format!("Не удалось изменить дни: {e}");
+                        if let Err(e) = self.state.db.set_alarm_days(id, days_opt) {
+                            self.state.status_msg = format!("Не удалось изменить дни: {e}");
                             ok = false;
                         }
                         if ok {
-                            self.status_msg = format!("Будильник #{id} изменён: {t}, {}.", mask_label_days(days_opt));
+                            self.state.status_msg = format!("Будильник #{id} изменён: {t}, {}.", mask_label_days(days_opt));
                         }
                         self.refresh_alarms();
                         close_alarm_edit = true;
@@ -4864,29 +4671,29 @@ impl TrackerApp {
                         close_alarm_edit = true;
                     }
                 });
-                self.edit_alarm = Some((id, h, m, days));
+                self.state.edit_alarm = Some((id, h, m, days));
             });
             if !open {
                 close_alarm_edit = true;
             }
         }
         if close_alarm_edit {
-            self.edit_alarm = None;
+            self.state.edit_alarm = None;
         }
 
         // Диалог таймера
-        if self.timer_dialog {
+        if self.state.timer_dialog {
             let mut open = true;
             egui::Window::new("Таймер").open(&mut open).show(ctx, |ui| {
                 ui.label("Таймер завершён!");
                 if ui.button("OK").clicked() {
-                    self.timer_dialog = false;
-                    self.sound.stop();
+                    self.state.timer_dialog = false;
+                    self.state.sound.stop();
                 }
             });
             if !open {
-                self.timer_dialog = false;
-                self.sound.stop();
+                self.state.timer_dialog = false;
+                self.state.sound.stop();
             }
         }
     }
