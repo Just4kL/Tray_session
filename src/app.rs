@@ -1,6 +1,6 @@
 use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateInfo};
 use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, save_known_games, AppConfig, TrackedGame};
-use crate::ui::{theme::ThemeManager, views::Views};
+use crate::ui::{theme::{tokens::Tokens, ThemeManager}, views::Views};
 use crate::db::{AlarmRow, Db};
 use crate::detector;
 use crate::gpu::query_gpu;
@@ -665,9 +665,6 @@ pub const UPDATE_BTN: f32 = 40.0;
 /// Радиус скругления кнопки.
 const UPDATE_BTN_ROUND: f32 = 10.0;
 
-/// Жёлтый акцент кнопки обновления.
-pub const UPDATE_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xC8, 0x3A);
-
 /// Цвета кнопки-уведомления в одном состоянии.
 #[derive(Debug, Clone, Copy)]
 pub struct UpdateNoticePaint {
@@ -688,9 +685,13 @@ pub struct UpdateNoticePaint {
 /// Затребовано: жёлтая окантовка, подсветка изнутри и жёлтая стрелка.
 /// Состояния — как у любой кнопки: покой, наведение (светлее), нажатие
 /// (темнее и стрелка гаснет), чтобы отклик был виден.
-pub fn update_notice_paint(hovered: bool, down: bool) -> UpdateNoticePaint {
-    let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
-    let y = UPDATE_YELLOW;
+pub fn update_notice_paint(
+    tokens: &Tokens,
+    hovered: bool,
+    down: bool,
+) -> UpdateNoticePaint {
+    let panel = tokens.palette.bg.surface;
+    let y = tokens.palette.semantic.warn_soft;
     // Фон: тёплый тёмный, чтобы жёлтая рамка читалась на нём, а сам он
     // не спорил с основной тёмно-синей темой.
     let base = blend(y, panel, 0.86); // 14% жёлтого в фоне панели
@@ -745,10 +746,14 @@ fn paint_update_arrow(p: &egui::Painter, rect: egui::Rect, color: egui::Color32)
 
 /// Кнопка-уведомление «скачать обновление»: жёлтая окантовка, внутренняя
 /// подсветка и стрелка вниз. Подсказка — с версией обновления.
-fn update_notice_button(ui: &mut egui::Ui, version: &str) -> egui::Response {
+fn update_notice_button(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    version: &str,
+) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(UPDATE_BTN, UPDATE_BTN), egui::Sense::click());
-    let p = update_notice_paint(resp.hovered(), resp.is_pointer_button_down_on());
+    let p = update_notice_paint(tokens, resp.hovered(), resp.is_pointer_button_down_on());
     let rounding = egui::Rounding::same(UPDATE_BTN_ROUND);
     // Внешняя мягкая подсветка вокруг кнопки — «свечение», чтобы её было
     // видно сразу, а не только при наведении.
@@ -1023,17 +1028,22 @@ pub struct NavPaint {
 /// * наведение — подложка светлее (слой акцента ~12%);
 /// * нажатие — подложка ещё светлее, иконка чуть притушена и кнопка уходит
 ///   вниз на 1px (видимый отклик, которого раньше не было вовсе).
-pub fn nav_item_paint(selected: bool, hovered: bool, down: bool) -> NavPaint {
-    let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
-    let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
+pub fn nav_item_paint(
+    tokens: &Tokens,
+    selected: bool,
+    hovered: bool,
+    down: bool,
+) -> NavPaint {
+    let panel = tokens.palette.bg.surface;
+    let accent = tokens.palette.accent.primary;
     let fg = if selected {
         accent
     } else if down {
-        egui::Color32::WHITE
+        tokens.palette.text.on_accent
     } else if hovered {
-        egui::Color32::WHITE
+        tokens.palette.text.on_accent
     } else {
-        egui::Color32::from_rgb(0x9A, 0xA4, 0xAF)
+        tokens.palette.text.muted
     };
     // Фон: выбранный пункт держит свою подложку, остальные появляются
     // только под курсором/пальцем. Слои акцента подобраны по замеру
@@ -1059,16 +1069,25 @@ pub fn nav_item_paint(selected: bool, hovered: bool, down: bool) -> NavPaint {
 /// перекрывает `fg_stroke` виджета, и при нажатии (фон темнеет) остаётся
 /// бледным — контраст падал до 2.3 вместо требуемых 4.5. Цвет состояния
 /// берётся из темы, поэтому контраст одинаков во всех состояниях.
-fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+fn chip_button(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    text: &str,
+    on: bool,
+) -> egui::Response {
     let sel = ui.visuals().selection.bg_fill;
-    let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
+    let accent = tokens.palette.accent.primary;
     ui.add(
         egui::Button::new(text)
             .min_size(egui::vec2(0.0, 20.0))
             .fill(if on { sel } else { ui.visuals().widgets.inactive.bg_fill })
             .stroke(egui::Stroke::new(
                 1.0_f32,
-                if on { accent } else { egui::Color32::from_rgb(0x3A, 0x55, 0x6C) },
+                if on {
+                    accent
+                } else {
+                    tokens.palette.border.interactive
+                },
             ))
             .rounding(egui::Rounding::same(10.0))
             .selected(on),
@@ -1884,7 +1903,7 @@ impl TrackerApp {
         // Текст кнопок БЕЗ своего цвета: свой цвет перекрывает fg_stroke
         // темы, и при нажатии (фон темнеет) текст оставался бледным.
         ui.horizontal(|ui| {
-            if chip_button(ui, "PIN", self.state.stopwatch_pinned).clicked() {
+            if chip_button(ui, self.theme.current().tokens(), "PIN", self.state.stopwatch_pinned).clicked() {
                 self.toggle_stopwatch_pin();
             }
             ui.label(
@@ -1898,7 +1917,7 @@ impl TrackerApp {
                 }
                 // Расширение: двойной размер окна + таймер обратного отсчёта.
                 let exp = if self.state.stopwatch_expanded { "⤡" } else { "⤢" };
-                if chip_button(ui, exp, self.state.stopwatch_expanded)
+                if chip_button(ui, self.theme.current().tokens(), exp, self.state.stopwatch_expanded)
                     .on_hover_text(if self.state.stopwatch_expanded {
                         "Свернуть окошко"
                     } else {
@@ -2244,7 +2263,7 @@ impl TrackerApp {
             // в одну строку (внутри Frame раскладка по умолчанию вертикальная).
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                strip_row(ui, STRIP_H - 6.0, zoom, sess, &mut state);
+                strip_row(ui, self.theme.current().tokens(), STRIP_H - 6.0, zoom, sess, &mut state);
             });
             if state.close_clicked {
                 self.set_strip_open(false);
@@ -2856,7 +2875,7 @@ impl eframe::App for TrackerApp {
                     egui::vec2(w, UPDATE_BTN),
                     egui::Layout::right_to_left(egui::Align::Min),
                     |ui| {
-                        if update_notice_button(ui, &version).clicked() {
+                        if update_notice_button(ui, self.theme.current().tokens(), &version).clicked() {
                             // Приложение сейчас закроется, состояние кнопки
                             // уже неважно.
                             self.start_update_install();
@@ -2997,7 +3016,12 @@ impl TrackerApp {
         let h = 60.0;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
         if ui.is_rect_visible(rect) {
-            let p = nav_item_paint(selected, resp.hovered(), resp.is_pointer_button_down_on());
+            let p = nav_item_paint(
+                self.theme.current().tokens(),
+                selected,
+                resp.hovered(),
+                resp.is_pointer_button_down_on(),
+            );
             // Эффект нажатия: кнопка опускается на 1px — «тактильный» отклик.
             let dy = if p.pressed { 1.0 } else { 0.0 };
             let rect = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, dy), rect.size());
@@ -5056,6 +5080,7 @@ fn strip_controls_width(ui: &egui::Ui, zoom: f32) -> f32 {
 /// любой ширине окна остаётся видна.
 fn strip_row(
     ui: &mut egui::Ui,
+    tokens: &Tokens,
     row_h: f32,
     zoom: f32,
     session: Option<(&str, i64, bool)>,
@@ -5143,7 +5168,7 @@ fn strip_row(
             if ui.small_button("×").on_hover_text("Скрыть полоску").clicked() {
                 state.close_clicked = true;
             }
-            if chip_button(ui, "PIN", state.pinned)
+            if chip_button(ui, tokens, "PIN", state.pinned)
                 .on_hover_text("Закрепить: полоска перестаёт перетаскиваться")
                 .clicked()
             {
@@ -6297,6 +6322,7 @@ mod tests {
     #[test]
     #[ignore]
     fn ui_preview_png() {
+        let skin = DefaultSkin::default();
         // Раскладка: 4 колонки состояний кнопки × строки.
         let (w, h) = (900.0_f32, 420.0_f32);
         let ctx = egui::Context::default();
@@ -6394,7 +6420,7 @@ mod tests {
                                 ("нажата", false, true, true),
                                 ("выбран", true, false, false),
                             ] {
-                                let p = nav_item_paint(sel, hov, dn);
+                                let p = nav_item_paint(skin.tokens(), sel, hov, dn);
                                 let (rect, _) =
                                     ui.allocate_exact_size(egui::vec2(76.0, 60.0), egui::Sense::hover());
                                 let dy = if p.pressed { 1.0 } else { 0.0 };
@@ -6589,13 +6615,14 @@ mod tests {
 
     #[test]
     fn update_button_uses_yellow_accent() {
+        let skin = DefaultSkin::default();
         // Требование: жёлтая окантовка и жёлтая стрелка. Проверяем именно
         // жёлтость (в канале R и G много, в B мало), а не «тёплый цвет»:
         // иначе кнопка однажды станет оранжевой и это не заметят.
         for (name, p) in [
-            ("покой", update_notice_paint(false, false)),
-            ("наведение", update_notice_paint(true, false)),
-            ("нажата", update_notice_paint(true, true)),
+            ("покой", update_notice_paint(skin.tokens(), false, false)),
+            ("наведение", update_notice_paint(skin.tokens(), true, false)),
+            ("нажата", update_notice_paint(skin.tokens(), true, true)),
         ] {
             let is_yellow = |c: egui::Color32| {
                 c.r() > 180 && c.g() > 130 && c.b() < 120 && c.r() > c.b() + 100
@@ -6613,11 +6640,12 @@ mod tests {
 
     #[test]
     fn update_button_press_effect_is_visible() {
+        let skin = DefaultSkin::default();
         // Наведение и нажатие должны отличаться от покоя, иначе отклика
         // не видно. Плюс само нажатие должно быть темнее покоя.
-        let rest = update_notice_paint(false, false);
-        let over = update_notice_paint(true, false);
-        let down = update_notice_paint(true, true);
+        let rest = update_notice_paint(skin.tokens(), false, false);
+        let over = update_notice_paint(skin.tokens(), true, false);
+        let down = update_notice_paint(skin.tokens(), true, true);
         assert!(
             relative_luminance(over.bg) > relative_luminance(rest.bg),
             "наведение должно быть светлее покоя"
@@ -6638,14 +6666,15 @@ mod tests {
 
     #[test]
     fn update_button_elements_are_readable() {
+        let skin = DefaultSkin::default();
         // Стрелка и окантовка — графические элементы, для них достаточно
         // 3:1 (WCAG 1.4.11), но текста-подписи рядом нет, поэтому держим
         // 3:1 и не ниже.
         const MIN: f32 = 3.0;
         for (name, p) in [
-            ("покой", update_notice_paint(false, false)),
-            ("наведение", update_notice_paint(true, false)),
-            ("нажата", update_notice_paint(true, true)),
+            ("покой", update_notice_paint(skin.tokens(), false, false)),
+            ("наведение", update_notice_paint(skin.tokens(), true, false)),
+            ("нажата", update_notice_paint(skin.tokens(), true, true)),
         ] {
             // Стрелка лежит на фоне, в который подмешан жёлтый.
             let arrow_cr = contrast_ratio(p.arrow, p.bg);
@@ -6662,9 +6691,9 @@ mod tests {
         }
         println!(
             "кнопка обновления: фон L покой={:.4} наведение={:.4} нажатие={:.4}",
-            relative_luminance(update_notice_paint(false, false).bg),
-            relative_luminance(update_notice_paint(true, false).bg),
-            relative_luminance(update_notice_paint(true, true).bg),
+            relative_luminance(update_notice_paint(skin.tokens(), false, false).bg),
+            relative_luminance(update_notice_paint(skin.tokens(), true, false).bg),
+            relative_luminance(update_notice_paint(skin.tokens(), true, true).bg),
         );
     }
 
@@ -6764,6 +6793,7 @@ mod tests {
     #[test]
     #[ignore]
     fn update_button_preview_png() {
+        let skin = DefaultSkin::default();
         let (w, h) = (560.0_f32, 150.0_f32);
         let ctx = egui::Context::default();
         ctx.set_style(egui::Style {
@@ -6793,7 +6823,7 @@ mod tests {
                                 ("нажата", true, true),
                             ] {
                                 ui.vertical(|ui| {
-                                    let p = update_notice_paint(hov, dn);
+                                    let p = update_notice_paint(skin.tokens(), hov, dn);
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(UPDATE_BTN, UPDATE_BTN),
                                         egui::Sense::hover(),
@@ -7354,6 +7384,7 @@ mod tests {
 
     #[test]
     fn strip_row_places_text_inside_window() {
+        let skin = DefaultSkin::default();
         // Настоящая проверка вёрстки полоски: текст должен оказаться ВНУТРИ
         // окна. Регрессия была ровно в этом — строка выходила пустой
         // (рисовались только кнопки): with_layout отдавал дочернему ui всю
@@ -7369,6 +7400,7 @@ mod tests {
             ui.horizontal(|ui| {
                 strip_row(
                     ui,
+                    skin.tokens(),
                     STRIP_H - 6.0,
                     1.0,
                     Some(("DOOM Eternal", 5025, false)),
@@ -7411,6 +7443,7 @@ mod tests {
 
     #[test]
     fn strip_row_fits_height() {
+        let skin = DefaultSkin::default();
         // Высоты окна хватает на строку с кнопками: baseline текста не должен
         // вылезать за нижнюю границу. Иначе полоска выглядит обрезанной.
         let ctx = egui::Context::default();
@@ -7418,7 +7451,7 @@ mod tests {
         let baseline = collect_text_rects(&ctx, strip_base_w(), |ui| {
             let mut state = StripUiState::default();
             ui.horizontal(|ui| {
-                strip_row(ui, row_h, 1.0, Some(("Игра", 5025, false)), &mut state);
+                strip_row(ui, skin.tokens(), row_h, 1.0, Some(("Игра", 5025, false)), &mut state);
             });
         })
         .iter()
@@ -7433,13 +7466,14 @@ mod tests {
 
     #[test]
     fn strip_row_shows_no_session_state() {
+        let skin = DefaultSkin::default();
         // Без активной сессии полоска обязана писать об этом, а не быть
         // пустой: пользователь должен видеть, что трей работает.
         let ctx = egui::Context::default();
         let texts = collect_text_rects(&ctx, strip_base_w(), |ui| {
             let mut state = StripUiState::default();
             ui.horizontal(|ui| {
-                strip_row(ui, STRIP_H - 6.0, 1.0, None, &mut state);
+                strip_row(ui, skin.tokens(), STRIP_H - 6.0, 1.0, None, &mut state);
             });
         });
         assert!(
@@ -7456,6 +7490,7 @@ mod tests {
 
     #[test]
     fn strip_row_fits_narrow_windows() {
+        let skin = DefaultSkin::default();
         // Узкое окно: информация сжимается, но остаётся ВИДИМОЙ (обрезается
         // многоточием, а не исчезает за краем). Кнопки приоритетнее.
         for w in [260.0_f32, 320.0, 460.0] {
@@ -7465,6 +7500,7 @@ mod tests {
                 ui.horizontal(|ui| {
                     strip_row(
                         ui,
+                        skin.tokens(),
                         STRIP_H - 6.0,
                         1.0,
                         Some(("Очень длинное название игры", 5025, false)),
@@ -7572,12 +7608,13 @@ mod tests {
 
     #[test]
     fn nav_button_has_visible_press_effect() {
+        let skin = DefaultSkin::default();
         // Раньше кнопка навигации вообще не реагировала на нажатие
         // (is_pointer_button_down_on() не проверялся). Теперь:
         // покой → наведение → нажатие должны различаться по фону.
-        let rest = nav_item_paint(false, false, false);
-        let over = nav_item_paint(false, true, false);
-        let down = nav_item_paint(false, true, true);
+        let rest = nav_item_paint(skin.tokens(), false, false, false);
+        let over = nav_item_paint(skin.tokens(), false, true, false);
+        let down = nav_item_paint(skin.tokens(), false, true, true);
         assert!(!rest.pressed && !over.pressed, "нажатия нет");
         assert!(down.pressed, "нажатие должно быть помечено");
         // Фон: прозрачный в покое, светлеет при наведении, ещё светлеет
@@ -7606,6 +7643,7 @@ mod tests {
 
     #[test]
     fn nav_press_effect_is_strong_enough_to_see() {
+        let skin = DefaultSkin::default();
         // Замер по реальному превью: покой L=0.020, наведение L=0.048,
         // нажатие L=0.089. Требование — нажатие заметно светлее фона
         // панели, иначе отклика снова не видно (так было до правки:
@@ -7613,8 +7651,8 @@ mod tests {
         // почти не читался).
         let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
         let lp = relative_luminance(panel);
-        let rest = nav_item_paint(false, false, false);
-        let down = nav_item_paint(false, true, true);
+        let rest = nav_item_paint(skin.tokens(), false, false, false);
+        let down = nav_item_paint(skin.tokens(), false, true, true);
         let ld = relative_luminance(down.bg);
         assert!(
             ld / lp > 3.0,
@@ -7623,21 +7661,22 @@ mod tests {
         assert!(rest.bg.a() == 0, "в покое подложки быть не должно");
         println!(
             "навигация: панель L={lp:.4}, наведение L={:.4}, нажатие L={ld:.4}",
-            relative_luminance(nav_item_paint(false, true, false).bg)
+            relative_luminance(nav_item_paint(skin.tokens(), false, true, false).bg)
         );
     }
 
     #[test]
     fn nav_button_text_contrast_in_all_states() {
+        let skin = DefaultSkin::default();
         // Подпись и иконка должны читаться на подложке в каждом состоянии.
         let panel = egui::Color32::from_rgb(0x1B, 0x28, 0x38);
         for (name, p) in [
-            ("выбранный", nav_item_paint(true, false, false)),
-            ("выбранный+наведение", nav_item_paint(true, true, false)),
-            ("выбранный+нажатие", nav_item_paint(true, true, true)),
-            ("покой", nav_item_paint(false, false, false)),
-            ("наведение", nav_item_paint(false, true, false)),
-            ("нажатие", nav_item_paint(false, true, true)),
+            ("выбранный", nav_item_paint(skin.tokens(), true, false, false)),
+            ("выбранный+наведение", nav_item_paint(skin.tokens(), true, true, false)),
+            ("выбранный+нажатие", nav_item_paint(skin.tokens(), true, true, true)),
+            ("покой", nav_item_paint(skin.tokens(), false, false, false)),
+            ("наведение", nav_item_paint(skin.tokens(), false, true, false)),
+            ("нажатие", nav_item_paint(skin.tokens(), false, true, true)),
         ] {
             // Реальный фон — это подложка поверх панели (или сама панель,
             // если подложки нет).
@@ -7655,10 +7694,11 @@ mod tests {
 
     #[test]
     fn nav_selected_keeps_accent_identity() {
+        let skin = DefaultSkin::default();
         // Выбранный пункт обязан отличаться от соседних и по фону, и по
         // цвету иконки — иначе активный раздел не читается.
-        let sel = nav_item_paint(true, false, false);
-        let idle = nav_item_paint(false, false, false);
+        let sel = nav_item_paint(skin.tokens(), true, false, false);
+        let idle = nav_item_paint(skin.tokens(), false, false, false);
         assert_ne!(sel.bg, idle.bg, "у выбранного пункта должна быть подложка");
         assert_ne!(sel.fg, idle.fg, "иконка выбранного пункта должна быть акцентной");
     }
@@ -7706,6 +7746,7 @@ mod tests {
 
     #[test]
     fn strip_row_is_single_line() {
+        let skin = DefaultSkin::default();
         // Информация и кнопки должны быть в ОДНОЙ строке. Внутри Frame
         // раскладка по умолчанию вертикальная, поэтому без внешнего
         // ui.horizontal() кнопки уезжали на вторую линию и обрезались
@@ -7716,6 +7757,7 @@ mod tests {
             ui.horizontal(|ui| {
                 strip_row(
                     ui,
+                    skin.tokens(),
                     STRIP_H - 6.0,
                     1.0,
                     Some(("Игра", 5025, false)),
