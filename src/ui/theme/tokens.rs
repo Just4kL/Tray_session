@@ -1,82 +1,109 @@
 //! Токены оформления.
 //!
-//! Этап 1.1: только структуры, без привязки к реальным цветам программы.
-//! Наполнение (`default.rs` реальными цветами из аудита) — коммит 1.3.
+//! Этап 1.2.a.1: полный набор структур, выведенный из аудита
+//! `steam_visuals()`. Значения — в `default.rs` (реальные цвета) и
+//! `dark.rs` (копия до фазы 1.4). Чтение токенов — с 1.2.a.2
+//! (`steam_visuals()` -> `egui_style()`), пока всё под `allow`.
 
 use egui::Color32;
 
-/// Отступы и фиксированные размеры каркаса (в поинтах).
-#[allow(dead_code)] // TODO(phase-1.2): поля читаются при замене хардкодов в app.rs
-#[derive(Debug, Clone)]
+#[allow(dead_code)] // TODO(phase-1.2.a.2): steam_visuals() -> egui_style()
+#[derive(Clone, Copy)]
 pub struct Spacing {
-    /// Крошечный зазор (4).
-    pub xs: f32,
-    /// Малый зазор (8).
-    pub sm: f32,
-    /// Средний зазор (12).
-    pub md: f32,
-    /// Крупный зазор (16).
-    pub lg: f32,
-    /// Ширина левой навигации (88 — как сейчас в `SidePanel`).
-    pub nav_w: f32,
-    /// Высота строки статуса (24 — как сейчас в `TopBottomPanel`).
-    pub status_h: f32,
-    /// Высота строки списка.
-    pub row_h: f32,
+    pub xs: f32, pub sm: f32, pub md: f32, pub lg: f32,
+    pub nav_w: f32, pub status_h: f32, pub row_h: f32,
 }
 
-/// Радиусы скругления.
-#[allow(dead_code)] // TODO(phase-1.2)
-#[derive(Debug, Clone)]
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
 pub struct Radii {
-    /// Виджеты (кнопки, поля).
-    pub widget: f32,
-    /// Панели и карточки.
-    pub panel: f32,
+    pub widget: f32, // 6.0
+    pub panel:  f32, // 8.0
 }
 
-/// Размеры шрифта (в поинтах).
-#[allow(dead_code)] // TODO(phase-1.2)
-#[derive(Debug, Clone)]
-pub struct Typography {
-    /// Основной текст.
-    pub body: f32,
-    /// Подписи и мелкий текст.
-    pub caption: f32,
-    /// Заголовки разделов.
-    pub heading: f32,
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct Strokes {
+    pub hairline: f32, // 1.0
+    pub cursor:   f32, // 2.0
 }
 
-/// Палитра скина.
-#[allow(dead_code)] // TODO(phase-1.2/1.3): поля читаются при замене цветов и наполнении default
-#[derive(Debug, Clone)]
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct Typography { pub body: f32, pub caption: f32, pub heading: f32 }
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct BgPalette {
+    pub surface:        Color32,
+    pub window:         Color32,
+    pub extreme:        Color32,
+    pub faint:          Color32,
+    pub sunken:         Color32,
+    pub noninteractive: Color32,
+    pub raised:         Color32,
+}
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct InteractiveState { pub bg: Color32, pub weak: Color32 }
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct InteractivePalette {
+    pub inactive: InteractiveState,
+    pub hovered:  InteractiveState,
+    pub active:   InteractiveState,
+}
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct AccentPalette {
+    pub primary:   Color32,
+    pub selection: Color32,
+    pub bright:    Color32,
+}
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct TextPalette {
+    pub primary:   Color32,
+    pub muted:     Color32,
+    pub on_accent: Color32,
+}
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct BorderPalette {
+    pub default:     Color32,
+    pub interactive: Color32,
+}
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
+pub struct SemanticPalette {
+    pub ok:        Color32,
+    pub warn:      Color32,
+    pub warn_soft: Color32,
+    pub err:       Color32,
+}
+
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
+#[derive(Clone, Copy)]
 pub struct Palette {
-    /// Фон панелей.
-    pub surface: Color32,
-    /// Альтернативный фон (карточки, чётные строки).
-    pub surface_alt: Color32,
-    /// Акцент (выбранная вкладка, ссылки).
-    pub accent: Color32,
-    /// Основной текст.
-    pub text: Color32,
-    /// Приглушённый текст.
-    pub text_muted: Color32,
-    /// Рамки и разделители.
-    pub border: Color32,
-    /// Успех.
-    pub ok: Color32,
-    /// Предупреждение.
-    pub warn: Color32,
-    /// Ошибка.
-    pub err: Color32,
+    pub bg:          BgPalette,
+    pub interactive: InteractivePalette,
+    pub accent:      AccentPalette,
+    pub text:        TextPalette,
+    pub border:      BorderPalette,
+    pub semantic:    SemanticPalette,
 }
 
-/// Полный набор токенов скина.
-#[allow(dead_code)] // TODO(phase-1.2)
-#[derive(Debug, Clone)]
+#[allow(dead_code)] // TODO(phase-1.2.a.2)
 pub struct Tokens {
-    pub spacing: Spacing,
-    pub radii: Radii,
+    pub spacing:    Spacing,
+    pub radii:      Radii,
+    pub strokes:    Strokes,
     pub typography: Typography,
-    pub palette: Palette,
+    pub palette:    Palette,
 }
