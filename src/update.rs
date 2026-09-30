@@ -1005,6 +1005,33 @@ pub enum AsideOutcome {
 /// себя переименовал (пустой, если не смог).
 fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBuf) {
     let base = base.to_path_buf();
+    // C14: второй апдейтер. Два параллельных процесса делили один
+    // TraySession.exe (rename_aside_from) и один update_report.json.
+    // Имя отличается от C5-мутекса main-окна: main + updater обязаны
+    // сосуществовать, C5 намеренно пропускает --updater.
+    #[cfg(windows)]
+    let _updater_mutex = {
+        use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::um::synchapi::CreateMutexW;
+        let name: Vec<u16> = "Local\\TraySession_Updater\0".encode_utf16().collect();
+        unsafe {
+            let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                crate::log::warn("второй апдейтер уже запущен, выходим");
+                let _ = write_report(
+                    &base,
+                    UpdateReport {
+                        ok: false,
+                        message: "обновление уже выполняется".to_string(),
+                        ..Default::default()
+                    },
+                );
+                std::process::exit(0);
+            }
+            h
+        }
+    };
     crate::log::info(&format!(
         "фоновый процесс обновления запущен, канал {}, ждём закрытия программы до {wait_secs} с",
         channel_label(channel)

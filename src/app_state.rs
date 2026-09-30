@@ -239,6 +239,13 @@ pub struct AppState {
     pub update_rx: Option<std::sync::mpsc::Receiver<UpdateInfo>>,
     pub update_status: String,
     pub update_checking: bool,
+    /// Момент, когда была запущена установка обновления.
+    /// Сторож в update(): если через N секунд не пришёл ok=true
+    /// от апдейтера — откатить quit_requested и показать ошибку.
+    /// Заодно работает флагом «установка идёт»: кнопка «Установить сейчас»
+    /// заблокирована, пока он задан (баг C12 — повторный клик плодил
+    /// второй апдейтер).
+    pub update_pending_since: Option<std::time::Instant>,
     /// Версия найденного обновления, если оно есть. Пока задана — в правом
     /// верхнем углу висит жёлтая кнопка со стрелкой вниз.
     pub update_available: Option<String>,

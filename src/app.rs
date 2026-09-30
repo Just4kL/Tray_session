@@ -1236,6 +1236,7 @@ impl TrackerApp {
                 update_rx: None,
                 update_status: String::new(),
                 update_checking: false,
+                update_pending_since: None,
                 update_available: None,
                 update_window_opened_at: 0.0,
                 last_hotkeys: Vec::new(),
@@ -1394,6 +1395,13 @@ impl TrackerApp {
     /// Запустить обновление: фоновый процесс скачает файлы и заменит их.
     /// Основная программа после этого закроется, а updater её перезапустит.
     fn start_update_install(&mut self) {
+        // C12: повторный клик, пока установка уже идёт, игнорируем — иначе
+        // плодится второй апдейтер, и оба пишут один update_report.json.
+        if self.state.update_pending_since.is_some() {
+            self.state.status_msg =
+                "Обновление уже ставится, дождитесь завершения.".to_string();
+            return;
+        }
         let exe = std::env::current_exe().unwrap_or_default();
         if exe.as_os_str().is_empty() {
             self.state.update_status = "Не удалось найти файл программы.".to_string();
@@ -1412,6 +1420,9 @@ impl TrackerApp {
                 // выходим. Файл-флаг читает updater.
                 let _ = crate::update::signal_ready_to_exit(&crate::update::program_dir());
                 self.state.quit_requested = true;
+                // Сторож в update() следит по этой метке: если апдейтер
+                // не отчитался за 90 с — откат quit_requested (баг C13b).
+                self.state.update_pending_since = Some(std::time::Instant::now());
             }
             Err(e) => {
                 self.state.update_status = format!("Не удалось запустить обновление: {e}");
@@ -2813,7 +2824,38 @@ impl eframe::App for TrackerApp {
                 }
             }
         }
+        // C13b: сторож. Если quit_requested выставлен (идёт установка),
+        // но апдейтер за 90 с не отчитался ok=true — он упал: откатываем
+        // флаг, показываем окно и ошибку вместо вечного чёрного экрана.
+        // Проверка ДО раннего return ниже, иначе сторож сам себя заблокирует.
         if self.state.quit_requested {
+            const STALL_TIMEOUT_SECS: u64 = 90;
+            if let Some(since) = self.state.update_pending_since {
+                if since.elapsed() > Duration::from_secs(STALL_TIMEOUT_SECS) {
+                    // UpdateReport::load читает update_tmp/update_report.json.
+                    let ok = crate::update::UpdateReport::load(&crate::update::program_dir())
+                        .map(|r| r.ok)
+                        .unwrap_or(false);
+                    if !ok {
+                        crate::log::err(
+                            "сторож: апдейтер не отчитался за 90 с, откат quit_requested",
+                        );
+                        self.state.quit_requested = false;
+                        self.state.update_pending_since = None;
+                        self.state.update_status =
+                            "Обновление не удалось. Смотрите лог программы.".to_string();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        if self.state.quit_requested {
+            // Дергаем event loop, чтобы сторож выше продолжал проверяться,
+            // пока апдейтер работает или висит. Без этого update() может
+            // вообще не вызываться — и сторож никогда не сработает.
+            ctx.request_repaint_after(Duration::from_secs(5));
             return;
         }
 
@@ -4209,7 +4251,13 @@ impl TrackerApp {
                     let ctx = ui.ctx().clone();
                     self.start_update_check(&ctx);
                 }
-                if ui.button("Установить сейчас").clicked() {
+                if ui
+                    .add_enabled(
+                        self.state.update_pending_since.is_none(),
+                        egui::Button::new("Установить сейчас"),
+                    )
+                    .clicked()
+                {
                     self.start_update_install();
                 }
                 ui.label(egui::RichText::new(format!(
