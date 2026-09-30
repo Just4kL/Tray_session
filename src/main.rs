@@ -254,6 +254,19 @@ fn apply_global_hotkeys(
 #[cfg(test)]
 mod tests {
     use super::build_app_icon;
+    use super::SINGLE_INSTANCE_MUTEX;
+
+    /// Имя mutex-а single-instance не должно меняться молча: иначе после
+    /// обновления живые процессы со старым именем не будут находиться
+    /// новыми, и защита от второго экземпляра отключится.
+    #[cfg(windows)]
+    #[test]
+    fn single_instance_mutex_name_is_stable() {
+        assert_eq!(
+            SINGLE_INSTANCE_MUTEX, "Local\\TraySession_SingleInstance",
+            "имя mutex-а изменилось — живые процессы его не найдут"
+        );
+    }
 
     /// Иконка должна быть непрозрачной по центру и прозрачной по углам
     /// (скругление) — иначе в трее будет белый/чёрный квадрат.
@@ -299,6 +312,14 @@ mod tests {
     }
 }
 
+/// Имя именованного мьютекса single-instance.
+///
+/// Вынесено в константу и зафиксировано тестом: если имя поменять, живые
+/// процессы со старым именем перестанут находиться новыми — и защита от
+/// второго экземпляра молча отключится после обновления.
+#[cfg(windows)]
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\TraySession_SingleInstance";
+
 fn main() -> eframe::Result {
     // Фоновый процесс обновления. Это тот же самый .exe, запущенный с
     // флагом --updater: отдельный процесс нужен, чтобы (а) интерфейс не
@@ -319,6 +340,50 @@ fn main() -> eframe::Result {
         crate::log::info("запуск в режиме деактивации");
         std::process::exit(uninstall::run(&argv));
     }
+
+    // Single-instance: не даём запуститься второму экземпляру.
+    // Оверлеи (секундомер, полоска) имеют одинаковый title во всех
+    // процессах — FindWindowW в ensure_thickframe/apply_overlay_opacity
+    // без этого попадает в чужой HWND, и позиция/прозрачность идут
+    // в случайное окно. Баг C5.
+    //
+    // Режимы --updater и --uninstaller вышли выше и mutex не берут —
+    // это короткоживущие вспомогательные процессы, они должны
+    // запускаться параллельно основной программе.
+    //
+    // Окно ищем по точному title "Tray Session" (см. run_native ниже).
+    // Если оно скрыто в трее (Visible(false)), HWND всё равно существует,
+    // ShowWindow(SW_SHOW) + SetForegroundWindow его показывают.
+    #[cfg(windows)]
+    let _single_instance_mutex = {
+        use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::um::synchapi::CreateMutexW;
+        use winapi::um::winuser::{
+            FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        let mutex_name: Vec<u16> = SINGLE_INSTANCE_MUTEX
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let h = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let title: Vec<u16> = "Tray Session\0".encode_utf16().collect();
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if !hwnd.is_null() {
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        ShowWindow(hwnd, SW_SHOW);
+                    }
+                    SetForegroundWindow(hwnd);
+                }
+                std::process::exit(0);
+            }
+            h
+        }
+    };
 
     // Логи пишутся рядом с программой, с ограничением по объёму.
     crate::log::init(&crate::update::program_dir());
