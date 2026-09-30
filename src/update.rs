@@ -585,6 +585,8 @@ pub fn file_url(name: &str) -> String {
 fn client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
+        // connect_timeout короче — обрыв на TCP не должен ждать весь read-таймаут.
+        .connect_timeout(std::time::Duration::from_secs(15))
         .user_agent("TraySession-Updater/0.7")
         .build()
         .map_err(|e| format!("HTTP-клиент: {e}"))
@@ -628,39 +630,91 @@ pub fn fetch_manifest() -> Result<Manifest, String> {
 }
 
 /// Скачать один файл в `dest` и проверить его SHA-256.
-pub fn download_to(url: &str, dest: &Path, expect_sha: &str) -> Result<(), String> {
-    let c = client(120)?;
-    let bytes = c
+///
+/// С retry: живой тест показал обрыв соединения посреди 10-МБ тела
+/// ("error decoding response body" — это hyper IncompleteMessage, а не
+/// проблема декодирования). Возвращает размер записанного файла.
+pub fn download_to(url: &str, dest: &Path, expect_sha: &str) -> Result<u64, String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match try_download_once(url, dest, expect_sha, attempt) {
+            Ok(n) => return Ok(n),
+            Err(e) => {
+                last_err = e;
+                if attempt < MAX_ATTEMPTS {
+                    let delay = std::time::Duration::from_secs(retry_delay_secs(attempt));
+                    crate::log::warn(&format!(
+                        "попытка {attempt}/{MAX_ATTEMPTS} скачать {url} не удалась: {last_err}. Повтор через {delay:?}"
+                    ));
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "не удалось скачать {url} за {MAX_ATTEMPTS} попытки. Последняя ошибка: {last_err}"
+    ))
+}
+
+/// Задержка перед повтором скачивания, секунды: 1, 2, 4, ...
+/// Вынесена именованной, чтобы расписание проверялось тестом, а не
+/// числом в уме при чтении цикла.
+fn retry_delay_secs(attempt: u32) -> u64 {
+    1 << attempt.saturating_sub(1).min(6)
+}
+
+fn try_download_once(
+    url: &str,
+    dest: &Path,
+    expect_sha: &str,
+    attempt: u32,
+) -> Result<u64, String> {
+    // Каждый раз новый клиент — старый мог кэшировать broken connection.
+    // Таймаут 180: 10 МБ с raw.githubusercontent.com может идти медленно.
+    let c = client(180)?;
+    let resp = c
         .get(url)
         .send()
-        .map_err(|e| format!("не скачался {}: {e}", file_name_of(url)))?
-        .error_for_status()
-        .map_err(|e| format!("{} недоступен: {e}", file_name_of(url)))?
-        .bytes()
-        .map_err(|e| format!("{} не прочитан: {e}", file_name_of(url)))?;
+        .map_err(|e| format!("attempt {attempt}: отправка запроса: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("attempt {attempt}: HTTP {status} для {url}"));
+    }
+    // Content-Length для диагностики (может отсутствовать при chunked).
+    let expected_len = resp.content_length();
+    let bytes = resp.bytes().map_err(|e| {
+        let got = expected_len
+            .map(|n| format!("ожидалось {n} байт, "))
+            .unwrap_or_default();
+        format!("attempt {attempt}: тело оборвано ({got}error: {e})")
+    })?;
+    if let Some(n) = expected_len {
+        if bytes.len() as u64 != n {
+            return Err(format!(
+                "attempt {attempt}: получено {} байт из {n} — соединение оборвано",
+                bytes.len()
+            ));
+        }
+    }
     // Хеш проверяем ДО записи: битый файл на диск не попадает.
     if !expect_sha.trim().is_empty() {
         let got = sha256_bytes(&bytes);
         if !got.eq_ignore_ascii_case(expect_sha.trim()) {
             return Err(format!(
-                "{}: хеш не совпал (ожидали {}, получили {}) — файл побился при загрузке",
-                file_name_of(url),
-                expect_sha,
+                "attempt {attempt}: хеш не совпал (ожидали {}, получили {}) — файл побился при загрузке",
+                expect_sha.trim(),
                 got
             ));
         }
     }
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| format!("не создана папка {}: {e}", dir.display()))?;
+            .map_err(|e| format!("attempt {attempt}: не создана папка {}: {e}", dir.display()))?;
     }
     std::fs::write(dest, &bytes)
-        .map_err(|e| format!("не записан {}: {e}", dest.display()))?;
-    Ok(())
-}
-
-fn file_name_of(url: &str) -> &str {
-    url.rsplit('/').next().unwrap_or(url)
+        .map_err(|e| format!("attempt {attempt}: не записан {}: {e}", dest.display()))?;
+    Ok(bytes.len() as u64)
 }
 
 // ---------------------------------------------------------------------------
