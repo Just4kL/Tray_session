@@ -160,3 +160,78 @@ update), `comfyui-update-view.png` (бейдж `Up to date` рядом с вер
   амендить, обновления идут следующим коммитом.
 - **Скоуп фиксируется явно** — что трогать и что НЕ трогать.
 - **Тесты не править под код** — код править под тесты.
+
+---
+
+## Дополнения после разведки авто-обновления
+
+### C1-B. Позиция overlay при старте программы (не закрыт)
+**Симптом:** перезапуск cargo run — оверлей в «где-то рядом», не на
+сохранённой позиции.
+**Что применено:** fix A (переоткрытие через кнопку) работает; fix B
+(overlay_place_pending при старте) применён в 89625fe, эффекта нет.
+**Гипотеза:** первый кадр draw_stopwatch_mini сохраняет в
+cfg_handle.stopwatch_pos дефолтную ОС-позицию ДО применения with_position.
+Самоподдерживающийся цикл.
+**Диагностика (при следующем заходе):** eprintln! в show_stopwatch_overlay
+(initial_pos), draw_stopwatch_mini (что сохраняется), первый кадр
+(outer_rect.min).
+**Решение (предположительно):** блокировать сохранение первые 1-2 кадра
+после старта, либо принудительно OuterPosition(clamped) после создания viewport.
+**Приоритет:** LOW, не блокирует pre-release.
+
+### C6a. Консольное окно при запуске release (не закрыт)
+**Симптом:** при двойном клике по .exe Windows открывает консольное
+окно (рисуется как «Windows PowerShell» при дефолтном Windows Terminal).
+**Причина:** .exe собран как консольное приложение, нет
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")].
+**Фикс:** одна строка в src/main.rs, отдельный коммит.
+**Приоритет:** MEDIUM, косметика.
+
+### C6b. Уведомления «Windows PowerShell» в Action Center
+**Симптом:** заголовок уведомления — «Windows PowerShell», не «Tray Session».
+**Причина:** notify-rust без кастомного app_id подставляет
+Toast::POWERSHELL_APP_ID (проверено: в коде notify-rust 4.18.0
+powershell.exe не спавнится; консольное окно — это C6a).
+**Фикс:** свой app_id + регистрация в реестре (WinRT-путь).
+**Приоритет:** LOW, косметика.
+
+### L1. Нативные уведомления WinRT
+Переход с notify-rust на tauri-winrt-notification или windows crate +
+ToastNotificationManager. Требуется для C6b.
+
+### AUTO-UPD. Авто-обновление — зафиксированная модель
+**Каналы:**
+- stable → ветка Tray-session, manifest_url
+  raw.githubusercontent.com/Just4kL/Tray_session/Tray-session/update_manifest.json
+- beta → ветка app-Tray_session, manifest_url .../app-Tray_session/update_manifest.json
+- **Ветка origin/beta кодом НЕ читается** — не путать её с beta-каналом.
+
+**Манифест:** update_manifest.json в корне ветки канала. Поля:
+version, build (YYYYMMDD), files[{name, sha256}]. Генерируется
+tools/make-manifest.ps1.
+
+**Выбор канала:** ComboBox в «Параметры → Обновления», сохраняется в
+config.json (update_channel). Апдейтер получает канал третьим CLI-аргументом.
+
+**Публикация:** git commit в ветку канала — новый TraySession.exe +
+installer + перегенерированный update_manifest.json. gh Releases кодом
+не используется (только для людей).
+
+**Известные баги авто-обновления:**
+
+#### AU-1. Ручная проверка игнорировала канал (ЗАКРЫТ в этом коммите)
+start_update_check всегда читал stable. На бете это либо «нет обновлений»,
+либо откат на stable. Плановая проверка и установка канал учитывали.
+Фикс: fetch_manifest_for(channel) с каналом из cfg_handle.
+
+#### AU-2. Нет сравнения версий (не закрыт)
+plan_update (update.rs:521) сравнивает только sha256. Программа
+«обновляется» на ту же версию с другими хешами. Для pre-release — плюс
+(не нужен бамп), для прода — риск откатить пользователя на старую сборку.
+**Приоритет:** MEDIUM.
+
+#### AU-3. Ветка origin/beta — призрак (не закрыт)
+Существует, манифест в ней есть, но код её не читает. Варианты:
+переименовать в ui-refactor или удалить.
+**Приоритет:** LOW.

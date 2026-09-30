@@ -1322,11 +1322,15 @@ impl TrackerApp {
         self.state.update_status = "Проверяю GitHub…".to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         self.state.update_rx = Some(rx);
+        // Канал — из настроек (бета смотрит бета-ветку). Извлекаем ДО
+        // spawn: замыкание потока `move` и не может брать &mut self.
+        // normalize_channel возвращает &'static str, перенос безопасен.
+        let channel = crate::update::normalize_channel(&self.state.cfg_handle.update_channel);
         std::thread::spawn(move || {
             // Настоящая сверка: тянем манифест и сравниваем с диском.
             // Раньше здесь проверялось только соединение с api.github.com,
             // то есть наличие обновления определить было невозможно.
-            let info = match crate::update::fetch_manifest() {
+            let info = match crate::update::fetch_manifest_for(channel) {
                 Ok(m) => {
                     let base = crate::update::program_dir();
                     let plan = crate::update::plan_update(&base, &m);

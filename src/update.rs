@@ -620,6 +620,9 @@ pub fn fetch_manifest_for(channel: &str) -> Result<Manifest, String> {
 }
 
 /// Скачать манифест стабильного канала (как раньше).
+/// Ручная проверка переведена на fetch_manifest_for с каналом из настроек;
+/// оставлена как короткий синоним стабильного канала.
+#[allow(dead_code)]
 pub fn fetch_manifest() -> Result<Manifest, String> {
     fetch_manifest_for(CHANNEL_STABLE)
 }
