@@ -16,7 +16,7 @@ pub const APP_NAME: &str = "Tray Session";
 /// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
-pub const VERSION: &str = "0.7.32";
+pub const VERSION: &str = "0.7.33-beta.1";
 pub const BUILD: &str = "20260929";
 pub const ISSUE_URL: &str = "https://example.com/issues";
 /// Заголовок окошка секундомера (он же ключ для поиска HWND под WinAPI).
