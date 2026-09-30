@@ -1617,7 +1617,7 @@ impl TrackerApp {
                 "close_dialog" => {
                     self.close_top_dialog();
                 }
-                "hide_tray" => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+                "hide_tray" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                 _ => {}
             }
         }

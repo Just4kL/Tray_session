@@ -91,6 +91,32 @@ pub fn build_app_icon(size: u32) -> Vec<u8> {
     rgba
 }
 
+/// Показать главное окно через WinAPI, минуя event loop eframe.
+/// Нужно для трей-меню: при Minimized(true) eframe спит, AppCmd::Show
+/// не обрабатывается. Прямой ShowWindow разбудит окно.
+#[cfg(windows)]
+fn show_main_window_native() {
+    use winapi::um::winuser::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+    let title: Vec<u16> = "Tray Session\0".encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_main_window_native() {}
+
 fn spawn_tray(rx_tooltip: mpsc::Receiver<TrayCmd>, tx_app: mpsc::Sender<AppCmd>) {
     // ВАЖНО (Windows): tray-icon требует прокачку Win32-сообщений на том потоке,
     // где создана иконка, иначе тултип/меню/клики мертвы. Отдельный winit
@@ -167,6 +193,10 @@ fn spawn_tray(rx_tooltip: mpsc::Receiver<TrayCmd>, tx_app: mpsc::Sender<AppCmd>)
             }
             if let Ok(ev) = menu_rx.try_recv() {
                 if ev.id == open_item.id() {
+                    // WinAPI напрямую — eframe спит при Minimized(true).
+                    show_main_window_native();
+                    // AppCmd::Show — на случай, если eframe всё-таки проснётся и
+                    // захочет синхронизировать своё внутреннее состояние viewport.
                     let _ = tx_app.send(AppCmd::Show);
                 } else if ev.id == quit_item.id() {
                     let _ = tx_app.send(AppCmd::Quit);
@@ -179,10 +209,12 @@ fn spawn_tray(rx_tooltip: mpsc::Receiver<TrayCmd>, tx_app: mpsc::Sender<AppCmd>)
                 match ev {
                     TrayIconEvent::Click { button, .. } => {
                         if button == MouseButton::Left {
+                            show_main_window_native();
                             let _ = tx_app.send(AppCmd::Show);
                         }
                     }
                     TrayIconEvent::DoubleClick { .. } => {
+                        show_main_window_native();
                         let _ = tx_app.send(AppCmd::Show);
                     }
                     _ => {}
@@ -426,6 +458,9 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([720.0, 480.0])
+            // Скрываем из taskbar: сворачивание = «уход в трей», не должно
+            // оставлять кнопку в панели задач.
+            .with_taskbar(false)
             // Та же иконка, что в трее: в заголовке окна была системная
             // картинка по умолчанию, и программа не выглядела «своей».
             .with_icon(egui::IconData {
