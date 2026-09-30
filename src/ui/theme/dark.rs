@@ -2,6 +2,7 @@
 //!
 //! Этап 1.2.a.1: копия `default.rs` (реальные значения steam-темы).
 //! Реальная инверсия цветов — фаза 1.4.
+// TODO(1.4): реальная тёмная тема. Сейчас — копия default, цвета те же.
 
 use super::tokens::*;
 use super::Skin;
@@ -67,21 +68,26 @@ impl Default for DarkSkin {
                         primary:   Color32::from_rgb(0x66, 0xC0, 0xF4),
                         selection: Color32::from_rgb(0x1B, 0x5F, 0x8A),
                         bright:    Color32::from_rgb(0x8E, 0xD4, 0xFF),
+                        dim:       Color32::from_rgb(0x3D, 0x6E, 0x8F),
                     },
                     text: TextPalette {
                         primary:   Color32::from_rgb(0xC7, 0xD5, 0xE0),
                         muted:     Color32::from_rgb(0x9A, 0xA4, 0xAD),
                         on_accent: Color32::WHITE,
+                        heading:   Color32::from_rgb(0xE8, 0xF0, 0xF7),
                     },
                     border: BorderPalette {
                         default:     Color32::from_rgb(0x3A, 0x42, 0x4C),
                         interactive: Color32::from_rgb(0x3A, 0x55, 0x6C),
+                        subtle:      Color32::from_rgb(0x2A, 0x47, 0x5E),
                     },
                     semantic: SemanticPalette {
                         ok:        Color32::from_rgb(0x8C, 0xFF, 0x5A),
                         warn:      Color32::from_rgb(255, 165, 0),
                         warn_soft: Color32::from_rgb(0xFF, 0xC8, 0x3A),
                         err:       Color32::from_rgb(255, 0, 0),
+                        attention: Color32::YELLOW,
+                        recording: Color32::LIGHT_GREEN,
                     },
                 },
             },

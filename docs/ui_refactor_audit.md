@@ -74,31 +74,42 @@
 Отдельно, после вкладок: `windows()` → `ui/views/dialogs.rs`,
 `show_stopwatch_overlay` / `show_session_strip` → `ui/overlays.rs`.
 
-## Оставшийся allow(dead_code) в src/ui/theme/ (снято на 1.2.a.2)
+## Оставшийся allow(dead_code) в src/ui/theme/ (обновлено на 1.2.a.4)
 
 Фактический список (`Select-String -Path src/ui/theme/*.rs -Pattern
 'allow\(dead_code\)'`). Правило: allow не переставляется со структур на
 поля, пока clippy реально не падает, — структурный allow покрывает
-непрочитанные поля целиком.
+непрочитанные поля целиком. Исключение — поля `err`/`default`: их
+структуры в основном читаются, поэтому allow висит точечно на полях.
 
 | Файл:строка | Что под allow | Когда снимем |
 |---|---|---|
-| tokens.rs:10 `Spacing` | все поля (xs/sm/md/lg/nav_w/status_h/row_h) | 1.2.a.3 — при замене геометрии в каркасе |
-| tokens.rs:17 `Radii` | `panel` (`widget` читается в `egui_style`) | 1.2.a.3 — при замене скруглений |
-| tokens.rs:30 `Typography` | все поля (body/caption/heading) | фаза 2 — при маппинге шрифтов в `egui_style` |
-| tokens.rs:34 `BgPalette` | `raised` (остальные 6 читаются) | 1.2.a.3 — если найдётся потребитель, иначе фаза 2 |
-| tokens.rs:63 `TextPalette` | `muted` (`primary`, `on_accent` читаются) | 1.2.a.3 — при замене приглушённого текста |
-| tokens.rs:71 `BorderPalette` | `default` (`interactive` читается) | 1.2.a.3 — при замене рамок |
-| tokens.rs:78 `SemanticPalette` | все поля (ok/warn/warn_soft/err) | фаза 2 — семантика красится напрямую в виджетах, не через `Visuals` |
-| tokens.rs:87 `Palette` | поле `semantic` (остальные 5 читаются) | вместе с `SemanticPalette`, фаза 2 |
-| tokens.rs:98 `Tokens` | поля `spacing`, `typography` (остальные читаются) | вместе с `Spacing`/`Typography` |
-| mod.rs:19 `trait Skin` | методы `id()`, `tokens()` (`egui_style()` читается) | 1.4 — `id()` для переключателя, `tokens()` для прямого чтения |
-| mod.rs:49 `ThemeManager::set` | весь метод | 1.4 — переключатель скинов в «О программе» |
-| dark.rs:11 `DarkSkin` | структура целиком | 1.4 — реальная инверсия цветов |
+| tokens.rs `Spacing` | все поля (xs/sm/md/lg/nav_w/status_h/row_h) | фаза 2 — при замене геометрии в каркасе |
+| tokens.rs `Radii` | `panel` (`widget` читается в `egui_style`) | фаза 2 — при замене скруглений |
+| tokens.rs `Typography` | все поля (body/caption/heading) | фаза 2 — при маппинге шрифтов в `egui_style` |
+| tokens.rs `BorderPalette.default` | поле (остальные читаются) | фаза 2 — потребитель default пока не переведён |
+| tokens.rs `SemanticPalette.err` | поле (остальные читаются) | фаза 2 — потребитель err пока не переведён |
+| tokens.rs `Tokens` | поля `spacing`, `typography` (остальные читаются) | вместе с `Spacing`/`Typography` |
+| mod.rs `trait Skin` | методы `id()`, `tokens()` (`egui_style()` читается) | 1.4 — `id()` для переключателя, `tokens()` для прямого чтения |
+| mod.rs `ThemeManager::set` | весь метод | 1.4 — переключатель скинов в «О программе» |
+| dark.rs `DarkSkin` | структура целиком | 1.4 — реальная инверсия цветов |
 
-Сняты в 1.2.a.2 (больше не нужны): `Strokes`, `InteractiveState`,
-`InteractivePalette`, `AccentPalette` (все поля читаются в `egui_style`),
-`DefaultSkin.tokens`, `ThemeManager` (структура), `ThemeManager::current`.
+Сняты в 1.2.a.2: `Strokes`, `InteractiveState`, `InteractivePalette`,
+`AccentPalette` (все поля читаются в `egui_style`), `DefaultSkin.tokens`,
+`ThemeManager` (структура), `ThemeManager::current`.
+
+Сняты в 1.2.a.4: `BgPalette` (все 7 полей читаются, включая `raised`
+в рамке полоски), `TextPalette` (все 4, включая `heading` заголовков),
+`Palette` (все 6). Проверено grep-ом: `semantic.ok` читается в
+`strip_row`, `semantic.warn` — в `ui_games`.
+
+## Категория B + Q закрыта (1.2.a.4)
+
+Свап 20 мест: B — 9 (`manual_section`, оверлеи, `ui_games`, `page_title`,
+`card`, `strip_row`), Q — 11 (+5 новых токенов `semantic.attention`/
+`recording`, `text.heading`, `border.subtle`, `accent.dim`). Остаток
+хардкодов в production: только растеризатор часов (audit-исключения),
+`from_rgba_unmultiplied`-композиции, `blend()`, `TRANSPARENT`.
 
 ## Roadmap: ctx.set_visuals → ctx.set_style
 

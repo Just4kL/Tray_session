@@ -31,7 +31,6 @@ pub struct Strokes {
 #[derive(Clone, Copy)]
 pub struct Typography { pub body: f32, pub caption: f32, pub heading: f32 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct BgPalette {
     pub surface:        Color32,
@@ -58,33 +57,45 @@ pub struct AccentPalette {
     pub primary:   Color32,
     pub selection: Color32,
     pub bright:    Color32,
+    /// Приглушённый акцент для рамок оверлеев. Производный цвет, заведён
+    /// именованным токеном вместо константы, чтобы не плодить «почти акценты».
+    pub dim: Color32,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct TextPalette {
     pub primary:   Color32,
     pub muted:     Color32,
     pub on_accent: Color32,
+    /// Заголовки страниц 21pt. Отдельный оттенок, не сводится к on_accent
+    /// (тот ярче — чистый белый).
+    pub heading: Color32,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct BorderPalette {
+    #[allow(dead_code)] // TODO(фаза 2): потребитель default пока не переведён на токены
     pub default:     Color32,
     pub interactive: Color32,
+    /// Рамки карточек. Темнее интерактивной — карточка не должна
+    /// спорить с кнопками.
+    pub subtle: Color32,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2)
 #[derive(Clone, Copy)]
 pub struct SemanticPalette {
     pub ok:        Color32,
     pub warn:      Color32,
     pub warn_soft: Color32,
+    #[allow(dead_code)] // TODO(фаза 2): потребитель err пока не переведён на токены
     pub err:       Color32,
+    /// Жёлтый системный сигнал («идёт проверка»). Токена yellow нет
+    /// осознанно: это не часть темы, а состояние процесса.
+    pub attention: Color32,
+    /// Зелёный системный сигнал («идёт запись»). Пара к `attention`.
+    pub recording: Color32,
 }
 
-#[allow(dead_code)] // TODO(phase-1.2.a.2): поле semantic не читается — семантика красится напрямую в виджетах
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub bg:          BgPalette,

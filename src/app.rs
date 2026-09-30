@@ -928,7 +928,13 @@ pub const USER_AGREEMENT: &[&str] = &[
 ///
 /// `last` = последний раздел: после него линия не рисуется, иначе подпись
 /// повисает над разделителем.
-fn manual_section(ui: &mut egui::Ui, title: &str, text: &str, last: bool) {
+fn manual_section(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    title: &str,
+    text: &str,
+    last: bool,
+) {
     if !last {
         ui.add_space(MANUAL_SECTION_GAP);
         ui.separator();
@@ -941,7 +947,7 @@ fn manual_section(ui: &mut egui::Ui, title: &str, text: &str, last: bool) {
             egui::RichText::new(title)
                 .size(15.0)
                 .strong()
-                .color(egui::Color32::from_rgb(0x66, 0xC0, 0xF4)),
+                .color(tokens.palette.accent.primary),
         );
     });
     ui.add_space(4.0);
@@ -1883,11 +1889,12 @@ impl TrackerApp {
         }
         let zoom = float_zoom(ui, stopwatch_base_w());
         // Чёткая граница виджета (рамка в цвете акцента, приглушённом).
+        // TODO(1.4): derivation от accent.primary вместо константы.
         egui::Frame {
             fill: ui.visuals().window_fill,
             stroke: egui::Stroke::new(
                 1.0_f32,
-                egui::Color32::from_rgb(0x3D, 0x6E, 0x8F),
+                self.theme.current().tokens().palette.accent.dim,
             ),
             rounding: egui::Rounding::same(6.0),
             inner_margin: egui::Margin::same(6.0),
@@ -1945,7 +1952,8 @@ impl TrackerApp {
                     egui::Label::new(
                         egui::RichText::new(format_lap_line(num, split, total))
                             .font(egui::FontId::monospace(9.75 * zoom))
-                            .color(egui::Color32::LIGHT_GRAY),
+                            // TODO(1.4): LIGHT_GRAY был (211,211,211), сведён к text.muted. Если визуал тусклый — вернуть text.soft.
+                            .color(self.theme.current().tokens().palette.text.muted),
                     )
                     .truncate(),
                 );
@@ -2043,7 +2051,11 @@ impl TrackerApp {
                 rect.min,
                 egui::pos2(rect.min.x + rect.width() * frac, rect.max.y),
             );
-            ui.painter().rect_filled(fill, 1.5, egui::Color32::from_rgb(0x66, 0xC0, 0xF4));
+            ui.painter().rect_filled(
+                fill,
+                1.5,
+                self.theme.current().tokens().palette.accent.primary,
+            );
         }
     }
 
@@ -2240,8 +2252,11 @@ impl TrackerApp {
         };
 
         egui::Frame {
-            fill: egui::Color32::from_rgb(0x2A, 0x2F, 0x35),
-            stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x3A, 0x42, 0x4C)),
+            fill: self.theme.current().tokens().palette.bg.raised,
+            stroke: egui::Stroke::new(
+                1.0_f32,
+                self.theme.current().tokens().palette.border.default,
+            ),
             rounding: egui::Rounding::same(2.0),
             inner_margin: egui::Margin::symmetric(6.0, 2.0),
             ..Default::default()
@@ -2848,7 +2863,10 @@ impl eframe::App for TrackerApp {
                 ui.horizontal(|ui| {
                     ui.add_space(m);
                     if !self.state.status_msg.is_empty() {
-                        ui.colored_label(egui::Color32::YELLOW, &self.state.status_msg);
+                        ui.colored_label(
+                            self.theme.current().tokens().palette.semantic.attention,
+                            &self.state.status_msg,
+                        );
                     } else {
                         ui.colored_label(
                             ui.visuals().weak_text_color(),
@@ -2871,11 +2889,15 @@ impl eframe::App for TrackerApp {
                 .filter(|v| should_show_update_notice(Some(v)));
             if let Some(version) = notice {
                 let w = ui.available_width();
+                // skin — локальный Arc: замыкание ниже берёт &mut self,
+                // а токены нужны рядом. Через self.theme напрямую было бы
+                // два пересекающихся заимствования self.
+                let skin = self.theme.current().clone();
                 ui.allocate_ui_with_layout(
                     egui::vec2(w, UPDATE_BTN),
                     egui::Layout::right_to_left(egui::Align::Min),
                     |ui| {
-                        if update_notice_button(ui, self.theme.current().tokens(), &version).clicked() {
+                        if update_notice_button(ui, skin.tokens(), &version).clicked() {
                             // Приложение сейчас закроется, состояние кнопки
                             // уже неважно.
                             self.start_update_install();
@@ -3068,11 +3090,13 @@ impl TrackerApp {
     }
 
     fn ui_sessions(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, "Сессии");
+        // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
+        let skin = self.theme.current().clone();
+        page_title(ui, skin.tokens(), "Сессии");
         // Живые сессии сверху (компактно, бывшая вкладка «Активные»).
         let now = Local::now();
         let act: Vec<ActiveInfo> = self.state.active.read().unwrap().values().cloned().collect();
-        card(ui, "Сейчас идёт", |ui| {
+        card(ui, skin.tokens(), "Сейчас идёт", |ui| {
             if act.is_empty() {
                 ui.weak("Нет активных сессий — запустите игру, подсчёт стартует сам.");
             } else {
@@ -3080,9 +3104,15 @@ impl TrackerApp {
                 let secs = (now - a.start).num_seconds().max(0);
                 ui.horizontal_wrapped(|ui| {
                     if a.pending {
-                        ui.colored_label(egui::Color32::YELLOW, "◌ проверка GPU…");
+                        ui.colored_label(
+                            self.theme.current().tokens().palette.semantic.attention,
+                            "◌ проверка GPU…",
+                        );
                     } else {
-                        ui.colored_label(egui::Color32::LIGHT_GREEN, "● запись");
+                        ui.colored_label(
+                            self.theme.current().tokens().palette.semantic.recording,
+                            "● запись",
+                        );
                     }
                     ui.strong(&a.game_name);
                     ui.label(format!(
@@ -3096,7 +3126,7 @@ impl TrackerApp {
                 });
             }
         }});
-        card(ui, "Полоска сессии и GPU", |ui| {
+        card(ui, skin.tokens(), "Полоска сессии и GPU", |ui| {
             ui.horizontal_wrapped(|ui| {
                 let mut open = self.state.strip_open;
                 ui.checkbox(&mut open, "Тонкая полоска сессии (как в uTorrent)");
@@ -3175,7 +3205,7 @@ impl TrackerApp {
                 self.state.cfg_handle.min_ram_mb,
             ));
         });
-        card(ui, "Таблица сессий", |ui| {
+        card(ui, skin.tokens(), "Таблица сессий", |ui| {
             // Строка управления: кнопки слева, итог справа. Отступ справа —
             // тот же CARD_INNER, что слева (раньше стоял отдельный 15px,
             // из-за чего правый край строки не совпадал с краем таблицы).
@@ -3270,9 +3300,11 @@ impl TrackerApp {
     }
 
     fn ui_games(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, "Игры и программы под наблюдением");
+        // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
+        let skin = self.theme.current().clone();
+        page_title(ui, skin.tokens(), "Игры и программы под наблюдением");
         // Подраздел 1: сканирование + список.
-        card(ui, "Сканирование и список игр", |ui| {
+        card(ui, skin.tokens(), "Сканирование и список игр", |ui| {
             ui.horizontal_wrapped(|ui| {
             if ui.button("Сканировать Steam").clicked() {
                 let found = detector::scan_steam_games(None);
@@ -3337,7 +3369,7 @@ impl TrackerApp {
                                 Some(_) => {}
                                 None if synced => {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 165, 0),
+                                        self.theme.current().tokens().palette.semantic.warn,
                                         "⊗",
                                     )
                                     .on_hover_text(
@@ -3346,7 +3378,7 @@ impl TrackerApp {
                                 }
                                 None => {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(0x8F, 0x98, 0xA0),
+                                        self.theme.current().tokens().palette.text.muted,
                                         "?",
                                     )
                                     .on_hover_text(
@@ -3377,7 +3409,7 @@ impl TrackerApp {
             });
         });
         // Подраздел 2: Steam Web API + общее время.
-        card(ui, "Steam Web API и общее время", |ui| {
+        card(ui, skin.tokens(), "Steam Web API и общее время", |ui| {
             ui.label("API key:");
             ui.text_edit_singleline(&mut self.state.api_key);
             ui.label("SteamID64:");
@@ -3403,7 +3435,9 @@ impl TrackerApp {
     }
 
     fn ui_alarms(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, "Будильники");
+        // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
+        let skin = self.theme.current().clone();
+        page_title(ui, skin.tokens(), "Будильники");
         page_note(
             ui,
             "Время любого будильника (в т.ч. неактивного) меняется кнопкой «Изменить» в любой момент.",
@@ -3413,7 +3447,7 @@ impl TrackerApp {
         // Отзывчивая таблица: ширины колонок — доли ширины окна, длинные
         // значения режутся многоточием (полные — в ховере). При сужении окна
         // таблица сжимается, а не смещает разделы и не уезжает вбок.
-        card(ui, "Список будильников", |ui| {
+        card(ui, skin.tokens(), "Список будильников", |ui| {
         table_scroll(ui, "alarms_scroll", 240.0, |ui| {
             let ws = col_widths(ui, &[0.55, 1.05, 0.4, 0.6, 1.2, 1.0, 0.6], 205.0);
             egui::Grid::new("alarms_grid").num_columns(8).striped(true).show(ui, |ui| {
@@ -3481,7 +3515,7 @@ impl TrackerApp {
             });
         });
         });
-        card(ui, "Новый будильник", |ui| {
+        card(ui, skin.tokens(), "Новый будильник", |ui| {
         ui.horizontal(|ui| {
             ui.label("Час:");
             time_field(ui, &mut self.state.alarm_h, 23);
@@ -3570,7 +3604,7 @@ impl TrackerApp {
         // --- чтобы таблица и все кнопки действий всегда оставались на месте.
         let enabled: Vec<AlarmRow> = self.state.alarms.iter().filter(|a| a.enabled).cloned().collect();
         if !enabled.is_empty() {
-        card(ui, "Аналоговые часы", |ui| {
+        card(ui, skin.tokens(), "Аналоговые часы", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.state.show_analog, "Аналоговые часы для активного будильника");
             });
@@ -3644,8 +3678,10 @@ impl TrackerApp {
     }
 
     fn ui_timer(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, "Таймер обратного отсчёта");
-        card(ui, "Таймер", |ui| {
+        // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
+        let skin = self.theme.current().clone();
+        page_title(ui, skin.tokens(), "Таймер обратного отсчёта");
+        card(ui, skin.tokens(), "Таймер", |ui| {
         ui.horizontal_wrapped(|ui| {
             for (label, secs) in [("1 мин", 60u64), ("5 мин", 300), ("10 мин", 600), ("15 мин", 900), ("30 мин", 1800), ("1 час", 3600)] {
                 if ui.button(label).clicked() {
@@ -3721,7 +3757,7 @@ impl TrackerApp {
         });
 
         // ---------- Секундомер ----------
-        card(ui, "Секундомер", |ui| {
+        card(ui, skin.tokens(), "Секундомер", |ui| {
         ui.heading(format_stopwatch(self.stopwatch_elapsed()));
         ui.horizontal_wrapped(|ui| {
             if ui.button("Старт").clicked() {
@@ -3818,9 +3854,11 @@ impl TrackerApp {
     }
 
     fn ui_shortcuts(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, "Параметры");
+        // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
+        let skin = self.theme.current().clone();
+        page_title(ui, skin.tokens(), "Параметры");
         page_note(ui, "Масштаб интерфейса, авто-трекинг и горячие клавиши.");
-        card(ui, "Масштаб интерфейса", |ui| {
+        card(ui, skin.tokens(), "Масштаб интерфейса", |ui| {
         ui.label("Ползунок применяется после отпускания, шаги — кнопками −/+, сброс — 100%.");
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("100%").clicked() {
@@ -3857,7 +3895,7 @@ impl TrackerApp {
         });
         });
         // Обновления: частота, автоматическая проверка, «ставить молча».
-        card(ui, "Обновления", |ui| {
+        card(ui, skin.tokens(), "Обновления", |ui| {
             let mut c = self.state.cfg_handle.clone();
             // Сравниваем с черновиком `c`, а не с сохранённым значением:
             // иначе выбранный вариант не подсвечивался бы до нажатия
@@ -3932,7 +3970,7 @@ impl TrackerApp {
             }
         });
         // Авто-трекинг живёт здесь (переехал из вкладки «Игры»).
-        card(ui, "Авто-трекинг (GPU-гейт)", |ui| {
+        card(ui, skin.tokens(), "Авто-трекинг (GPU-гейт)", |ui| {
         ui.collapsing("Настройки", |ui| {
             let mut c = self.state.cfg_handle.clone();
             ui.checkbox(&mut c.require_gpu, "Требовать нагрузку на видеокарту (лаунчер без VRAM игнорируется)");
@@ -3957,11 +3995,11 @@ impl TrackerApp {
             ui.label("Как это работает: каждый опрос сверяем процессы с вашим списком игр; PID проверяем в NVML. Есть VRAM выше порога — идёт игра, стартует/продолжается сессия. Нет — это лаунчер/фон, сессия не пишется.");
         });
         });
-        card(ui, "Горячие клавиши и кнопки мыши", |ui| {
+        card(ui, skin.tokens(), "Горячие клавиши и кнопки мыши", |ui| {
         ui.label("Нажмите «Изменить», затем клавиши (с Ctrl/Alt/Shift) или кнопку мыши — подойдут и дополнительные Mouse4/Mouse5. Сохраняется автоматически в shortcuts.json. Esc в режиме захвата — отмена (поэтому Esc назначить нельзя).");
         if let Some(id) = self.state.capture_action.clone() {
             ui.colored_label(
-                egui::Color32::YELLOW,
+                self.theme.current().tokens().palette.semantic.attention,
                 format!("Нажмите клавиши или кнопку мыши для «{}»… (Esc — отмена)", action_label(&id)),
             );
         }
@@ -4057,7 +4095,9 @@ impl TrackerApp {
 
     /// Подраздел «О программе»: версия, обновления, сообщить о проблеме.
     fn about_program(&mut self, ui: &mut egui::Ui) {
-        card(ui, "О программе", |ui| {
+        // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
+        let skin = self.theme.current().clone();
+        card(ui, skin.tokens(), "О программе", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(format!("{APP_NAME}"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -4131,7 +4171,7 @@ impl TrackerApp {
         // Сначала короткая аннотация — «зачем программа», как аннотация
         // к книге. Без технических деталей, чтобы её можно было прочитать
         // за десять секунд и понять, нужна ли программа вообще.
-        card(ui, "О программе", |ui| {
+        card(ui, self.theme.current().tokens(), "О программе", |ui| {
             ui.add(egui::Label::new(MANUAL_ANNOTATION).wrap());
             ui.add_space(8.0);
             ui.add(egui::Label::new(MANUAL_ANNOTATION_CONT).wrap());
@@ -4141,21 +4181,21 @@ impl TrackerApp {
         // (линия + воздух), иначе сплошной текст сливается в стену.
         ui.add_space(4.0);
         page_rule(ui);
-        page_title(ui, "Руководство");
+        page_title(ui, self.theme.current().tokens(), "Руководство");
         page_note(
             ui,
             "Разделы идут в порядке вкладок. Каждый блок — отдельный раздел.",
         );
         for (i, (title, text)) in MANUAL_SECTIONS.iter().enumerate() {
-            manual_section(ui, title, text, i + 1 == MANUAL_SECTIONS.len());
+            manual_section(ui, self.theme.current().tokens(), title, text, i + 1 == MANUAL_SECTIONS.len());
         }
-        card(ui, "Согласие на использование", |ui| {
+        card(ui, self.theme.current().tokens(), "Согласие на использование", |ui| {
             ui.add(egui::Label::new(
                 "Программа работает полностью локально: сессии, будильники и настройки хранятся на вашем ПК (SQLite и JSON). За пределы ПК данные уходят только по вашей явной команде: запросы Steam Web API (ваш ключ и SteamID), проверка обновлений и проверка соединения с GitHub. Используя программу, вы соглашаетесь с локальным хранением этих данных.",
             )
             .wrap());
         });
-        card(ui, "Правила пользования (user agreement)", |ui| {
+        card(ui, self.theme.current().tokens(), "Правила пользования (user agreement)", |ui| {
             for r in USER_AGREEMENT {
                 ui.add(egui::Label::new(*r).wrap());
             }
@@ -4165,7 +4205,7 @@ impl TrackerApp {
 
     /// Подраздел «Журнал изменений».
     fn about_changelog(&mut self, ui: &mut egui::Ui) {
-        card(ui, "Журнал изменений", |ui| {
+        card(ui, self.theme.current().tokens(), "Журнал изменений", |ui| {
             for (v, d, changes) in CHANGELOG {
                 ui.strong(format!("{v} — {d}"));
                 for c in *changes {
@@ -4178,7 +4218,7 @@ impl TrackerApp {
 
     /// Подраздел «Горячие клавиши» (список обновляется сам).
     fn about_keys(&mut self, ui: &mut egui::Ui) {
-        card(ui, "Горячие клавиши", |ui| {
+        card(ui, self.theme.current().tokens(), "Горячие клавиши", |ui| {
             ui.label(self.shortcuts_doc());
         });
     }
@@ -4369,7 +4409,10 @@ impl TrackerApp {
                             let day = s.start_time.get(0..10).unwrap_or("").to_string();
                             if day != last_day {
                                 last_day = day.clone();
-                                ui.colored_label(egui::Color32::GRAY, format!("=== {day} ==="));
+                                ui.colored_label(
+                                    self.theme.current().tokens().palette.text.muted,
+                                    format!("=== {day} ==="),
+                                );
                                 ui.label(""); ui.label(""); ui.label(""); ui.label("");
                                 ui.end_row();
                             }
@@ -4912,14 +4955,14 @@ fn page_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// Заголовок раздела на общей вертикали с карточками.
-fn page_title(ui: &mut egui::Ui, title: &str) {
+fn page_title(ui: &mut egui::Ui, tokens: &Tokens, title: &str) {
     page_row(ui, |ui| {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(title)
                     .size(21.0)
                     .strong()
-                    .color(egui::Color32::from_rgb(0xE8, 0xF0, 0xF7)),
+                    .color(tokens.palette.text.heading),
             ),
         );
     });
@@ -4942,13 +4985,15 @@ fn page_rule(ui: &mut egui::Ui) {
 /// Карточка раздела в web-стиле: скруглённая панель с заголовком-акцентом
 /// и визуальным отделением областей друг от друга. Ширина — вся доступная
 /// (уже с полями страницы), поэтому блоки разных разделов совпадают.
-fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+fn card(
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     egui::Frame {
         fill: ui.visuals().faint_bg_color,
-        stroke: egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgb(0x2A, 0x47, 0x5E),
-        ),
+        stroke: egui::Stroke::new(1.0_f32, tokens.palette.border.subtle),
         rounding: egui::Rounding::same(CARD_ROUNDING),
         inner_margin: egui::Margin::same(CARD_INNER),
         outer_margin: egui::Margin {
@@ -4964,7 +5009,7 @@ fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             egui::RichText::new(title)
                 .size(15.0)
                 .strong()
-                .color(egui::Color32::from_rgb(0x66, 0xC0, 0xF4)),
+                .color(tokens.palette.accent.primary),
         );
         ui.add_space(6.0);
         add(ui);
@@ -5116,7 +5161,7 @@ fn strip_row(
                     egui::Label::new(
                         egui::RichText::new("Нет активной сессии")
                             .font(egui::FontId::proportional(12.0 * zoom))
-                            .color(egui::Color32::from_rgb(0x9A, 0xA4, 0xAD)),
+                            .color(tokens.palette.text.muted),
                     )
                     .truncate(),
                 );
@@ -5130,7 +5175,8 @@ fn strip_row(
                     egui::Label::new(
                         egui::RichText::new(n)
                             .font(egui::FontId::proportional(12.0 * zoom))
-                            .color(egui::Color32::WHITE),
+                            // TODO(1.4): переименовать on_accent → text.bright (не только для акцента).
+                            .color(tokens.palette.text.on_accent),
                     )
                     .truncate(),
                 );
@@ -5139,9 +5185,9 @@ fn strip_row(
                         egui::RichText::new(format_duration(secs))
                             .font(egui::FontId::monospace(12.0 * zoom))
                             .color(if pending {
-                                egui::Color32::from_rgb(0x9A, 0xA4, 0xAD)
+                                tokens.palette.text.muted
                             } else {
-                                egui::Color32::from_rgb(0x8C, 0xFF, 0x5A)
+                                tokens.palette.semantic.ok
                             }),
                     )
                     .truncate(),
