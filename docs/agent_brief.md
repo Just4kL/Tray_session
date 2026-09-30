@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-01
-Обновил: агент-сессия — pre-release 0.7.33-beta.1 в подготовке
+Обновил: агент-сессия — tasks.md как чек-лист со статусами и датами
 
 ## Проект
 
@@ -18,7 +18,7 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `f127ffb` (release: 0.7.33-beta.1 binaries + manifest)
+- HEAD: `9646921` (fix(C9 v2): показ окна из трея через WinAPI + taskbar(false))
 - Тесты: 159 зелёных
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
@@ -46,7 +46,13 @@ Pre-release 0.7.33-beta.1 в подготовке: бамп версии + би�
 | `42365fd` | fix RAM: `memory()/1024` → `bytes_to_mb` в `monitor.rs:94`, `detector.rs:412` | `src/gpu.rs` (хелпер + тест), `docs/bugs.md` |
 | `b4e668a` | 1.2.a.4: +5 токенов, свап 20 мест (B: 9, Q: 11), бриф → `docs/` | `src/app.rs`, `src/ui/theme/*`, `docs/*`, `tools/adapt-calls-1.2a.4.ps1`, `fix-skin-1.2a.4.ps1` |
 | `2feb126` | AU-1: ручная проверка учитывает канал + AUTO-UPD в tasks.md | `src/app.rs`, `src/update.rs` (allow), `docs/tasks.md`, `docs/agent_brief.md` |
-
+| `785705f` | fix(C5): single-instance через именованный mutex | `src/main.rs`, `Cargo.toml` (фичи winapi) |
+| `a598516` | chore: bump version to 0.7.33-beta.1 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `f127ffb` | release: 0.7.33-beta.1 binaries + manifest | `TraySession.exe`, `Tray_session_setup.exe`, `update_manifest.json` |
+| `2467fdc` | docs: agent_brief под 0.7.33-beta.1 | `docs/agent_brief.md` |
+| `67101e5` | fix: ComboBox-черновики (C10/C11), show_main_window WinAPI (C9), BUILD из build.rs (C8) | `src/app.rs`, `src/app_state.rs`, `build.rs`, `Cargo.toml` |
+| `04f78cc` | fix(C9): скрытие в трей через Minimized + guard-тест | `src/app.rs` |
+| `9646921` | fix(C9 v2): показ окна из трея через WinAPI + taskbar(false) | `src/main.rs`, `src/app.rs` (hide_tray) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
@@ -56,7 +62,8 @@ debug-сборки: 12 секунд полёт нормальный; число 
 
 ## Очередь следующего
 
-Единый бэклог: `docs/tasks.md`.
+Единый бэклог: `docs/tasks.md` (чек-лист со статусами `[ ]/[~]/[x]`, датами,
+приоритетами; закрытые — в архиве внизу файла).
 
 1. **Фаза 2** — `LayoutSpec` + `engine.rs` (H1). Лечит layout со скриншота:
    панели не привязаны к `screen_rect`, блоки плывут.
