@@ -2063,28 +2063,39 @@ impl TrackerApp {
     /// Ресайз — невидимой рамкой за край (THICKFRAME через WinAPI).
     fn show_stopwatch_overlay(&mut self, ctx: &egui::Context) {
         let vp_id = stopwatch_viewport_id();
-        // Восстановление позиции: только на живом мониторе, иначе — как даст ОС.
-        if self.state.overlay_place_pending {
+        // Позиция вычисляется ДО создания вьюпорта и передаётся через
+        // builder: команда send_viewport_cmd_to на первом кадре после
+        // reopen уходила в ещё не существующий viewport и терялась,
+        // а старый код вдобавок ставил угол монитора вместо позиции.
+        let initial_pos = if self.state.overlay_place_pending {
             self.state.overlay_place_pending = false;
-            self.place_overlay_on_saved_mon(ctx, vp_id);
-        }
+            self.compute_overlay_pos_on_saved_mon(ctx)
+        } else {
+            None
+        };
         ensure_thickframe(STOPWATCH_TITLE);
         apply_overlay_opacity(self.state.stopwatch_opacity_pct / 100.0);
         let size = stopwatch_window_size(self.state.stopwatch_expanded);
         // Размер в поинтах держим в одном состоянии: сведения о нём читают и
-        // place_overlay_on_saved_mon, и проверка границ экрана, поэтому
+        // compute_overlay_pos_on_saved_mon, и проверка границ экрана, поэтому
         // берём его из одного места, а не пересчитываем на трёх.
         self.state.last_stopwatch_size = size;
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(STOPWATCH_TITLE)
+            .with_inner_size(size)
+            .with_min_inner_size([150.0, 140.0])
+            .with_always_on_top()
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_taskbar(false);
+        // with_position действует только при СОЗДАНИИ viewport (первый
+        // кадр после reopen) — именно этот момент нам и нужен.
+        if let Some(pos) = initial_pos {
+            builder = builder.with_position(pos);
+        }
         ctx.show_viewport_immediate(
             vp_id,
-            egui::ViewportBuilder::default()
-                .with_title(STOPWATCH_TITLE)
-                .with_inner_size(size)
-                .with_min_inner_size([150.0, 140.0])
-                .with_always_on_top()
-                .with_decorations(false)
-                .with_resizable(true)
-                .with_taskbar(false),
+            builder,
             |c, _| {
                 egui::CentralPanel::default().show(c, |ui| {
                     self.draw_stopwatch_mini(ui, vp_id);
@@ -2106,17 +2117,20 @@ impl TrackerApp {
         );
     }
 
-    /// Вернуть окошко на запомненное место, только если там живой монитор.
-    /// Точка берётся с запасом внутрь окна: иначе после смены разрешения
-    /// (или отключения экрана) угол попадает в невидимую область и окно
-    /// «уезжает» за край. Проверка идёт по пересечению с рабочей областью.
-    fn place_overlay_on_saved_mon(&mut self, ctx: &egui::Context, vp_id: egui::ViewportId) {
-        let Some(p) = self.state.cfg_handle.stopwatch_pos else { return };
+    /// Вычислить стартовую позицию окошка по запомненному месту.
+    ///
+    /// Возвращает позицию, прижатую к рабочей области живого монитора.
+    /// `None` — ставить некуда (нет запомненной точки или нет мониторов):
+    /// тогда решает ОС. Чистая функция вычисления (без отправки команд):
+    /// отправка через `send_viewport_cmd_to` до создания viewport терялась,
+    /// поэтому позиция идёт через `ViewportBuilder::with_position`.
+    fn compute_overlay_pos_on_saved_mon(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
+        let p = self.state.cfg_handle.stopwatch_pos?;
         #[cfg(windows)]
         {
             let mons = enum_monitor_work_areas();
             if mons.is_empty() {
-                return;
+                return None;
             }
             let size = stopwatch_window_size(self.state.stopwatch_expanded);
             // Поинты → пиксели: экранные координаты и рабочие области
@@ -2124,24 +2138,16 @@ impl TrackerApp {
             let ppp = ctx.pixels_per_point();
             let w = (size.x * ppp) as i32;
             let h = (size.y * ppp) as i32;
-            // Углы окна в экранных координатах.
             let x0 = p[0] as i32;
             let y0 = p[1] as i32;
-            let Some((l, t, _r, _b)) = nearest_monitor_for_rect(&mons, x0, y0, w, h) else {
-                return;
-            };
-            // Верхний левый угол с запасом 1px внутрь рабочей области.
-            ctx.send_viewport_cmd_to(
-                vp_id,
-                egui::ViewportCommand::OuterPosition(egui::pos2((l + 1) as f32, (t + 1) as f32)),
-            );
+            let work = nearest_monitor_for_rect(&mons, x0, y0, w, h)?;
+            let (x, y) = clamp_overlay_pos(p, work, (w, h));
+            Some(egui::pos2(x, y))
         }
         #[cfg(not(windows))]
         {
-            ctx.send_viewport_cmd_to(
-                vp_id,
-                egui::ViewportCommand::OuterPosition([p[0], p[1]].into()),
-            );
+            let _ = ctx;
+            Some(egui::pos2(p[0], p[1]))
         }
     }
 
@@ -5302,6 +5308,20 @@ fn clamp_into_work_areas(
     (cx, cy)
 }
 
+/// Прижать запомненную позицию к рабочей области монитора с запасом 1px
+/// внутрь (чтобы угол не попадал в невидимую область после смены
+/// разрешения). В отличие от `clamp_into_work_areas`, работает в f32
+/// и держит отступ от краёв: используется для стартовой позиции оверлея.
+fn clamp_overlay_pos(p: [f32; 2], work: (i32, i32, i32, i32), size: (i32, i32)) -> (f32, f32) {
+    let (l, t, r, b) = work;
+    let (w, h) = size;
+    // .max защищает от инверсии границ, если окно больше монитора.
+    (
+        p[0].clamp((l + 1) as f32, (r - w - 1).max(l + 1) as f32),
+        p[1].clamp((t + 1) as f32, (b - h - 1).max(t + 1) as f32),
+    )
+}
+
 /// Перетаскивание окна за фон (кнопки лежат выше).
 /// На Windows — нативным захватом ОС (ReleaseCapture + WM_NCLBUTTONDOWN),
 /// поэтому окно идёт строго за курсором 1:1 без лагов, двоения и залипаний:
@@ -6199,6 +6219,21 @@ mod tests {
         // Далеко за всеми экранами — берём ближайший по расстоянию.
         assert_eq!(nearest_monitor_for_rect(&mons, 8000, 100, 460, 26), Some((1920, 0, 5760, 2160)));
         assert_eq!(nearest_monitor_for_rect(&[], 0, 0, 10, 10), None);
+    }
+
+    #[test]
+    fn saved_pos_clamps_to_work_area() {
+        // Позиция в углу экрана остаётся как есть
+        let (x, y) = clamp_overlay_pos([100.0, 200.0], (0, 0, 1920, 1080), (300, 200));
+        assert_eq!((x, y), (100.0, 200.0));
+
+        // Позиция за правым краем прижимается к (r - w - 1)
+        let (x, y) = clamp_overlay_pos([5000.0, 5000.0], (0, 0, 1920, 1080), (300, 200));
+        assert_eq!((x, y), (1619.0, 879.0));
+
+        // Позиция за левым/верхним краем прижимается к (l+1, t+1)
+        let (x, y) = clamp_overlay_pos([-100.0, -100.0], (0, 0, 1920, 1080), (300, 200));
+        assert_eq!((x, y), (1.0, 1.0));
     }
 
     #[test]
