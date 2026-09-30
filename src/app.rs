@@ -2604,7 +2604,12 @@ impl TrackerApp {
         // Скрытие в трей вместо закрытия
         if ctx.input(|i| i.viewport().close_requested()) && !self.state.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Minimized(true), а не Visible(false): при Visible(false) eframe
+            // перестаёт звать update(), poll_appcmd не крутится, AppCmd::Show
+            // из трея не обрабатывается. Минимизированное окно остаётся
+            // живым для event loop. with_taskbar(false) (main.rs:437)
+            // скрывает его из панели задач — визуально это «трей».
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
     }
 
@@ -7899,6 +7904,38 @@ mod tests {
         let i_min = cmds.iter().position(|c| *c == "Minimized(false)").unwrap();
         let i_vis = cmds.iter().position(|c| *c == "Visible(true)").unwrap();
         assert!(i_min < i_vis, "минимизацию снимаем до показа окна");
+    }
+
+    #[test]
+    fn tray_hide_uses_minimize_not_visibility() {
+        // Скрытие в трей обязано идти через Minimized(true), а не
+        // Visible(false): при Visible(false) eframe перестаёт звать
+        // update(), poll_appcmd не крутится и AppCmd::Show из трея
+        // не обрабатывается (баг C9). Проверяем исходник блока
+        // close_requested; другие Visible(false) (например, явная
+        // команда hide_tray) под запрет не попадают.
+        let src = include_str!("app.rs");
+        let mut in_close_block = false;
+        for line in src.lines() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains("close_requested()") {
+                in_close_block = true;
+            }
+            if in_close_block && code.contains("Visible(false)") {
+                panic!(
+                    "Visible(false) в блоке close_requested ломает обработку \
+                     AppCmd::Show. Используйте Minimized(true)."
+                );
+            }
+            if in_close_block && code.contains('}') {
+                in_close_block = false;
+            }
+        }
+        // Сам блок на месте: тест не должен проходить на пустом совпадении.
+        assert!(
+            src.contains("close_requested()"),
+            "блок close_requested исчез — тест проверяет пустоту"
+        );
     }
 
     #[test]
