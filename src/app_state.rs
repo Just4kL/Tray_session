@@ -175,6 +175,14 @@ pub struct AppState {
     /// Черновик масштаба интерфейса: правится ползунком без перестройки UI,
     /// применяется (commit_scale) при отпускании ползунка или кнопками.
     pub scale_draft: Option<f32>,
+    /// Черновики настроек обновлений: правятся в UI без записи в конфиг,
+    /// применяются кнопкой «Сохранить настройки обновлений». Паттерн как
+    /// у scale_draft: без черновика ComboBox писал бы в клон, умиравший
+    /// в конце кадра, и выбор не сохранялся бы (баг C11).
+    pub update_freq_draft: Option<u8>,
+    pub update_auto_draft: Option<bool>,
+    pub update_silent_draft: Option<bool>,
+    pub update_channel_draft: Option<String>,
     /// Пользовательские шорткаты (shortcuts.json, автосохранение).
     pub shortcuts: ShortcutStore,
     /// Захват нового шортката: id действия + время старта (анти-дребезг).

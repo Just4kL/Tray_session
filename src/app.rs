@@ -17,7 +17,9 @@ pub const APP_NAME: &str = "Tray Session";
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
 pub const VERSION: &str = "0.7.33-beta.1";
-pub const BUILD: &str = "20260929";
+// Номер сборки (дата YYYYMMDD). Генерируется build.rs при каждой сборке,
+// руками не правится (раньше забывался при бампе версии).
+include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 pub const ISSUE_URL: &str = "https://example.com/issues";
 /// Заголовок окошка секундомера (он же ключ для поиска HWND под WinAPI).
 pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
@@ -1192,6 +1194,10 @@ impl TrackerApp {
                 last_gpu_check: Instant::now() - Duration::from_secs(99),
                 status_msg: String::new(),
                 scale_draft: None,
+                update_freq_draft: None,
+                update_auto_draft: None,
+                update_silent_draft: None,
+                update_channel_draft: None,
                 shortcuts: ShortcutStore::load(),
                 capture_action: None,
                 capture_armed_at: 0.0,
@@ -2550,9 +2556,32 @@ impl TrackerApp {
     /// Нужны все три команды: снять минимизацию, показать и активировать
     /// (последнее выводит окно поверх остальных и убирает его с таскбара).
     fn show_main_window(&mut self, ctx: &egui::Context) {
+        // egui-команды на случай если winit всё-таки обработает
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
+        // Прямой WinAPI-путь: гарантированно показывает окно, если
+        // egui-winit не справился. Проверено в C5 (single-instance).
+        #[cfg(windows)]
+        {
+            use winapi::um::winuser::{
+                FindWindowW, IsIconic, SetForegroundWindow, ShowWindow,
+                SW_RESTORE, SW_SHOW,
+            };
+            let title: Vec<u16> = "Tray Session\0".encode_utf16().collect();
+            unsafe {
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if !hwnd.is_null() {
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        ShowWindow(hwnd, SW_SHOW);
+                    }
+                    SetForegroundWindow(hwnd);
+                }
+            }
+        }
     }
 
     fn poll_appcmd(&mut self, ctx: &egui::Context) {
@@ -3910,43 +3939,70 @@ impl TrackerApp {
         });
         // Обновления: частота, автоматическая проверка, «ставить молча».
         card(ui, skin.tokens(), "Обновления", |ui| {
-            let mut c = self.state.cfg_handle.clone();
-            // Сравниваем с черновиком `c`, а не с сохранённым значением:
-            // иначе выбранный вариант не подсвечивался бы до нажатия
-            // «Сохранить» — список как будто не реагирует на клик.
-            let draft_freq = crate::update::UpdateFreq::from_code(c.update_freq);
+            // Черновики живут в AppState, а не в локальном клоне: клон
+            // умирал бы в конце кадра вместе с выбором (баг C11), а
+            // черновик переживает кадры до нажатия «Сохранить».
+            // None = черновика нет, показываем сохранённое значение.
+            // Сохранённое копируем в локальные переменные (а не держим
+            // &self): замыкания ниже пишут в self, и ссылка через них
+            // не пережила бы проверку заимствований.
+            let committed_freq = self.state.cfg_handle.update_freq;
+            let committed_auto = self.state.cfg_handle.update_auto;
+            let committed_silent = self.state.cfg_handle.update_silent;
+            let committed_channel = self.state.cfg_handle.update_channel.clone();
+            let shown_freq = self.state.update_freq_draft.unwrap_or(committed_freq);
+            let shown_freq = crate::update::UpdateFreq::from_code(shown_freq);
             egui::ComboBox::from_label("Проверять свежие сборки")
-                .selected_text(draft_freq.label())
+                .selected_text(shown_freq.label())
                 .show_ui(ui, |ui| {
                     for f in crate::update::UpdateFreq::all() {
                         if ui
-                            .selectable_label(f == draft_freq, f.label())
+                            .selectable_label(f == shown_freq, f.label())
                             .clicked()
                         {
-                            c.update_freq = f.code();
+                            // Клик обратно в сохранённое значение гасит черновик.
+                            self.state.update_freq_draft =
+                                (f.code() != committed_freq).then_some(f.code());
                         }
                     }
                 });
+            let mut auto = self.state.update_auto_draft.unwrap_or(committed_auto);
             ui.checkbox(
-                &mut c.update_auto,
+                &mut auto,
                 "Проверять автоматически (не только по кнопке)",
             );
+            self.state.update_auto_draft =
+                (auto != committed_auto).then_some(auto);
+            let mut silent = self
+                .state
+                .update_silent_draft
+                .unwrap_or(committed_silent);
             ui.checkbox(
-                &mut c.update_silent,
+                &mut silent,
                 "Ставить найденное молча, не спрашивая",
             );
+            self.state.update_silent_draft =
+                (silent != committed_silent).then_some(silent);
             // Канал: стабильный или бета. Без него бетовые сборки обновлялись
             // бы по стабильной ветке и молча откатывались назад.
-            let draft_channel = crate::update::normalize_channel(&c.update_channel);
+            let shown_channel = self
+                .state
+                .update_channel_draft
+                .as_deref()
+                .unwrap_or(&committed_channel);
+            let shown_channel = crate::update::normalize_channel(shown_channel);
             egui::ComboBox::from_label("Канал обновлений")
-                .selected_text(crate::update::channel_label(draft_channel))
+                .selected_text(crate::update::channel_label(shown_channel))
                 .show_ui(ui, |ui| {
                     for ch in crate::update::CHANNELS {
                         if ui
-                            .selectable_label(*ch == draft_channel, crate::update::channel_label(ch))
+                            .selectable_label(*ch == shown_channel, crate::update::channel_label(ch))
                             .clicked()
                         {
-                            c.update_channel = (*ch).to_string();
+                            let same = crate::update::normalize_channel(ch)
+                                == crate::update::normalize_channel(&committed_channel);
+                            self.state.update_channel_draft =
+                                (!same).then(|| (*ch).to_string());
                         }
                     }
                 });
@@ -3966,19 +4022,31 @@ impl TrackerApp {
                 )
                 .wrap(),
             );
-            let changed = c.update_freq != self.state.cfg_handle.update_freq
-                || c.update_auto != self.state.cfg_handle.update_auto
-                || c.update_silent != self.state.cfg_handle.update_silent
-                || crate::update::normalize_channel(&c.update_channel)
-                    != crate::update::normalize_channel(&self.state.cfg_handle.update_channel);
+            // Кнопка активна, пока есть неприменённые черновики.
+            let changed = self.state.update_freq_draft.is_some()
+                || self.state.update_auto_draft.is_some()
+                || self.state.update_silent_draft.is_some()
+                || self.state.update_channel_draft.is_some();
             if ui
                 .add_enabled(changed, egui::Button::new("Сохранить настройки обновлений"))
                 .clicked()
             {
-                if let Ok(mut g) = self.state.cfg.write() {
-                    *g = c.clone();
+                // Применяем черновики в сохранённый конфиг и гасим их.
+                if let Some(v) = self.state.update_freq_draft.take() {
+                    self.state.cfg_handle.update_freq = v;
                 }
-                self.state.cfg_handle = c.clone();
+                if let Some(v) = self.state.update_auto_draft.take() {
+                    self.state.cfg_handle.update_auto = v;
+                }
+                if let Some(v) = self.state.update_silent_draft.take() {
+                    self.state.cfg_handle.update_silent = v;
+                }
+                if let Some(v) = self.state.update_channel_draft.take() {
+                    self.state.cfg_handle.update_channel = v;
+                }
+                if let Ok(mut g) = self.state.cfg.write() {
+                    *g = self.state.cfg_handle.clone();
+                }
                 self.persist_if_changed();
                 self.state.status_msg = "Настройки обновлений сохранены.".to_string();
             }
