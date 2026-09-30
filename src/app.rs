@@ -1209,7 +1209,11 @@ impl TrackerApp {
                 stopwatch_opacity_pct: cfg_handle.stopwatch_opacity_pct,
                 stopwatch_expanded: cfg_handle.stopwatch_expanded,
                 stopwatch_drag_pos: None,
-                overlay_place_pending: false,
+                // При старте с уже открытым оверлеем set_stopwatch_overlay
+                // не вызывается, поэтому флаг взводим сразу из конфига:
+                // иначе позиция не восстановится и ОС поставит окно рядом
+                // с основным. При закрытом оверлее — false, как раньше.
+                overlay_place_pending: cfg_handle.stopwatch_overlay,
                 last_ppp: 0.0,
                 laps_scroll: 0.0,
                 strip_open: cfg_handle.strip_open,
@@ -6353,19 +6357,19 @@ mod tests {
                                 ui.painter().vline(
                                     origin.x + f,
                                     egui::Rangef::new(origin.y, origin.y + cell),
-                                    egui::Stroke::new(1.0, grid),
+                                    egui::Stroke::new(1.0_f32, grid),
                                 );
                                 ui.painter().hline(
                                     egui::Rangef::new(origin.x, origin.x + cell),
                                     origin.y + f,
-                                    egui::Stroke::new(1.0, grid),
+                                    egui::Stroke::new(1.0_f32, grid),
                                 );
                             }
                             // Контур клетки иконки.
                             ui.painter().rect_stroke(
                                 r.shrink(1.0),
                                 0.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3A, 0x4A, 0x5A)),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x3A, 0x4A, 0x5A)),
                             );
                             // Сама иконка: белая, на тёмном фоне — контрастно.
                             paint_nav_icon(
