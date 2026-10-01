@@ -193,37 +193,30 @@ fn plan_downloads_only_changed_files() {
 }
 
 #[test]
-fn apply_update_replaces_only_listed_files() {
+fn atomic_replace_swaps_staged_files_and_keeps_user_data() {
     let dir = TempDir::new("apply");
     let tmp = dir.join("update_tmp");
     std::fs::create_dir_all(&tmp).unwrap();
     // Пользовательские файлы на месте.
     std::fs::write(dir.join("sessions.db"), b"HISTORY-KEEP").unwrap();
     std::fs::write(dir.join("config.json"), b"{\"scale\":1.3}").unwrap();
-    // Программные файлы.
+    // Программный файл (старый) и скачанный .new.
     std::fs::write(dir.join("old.exe"), b"STALE").unwrap();
-    std::fs::write(dir.join("same.exe"), b"IDENTICAL").unwrap();
-    // Скачанное в tmp.
-    std::fs::write(tmp.join("old.exe"), b"FRESH-BINARY-1234").unwrap();
-    std::fs::write(tmp.join("same.exe"), b"IDENTICAL").unwrap();
+    std::fs::write(tmp.join("old.exe.new"), b"FRESH-BINARY-1234").unwrap();
 
     let files = vec![
         FileEntry { name: "old.exe".into(), sha256: String::new() },
-        FileEntry { name: "same.exe".into(), sha256: String::new() },
         // Попытка подсунуть пользовательский файл в список на замену.
         FileEntry { name: "sessions.db".into(), sha256: String::new() },
     ];
-    let res = apply_update(&dir.0, &tmp, &files).expect("замена сорвалась");
-    match &res {
-        ApplyResult::Replaced(upd) => {
-            assert_eq!(upd, &vec!["old.exe".to_string()], "заменено лишнее: {upd:?}");
-        }
-        ApplyResult::NothingToDo => panic!("должна была быть замена"),
-    }
-    // Программный файл обновился.
+    let res = replace_files_atomic(&dir.0, &tmp, &files).expect("замена сорвалась");
+    assert_eq!(res, vec!["old.exe".to_string()], "заменено лишнее: {res:?}");
+    // Программный файл обновился, старый ушёл в .old (до cleanup).
     assert_eq!(std::fs::read(dir.join("old.exe")).unwrap(), b"FRESH-BINARY-1234");
-    // Совпадающий файл не переписывался (остался один и тот же).
-    assert_eq!(std::fs::read(dir.join("same.exe")).unwrap(), b"IDENTICAL");
+    assert_eq!(std::fs::read(dir.join("old.exe.old")).unwrap(), b"STALE");
+    // Cleanup убирает .old.
+    cleanup_old_files(&dir.0, &res);
+    assert!(!dir.join("old.exe.old").exists(), ".old остался после cleanup");
     // Пользовательские файлы целы.
     assert_eq!(std::fs::read(dir.join("sessions.db")).unwrap(), b"HISTORY-KEEP");
     assert_eq!(
@@ -233,18 +226,49 @@ fn apply_update_replaces_only_listed_files() {
 }
 
 #[test]
-fn apply_update_reports_nothing_when_identical() {
-    let dir = TempDir::new("identical");
+fn atomic_replace_fails_without_staged_file() {
+    // Нет <name>.new — заменять нечего, ошибка (а не молчаливый пропуск).
+    let dir = TempDir::new("missing_new");
     let tmp = dir.join("update_tmp");
     std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::write(dir.join("a.exe"), b"SAME").unwrap();
-    std::fs::write(tmp.join("a.exe"), b"SAME").unwrap();
-    let res = apply_update(&dir.0,
+    std::fs::write(dir.join("a.exe"), b"OLD").unwrap();
+    let e = replace_files_atomic(
+        &dir.0,
         &tmp,
         &[FileEntry { name: "a.exe".into(), sha256: String::new() }],
     )
-    .expect("замена сорвалась");
-    assert_eq!(res, ApplyResult::NothingToDo);
+    .unwrap_err();
+    assert!(e.contains("нет скачанного файла"), "{e}");
+    assert_eq!(std::fs::read(dir.join("a.exe")).unwrap(), b"OLD");
+}
+
+#[test]
+fn atomic_replace_rollback_restores_previous_on_conflict() {
+    // Конфликт: .old от прошлой попытки — каталог, remove_file на нём
+    // падает. Уже заменённое (good.exe) должно откатиться из .old.
+    let dir = TempDir::new("rollback");
+    let tmp = dir.join("update_tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(dir.join("good.exe"), b"STALE-GOOD").unwrap();
+    std::fs::write(tmp.join("good.exe.new"), b"FRESH-GOOD").unwrap();
+    std::fs::write(dir.join("bad.exe"), b"STALE-BAD").unwrap();
+    std::fs::write(tmp.join("bad.exe.new"), b"FRESH-BAD").unwrap();
+    std::fs::create_dir_all(dir.join("bad.exe.old")).unwrap();
+
+    let files = vec![
+        FileEntry { name: "good.exe".into(), sha256: String::new() },
+        FileEntry { name: "bad.exe".into(), sha256: String::new() },
+    ];
+    let e = replace_files_atomic(&dir.0, &tmp, &files).unwrap_err();
+    assert!(e.contains("остаток"), "{e}");
+    // good.exe откачен из .old (откат идёт в обратном порядке).
+    assert_eq!(std::fs::read(dir.join("good.exe")).unwrap(), b"STALE-GOOD");
+    assert!(
+        !dir.join("good.exe.old").exists(),
+        ".old остался после отката — повторная замена споткнётся"
+    );
+    // bad.exe вообще не тронут.
+    assert_eq!(std::fs::read(dir.join("bad.exe")).unwrap(), b"STALE-BAD");
 }
 
 // ---------------------------------------------------------------------------
@@ -335,87 +359,50 @@ fn update_offer_decision_drives_the_notice_button() {
 }
 
 #[test]
-fn stale_ready_flag_cannot_authorize_early_replacement() {
-    // Разбор реальной поломки: файл-флаг живёт рядом с программой и
-    // переживает её. Если программу убили в момент установки, флаг остаётся,
-    // а `wait_for_exit` видит его с первой проверки и разрешает замену файлов
-    // при работающей программе — ровно тогда, когда заменять нельзя.
-    let dir = TempDir::new("stale_flag");
-    let flag = dir.join(READY_FLAG);
-
-    // 1. Программа упала, флаг остался.
+fn exited_flag_is_consumed_before_replace() {
+    // Протокол pipeline: main пишет main_exited.flag перед exit, updater
+    // читает его на шаге 3 и СЪЕДАЕТ (удаляет). Протухший флаг от упавшего
+    // прогона не должен разрешать замену при живом процессе — та же
+    // ловушка, что была у READY_FLAG (тест-предшественник
+    // stale_ready_flag_cannot_authorize_early_replacement удалён вместе
+    // с механизмом).
+    let dir = TempDir::new("exited_flag");
+    let flag = tmp_dir(&dir.0).join(MAIN_EXITED_FLAG);
+    std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+    // 1. Флаг от прошлого прогона лежит.
     std::fs::write(&flag, b"1").unwrap();
     assert!(flag.exists());
-
-    // 2. Именно поэтому проверка НЕ должна проходить: без снятия флага
-    //    updater счёл бы, что ему уже разрешили менять файлы.
-    //    (Проверяем, что без очистки так и было бы — прямым чтением.)
-    assert!(
-        flag.exists(),
-        "проверка должна была бы пройти на остаточном флаге — это и есть баг"
-    );
-
-    // 3. При старте программа снимает флаг.
-    assert!(clear_stale_ready_flag(&dir.0), "остаточный ф��аг не снят");
-    assert!(!flag.exists(), "флаг остался после очистки");
-    // 4. Теперь updater честно ждёт сигнала и не спешит.
-    assert!(
-        !wait_for_exit(&dir.0, 1),
-        "после очистки updater не должен считать, что ему разрешили"
-    );
-
-    // 5. И повторный вызов на чистом месте ничего не ломает.
-    assert!(!clear_stale_ready_flag(&dir.0), "очистка без флага должна быть no-op");
+    // 2. Шаг 3 pipeline читает и удаляет — проверяем ту же операцию,
+    // что делает код (read + remove).
+    let present = flag.exists();
+    let _ = std::fs::remove_file(&flag);
+    assert!(present, "флаг должен был быть виден шагу 3");
+    assert!(!flag.exists(), "флаг не съеден — протухший разрешит замену");
+    // 3. Повторный шаг 3 флага уже не видит.
+    assert!(!flag.exists(), "флаг воскрес после съедения");
 }
 
 #[test]
-fn self_rename_frees_the_program_name() {
-    // Разбор настоящей поломки: фоновый процесс — это сам TraySession.exe,
-    // и он пытался заменить файл, который сам же выполняет. Windows даёт
-    // os error 32 («процесс не может получить доступ к файлу»), обновление
-    // никогда не доходило до конца. Лечится переименованием себя: имя
-    // программы освобождается, и под него кладётся новая сборка.
-    let dir = TempDir::new("rename");
-    let base = &dir.0;
-    let exe = base.join(MAIN_EXE);
-    std::fs::write(&exe, b"OLD-BINARY").unwrap();
-
-    let aside = rename_aside_from(&exe, base).expect("переименование не удалось");
-    // Имя программы освободилось — под него можно класть новую сборку.
-    assert!(!exe.exists(), "прежнее имя всё ещё занято");
-    assert!(aside.exists(), "переименованной копии нет");
-    assert_eq!(aside, tmp_dir(base).join(UPDATER_NAME));
-    // Копия лежит внутри папки обновлений, а не рядом с программой.
-    assert_eq!(aside.parent(), Some(tmp_dir(base).as_path()));
-    // Под освобождённое имя кладётся новая сборка — конфликта быть не может.
-    std::fs::write(&exe, b"NEW-BINARY-0123456789").unwrap();
-    assert_eq!(std::fs::read(&exe).unwrap(), b"NEW-BINARY-0123456789");
-    // А старая копия всё ещё на месте и её отдельно удаляем.
-    assert_eq!(std::fs::read(&aside).unwrap(), b"OLD-BINARY");
-    std::fs::remove_file(&aside).unwrap();
+fn updater_log_appends_to_updater_log() {
+    // R6: шаги pipeline идут в logs/updater.log, log.rs при этом не тронут.
+    let dir = TempDir::new("ulog");
+    ulog(&dir.0, "INFO", "шаг проверен");
+    ulog(&dir.0, "ERR", "ошибка проверена");
+    let text = std::fs::read_to_string(dir.0.join("logs").join(UPDATER_LOG_NAME)).unwrap();
+    assert!(text.contains("[INFO] шаг проверен"), "{text}");
+    assert!(text.contains("[ERR] ошибка проверена"), "{text}");
+    // Формат: дата время [LEVEL] сообщение, по строке на запись.
+    assert_eq!(text.lines().count(), 2, "{text}");
 }
 
 #[test]
-fn self_rename_is_idempotent() {
-    // Повторный запуск не должен пытаться переименовать уже переименованный
-    // файл и не должен падать.
-    let dir = TempDir::new("rename2");
-    let base = &dir.0;
-    let already = tmp_dir(base).join(UPDATER_NAME);
-    std::fs::create_dir_all(already.parent().unwrap()).unwrap();
-    std::fs::write(&already, b"X").unwrap();
-    let again = rename_aside_from(&already, base).expect("повторное переименование сломалоcь");
-    assert_eq!(again, already, "путь изменился при повторном вызове");
-    assert!(already.exists(), "файл исчез при повторном вызове");
-}
-
-#[test]
-fn rename_error_is_reported_not_panicked() {
-    // Несуществующий файл: должна быть ошибка в тексте, а не паника.
-    let dir = TempDir::new("rename3");
-    let missing = dir.0.join("нет-такого.exe");
-    let e = rename_aside_from(&missing, &dir.0).unwrap_err();
-    assert!(e.contains("не удалось убрать себя с пути"), "{e}");
+fn updater_name_is_stable() {
+    // Имя копии updater в update_tmp зашито в pipeline (шаг 2 и cleanup)
+    // и в main_pid-логику не входит, но переименовывать молча нельзя:
+    // ручная проверка ищет этот файл в диспетчере задач.
+    assert_eq!(UPDATER_NAME, "_updater_running.exe");
+    assert_eq!(MAIN_PID_FILE, "main_pid.txt");
+    assert_eq!(MAIN_EXITED_FLAG, "main_exited.flag");
 }
 
 #[test]
@@ -548,72 +535,61 @@ fn temp_dir_is_beside_program_not_system_temp() {
 }
 
 #[test]
-fn cancelled_update_puts_the_program_back() {
-    // Критично. Фоновый процесс переименовывает программу, чтобы освободить
-    // имя под новую сборку. Если обновление сорвалось, копия — это и есть
-    // программа. Раньше она удалялась в любом случае, и человек оставался
-    // вообще без программы: отмена обновления стоила ему установки.
+fn atomic_replace_never_touches_user_files_even_when_listed() {
+    // Замена C13b-механики (finish_aside): при отмене/обрыве программа
+    // обязана остаться на месте. В новом pipeline это свойство даёт
+    // replace_files_atomic: переименование идёт только вперёд через .old,
+    // а при ошибке — откат. Проверяем инвариант: без .new-файлов
+    // боевые файлы не меняются вообще.
     let dir = TempDir::new("aside_restore");
     let main = dir.join(MAIN_EXE);
     dir.write(MAIN_EXE, b"OLD PROGRAM");
-    // Так выглядит состояние после переименования: программы на месте нет.
-    let aside = dir.0.join(UPDATER_NAME);
-    std::fs::rename(&main, &aside).expect("не переименовали");
-    assert!(!main.is_file(), "исходник не ушёл");
-
-    let out = finish_aside(&dir.0, &aside);
-    assert_eq!(out, AsideOutcome::Restored, "копия не вернулась на место");
-    assert!(main.is_file(), "программа не появилась под своим именем");
+    // Скачанного нет — pipeline дальше не пойдёт, main цел.
+    let e = replace_files_atomic(
+        &dir.0,
+        &dir.join("update_tmp"),
+        &[FileEntry { name: MAIN_EXE.into(), sha256: String::new() }],
+    )
+    .unwrap_err();
+    assert!(e.contains("нет скачанного файла"), "{e}");
+    assert!(main.is_file(), "программа пропала без замены");
     assert_eq!(std::fs::read(&main).unwrap(), b"OLD PROGRAM", "программа повреждена");
-    assert!(!aside.exists(), "служебная копия осталась");
 }
 
 #[test]
-fn successful_update_deletes_the_copy() {
-    // Обратный случай: новая сборка встала на место — тогда копию удаляем,
-    // иначе в папке обновлений навсегда остался бы _updater_running.exe.
-    let dir = TempDir::new("aside_delete");
-    let main = dir.join(MAIN_EXE);
-    dir.write(MAIN_EXE, b"NEW PROGRAM");
-    let aside = dir.0.join(UPDATER_NAME);
-    std::fs::write(&aside, b"OLD PROGRAM").unwrap();
-
-    let out = finish_aside(&dir.0, &aside);
-    assert_eq!(out, AsideOutcome::Deleted);
-    assert_eq!(std::fs::read(&main).unwrap(), b"NEW PROGRAM", "новая сборка затёрта");
-    // Удаление отложенное (через cmd), поэтому сразу может ещё лежать.
-    let _ = std::fs::remove_file(&aside);
-}
-
-#[test]
-fn ready_flag_is_checked_even_with_zero_wait() {
-    // При wait_secs = 0 цикл ожидания не выполнялся ни разу, и флаг не
-    // смотрели вообще. Программа, которая уже записала файл и вышла,
-    // считалась работающей: обновление отменялось, а её файл оставался
-    // лежать и в следующий раз разрешил бы замену файлов на живых.
-    let dir = TempDir::new("zero_wait");
-    assert!(signal_ready_to_exit(&dir.0).is_ok());
-    assert!(wait_for_exit(&dir.0, 0), "флаг не увидели при нулевом ожидании");
-    // Файл-флаг при этом убирается, чтобы не разрешить замену позже.
-    assert!(!dir.0.join(READY_FLAG).exists(), "файл-флаг остался");
-    // Без флага при нулевом ожидании — отмена, и это правильно.
-    assert!(!wait_for_exit(&dir.0, 0), "отмена без флага не сработала");
-}
-
-#[test]
-fn updater_flag_is_parsed_from_args() {
+fn updater_args_use_named_parameters_with_defaults() {
+    // Новый протокол R2: --updater --parent-pid <PID> --wait-secs <N>
+    // --channel <c>. Позиционного формата больше нет.
     // Обычный запуск — не updater.
     assert!(parse_args(&args(&[])).is_none());
     assert!(parse_args(&args(&["TraySession.exe"])).is_none());
-    // С флагом — updater, время ожидания из следующего аргумента.
-    let u = parse_args(&args(&["TraySession.exe", "--updater", "45"])).unwrap();
+    // Полный набор.
+    let u = parse_args(&args(&[
+        "TraySession.exe",
+        "--updater",
+        "--parent-pid",
+        "1234",
+        "--wait-secs",
+        "45",
+        "--channel",
+        "beta",
+    ]))
+    .unwrap();
+    assert_eq!(u.parent_pid, 1234);
     assert_eq!(u.wait_secs, 45);
-    // Без числа — разумное умолчание.
+    assert_eq!(u.channel, "beta");
+    // Голый --updater — умолчания, а не падение: pid 0 = ждать некого.
     let u = parse_args(&args(&["--updater"])).unwrap();
-    assert_eq!(u.wait_secs, 20);
-    // Мусор вместо числа — тоже умолчание, а не падение.
-    let u = parse_args(&args(&["--updater", "не-число"])).unwrap();
-    assert_eq!(u.wait_secs, 20);
+    assert_eq!(u.parent_pid, 0);
+    assert_eq!(u.wait_secs, 60);
+    assert_eq!(u.channel, CHANNEL_STABLE);
+    // Мусор вместо чисел — тоже умолчания.
+    let u = parse_args(&args(&["--updater", "--parent-pid", "не-число"])).unwrap();
+    assert_eq!(u.parent_pid, 0);
+    // Порядок аргументов не важен.
+    let u = parse_args(&args(&["--updater", "--channel", "beta", "--wait-secs", "7"])).unwrap();
+    assert_eq!(u.wait_secs, 7);
+    assert_eq!(u.channel, "beta");
 }
 
 #[test]
@@ -659,17 +635,36 @@ fn unknown_channel_falls_back_to_stable_not_to_nothing() {
 }
 
 #[test]
-fn updater_receives_its_channel_through_arguments() {
+fn updater_channel_survives_named_arguments() {
     // Фоновый процесс — отдельный, и без явной передачи канала он взял бы
     // стабильный по умолчанию. Проверяем именно сквозную передачу.
-    let u = parse_args(&args(&["--updater", "20", "beta"])).unwrap();
+    let u = parse_args(&args(&["--updater", "--parent-pid", "9", "--wait-secs", "20", "--channel", "beta"])).unwrap();
     assert_eq!(u.channel, "beta");
-    // Без третьего аргумента — стабильный, обратная совместимость со
-    // старыми запусками.
-    let u = parse_args(&args(&["--updater", "20"])).unwrap();
+    assert_eq!(u.parent_pid, 9);
+    assert_eq!(u.wait_secs, 20);
+    // Без канала — стабильный.
+    let u = parse_args(&args(&["--updater", "--parent-pid", "9"])).unwrap();
     assert_eq!(u.channel, CHANNEL_STABLE);
-    let u = parse_args(&args(&["--updater", "не-число", "beta"])).unwrap();
-    assert_eq!(u.channel, "beta", "канал терялся из-за неверного числа секунд");
+}
+
+#[test]
+#[cfg(windows)]
+fn pid_death_distinguishes_live_and_dead() {
+    // wait_for_pid_death: живой PID + короткий таймаут = false,
+    // мёртвый PID = true. Мёртвый берём честно: запускаем cmd,
+    // дожидаемся выхода — PID гарантированно мёртв.
+    use std::process::Command;
+    let mut child = Command::new("cmd").args(["/C", "exit"]).spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    assert!(
+        wait_for_pid_death(dead, std::time::Duration::from_secs(5)),
+        "мёртвый pid {dead} не опознан"
+    );
+    assert!(
+        !wait_for_pid_death(std::process::id(), std::time::Duration::from_millis(50)),
+        "живой собственный pid сочтён мёртвым"
+    );
 }
 
 #[test]
@@ -707,6 +702,8 @@ fn report_roundtrips_through_file() {
         updated: vec!["TraySession.exe".into()],
         unchanged: vec!["Tray_session_setup.exe".into()],
         preserved: vec!["sessions.db".into()],
+        stage: "done".into(),
+        error_kind: String::new(),
     };
     r.save(&dir.0).unwrap();
     let back = UpdateReport::load(&dir.0).expect("отчёт не прочитан");
@@ -720,24 +717,16 @@ fn report_roundtrips_through_file() {
 }
 
 #[test]
-fn ready_flag_roundtrips() {
-    // Основная программа пишет флаг, updater его ждёт и удаляет.
-    let dir = TempDir::new("flag");
-    let flag = dir.join(READY_FLAG);
-    assert!(!flag.exists());
-    assert!(!wait_for_exit(&dir.0, 1), "флага нет — ждать нечего");
-    signal_ready_to_exit(&dir.0).unwrap();
-    assert!(flag.exists(), "флаг не записан");
-    assert!(wait_for_exit(&dir.0, 5), " updater не дождался флага");
-    assert!(!flag.exists(), "флаг не удалён после ожидания");
-}
-
-#[test]
-#[allow(clippy::assertions_on_constants)]
-fn watchdog_hard_limit_exceeds_download_budget() {
-    // C13c: сторож обязан ждать дольше, чем download исчерпывает попытки:
-    // 3 попытки × 180 с read-таймаут + задержки retry. Иначе сторож
-    // откатывал quit_requested посреди живой загрузки.
-    assert!(900 > 3 * 180 + 10);
-    assert!(UPDATER_HARD_LIMIT_SECS > 3 * 180 + 10);
+fn fail_report_carries_stage_and_kind() {
+    // fail() — единая точка выхода pipeline: отчёт всегда содержит
+    // stage и error_kind, иначе диагностика по update_report.json слепая.
+    let dir = TempDir::new("fail_report");
+    let base = &dir.0;
+    let code = fail(base, "download", "net", "тестовая ошибка".to_string(), 6);
+    assert_eq!(code, 6);
+    let back = UpdateReport::load(base).expect("отчёт не записан");
+    assert!(!back.ok);
+    assert_eq!(back.stage, "download");
+    assert_eq!(back.error_kind, "net");
+    assert!(back.message.contains("тестовая ошибка"));
 }

@@ -1144,6 +1144,23 @@ impl TrackerApp {
         tx_tray: mpsc::Sender<TrayCmd>,
     ) -> Self {
         let cfg_handle = cfg.read().unwrap().clone();
+        // Прошлый updater мог оставить отчёт (main всегда выходит сразу
+        // после spawn и результат не видит). Забираем один раз: при ошибке
+        // показываем текст в блоке обновлений, при успехе молчим.
+        // Сценарий B ручной проверки опирается на это.
+        let drained_report = crate::update::UpdateReport::load(&crate::update::program_dir());
+        if drained_report.is_some() {
+            crate::update::UpdateReport::clear(&crate::update::program_dir());
+        }
+        let startup_update_status = drained_report
+            .and_then(|r| {
+                if r.ok {
+                    None
+                } else {
+                    Some(format!("Прошлое обновление не удалось: {}.", r.message))
+                }
+            })
+            .unwrap_or_default();
         let mut app = Self {
             state: AppState {
                 db,
@@ -1245,9 +1262,8 @@ impl TrackerApp {
                 infobar_open: false,
                 infobar_placed: false,
                 update_rx: None,
-                update_status: String::new(),
+                update_status: startup_update_status,
                 update_checking: false,
-                update_pending_since: None,
                 update_available: None,
                 update_window_opened_at: 0.0,
                 last_hotkeys: Vec::new(),
@@ -1404,15 +1420,14 @@ impl TrackerApp {
     }
 
     /// Запустить обновление: фоновый процесс скачает файлы и заменит их.
-    /// Основная программа после этого закроется, а updater её перезапустит.
+    /// Новый протокол (pipeline R2): main спавнит updater с явными
+    /// аргументами (--parent-pid/--wait-secs/--channel), создаёт
+    /// main_exited.flag и СРАЗУ выходит через process::exit(0) — ничего
+    /// не ждёт. Дальше всё делает updater: ждёт смерть main, качает,
+    /// меняет, запускает новый процесс с --updated.
+    /// Дубли давит mutex updater на шаге 1 (повторный клик невозможен:
+    /// процесс умирает в этом же вызове).
     fn start_update_install(&mut self) {
-        // C12: повторный клик, пока установка уже идёт, игнорируем — иначе
-        // плодится второй апдейтер, и оба пишут один update_report.json.
-        if self.state.update_pending_since.is_some() {
-            self.state.status_msg =
-                "Обновление уже ставится, дождитесь завершения.".to_string();
-            return;
-        }
         let exe = std::env::current_exe().unwrap_or_default();
         if exe.as_os_str().is_empty() {
             self.state.update_status = "Не удалось найти файл программы.".to_string();
@@ -1421,20 +1436,18 @@ impl TrackerApp {
         // Канал берём из настроек: бета должна обновляться по бета-ветке,
         // иначе установленная бета молча возвращается на старую версию.
         let channel = crate::update::normalize_channel(&self.state.cfg_handle.update_channel);
-        match crate::update::spawn_updater(&exe, 20, channel) {
+        match crate::update::spawn_updater(&exe, std::process::id(), 60, channel) {
             Ok(()) => {
-                self.state.update_checking = false;
-                self.state.status_msg = "Обновление ставится, программа сейчас закроется…"
-                    .to_string();
-                self.notify("Tray Session", "Ставим обновление, программа сейчас закроется.");
-                // Сообщаем фоновому процессу, что можно заменять файлы, и
-                // выходим. Файл-флаг читает updater.
-                let _ = crate::update::signal_ready_to_exit(&crate::update::program_dir());
-                self.state.quit_requested = true;
-                // Сторож в update() следит по этой метке через updater.lock:
-                // пока файл жив — апдейтер работает, откат только по
-                // HARD_LIMIT или завершению без успеха (C13b/C13c).
-                self.state.update_pending_since = Some(std::time::Instant::now());
+                // Подтверждение готовности для updater (fallback шага 3):
+                // если PID успеют переиспользовать, флаг скажет, что main
+                // вышел сам. Пишем синхронно, до exit.
+                let _ = std::fs::write(
+                    crate::update::tmp_dir(&crate::update::program_dir())
+                        .join(crate::update::MAIN_EXITED_FLAG),
+                    b"1",
+                );
+                crate::log::info("обновление запущено, выхожу для замены файлов");
+                std::process::exit(0);
             }
             Err(e) => {
                 self.state.update_status = format!("Не удалось запустить обновление: {e}");
@@ -1472,22 +1485,29 @@ impl TrackerApp {
                     let base = crate::update::program_dir();
                     let plan = crate::update::plan_update(&base, &m);
                     if !plan.to_download.is_empty() && silent {
-                        // Пользователь разрешил ставить молча.
+                        // Пользователь разрешил ставить молча: тот же
+                        // протокол, что и ручная установка — spawn updater
+                        // и немедленный выход (иначе замена упрётся в
+                        // запущенный exe). Поток фоновый, но process::exit
+                        // завершает весь процесс — так и задумано.
                         let exe = std::env::current_exe().unwrap_or_default();
-                        if !exe.as_os_str().is_empty() {
-                            let _ = crate::update::spawn_updater(&exe, 20, channel);
-                            let _ = crate::update::signal_ready_to_exit(&base);
-                            UpdateInfo {
-                                msg: "Обновление найдено, ставлю в фоне, программа сейчас закроется."
-                                    .to_string(),
-                                // Ставим сами — кнопка уведомления не нужна.
-                                new_version: None,
-                            }
-                        } else {
-                            UpdateInfo {
-                                msg: m.describe(),
-                                new_version: Some(m.version),
-                            }
+                        if !exe.as_os_str().is_empty()
+                            && crate::update::spawn_updater(&exe, std::process::id(), 60, channel)
+                                .is_ok()
+                        {
+                            let _ = std::fs::write(
+                                crate::update::tmp_dir(&crate::update::program_dir())
+                                    .join(crate::update::MAIN_EXITED_FLAG),
+                                b"1",
+                            );
+                            crate::log::info(
+                                "тихое обновление запущено, выхожу для замены файлов",
+                            );
+                            std::process::exit(0);
+                        }
+                        UpdateInfo {
+                            msg: m.describe(),
+                            new_version: Some(m.version),
                         }
                     } else if plan.to_download.is_empty() {
                         UpdateInfo {
@@ -2833,56 +2853,6 @@ impl eframe::App for TrackerApp {
                 // неотображённым (окошко одно, и оно в фокусе).
                 if self.state.tab == Tab::About && self.state.about_sub == 0 {
                     ctx.request_repaint_after(Duration::from_millis(250));
-                }
-            }
-        }
-        // C13c: сторож по живости апдейтера, а не по фиксированному таймауту.
-        // Фиксированные 90 с срабатывали раньше, чем download исчерпывал
-        // попытки (3 × 180 с), и откатывали quit_requested посреди живой
-        // загрузки. Теперь: пока существует update_tmp/updater.lock —
-        // апдейтер работает, ждём. Файла нет — завершился, проверяем итог.
-        // HARD_LIMIT — только страховка от вечно висящего процесса.
-        if self.state.quit_requested {
-            if let Some(since) = self.state.update_pending_since {
-                let lock_path = crate::update::tmp_dir(&crate::update::program_dir())
-                    .join(crate::update::UPDATER_LOCK_FILE);
-                let updater_alive = lock_path.exists();
-                let should_rollback = if updater_alive {
-                    since.elapsed()
-                        > Duration::from_secs(crate::update::UPDATER_HARD_LIMIT_SECS)
-                } else {
-                    // Файла нет → апдейтер завершился (успешно или с ошибкой).
-                    true
-                };
-                if should_rollback {
-                    // UpdateReport::load читает update_tmp/update_report.json.
-                    let ok = crate::update::UpdateReport::load(&crate::update::program_dir())
-                        .map(|r| r.ok)
-                        .unwrap_or(false);
-                    if ok {
-                        // C15: обновление успешно — главный процесс должен
-                        // сам закрыться, иначе updater не сможет перезапустить
-                        // программу (новый процесс упрётся в C5-mutex живого
-                        // старого и молча выйдет). При quit_requested=true
-                        // CancelClose не ставится (poll_appcmd), так что
-                        // Close реально завершает цикл и освобождает mutex.
-                        // Updater со своей стороны ждёт смерть по main_pid.txt
-                        // (wait_for_main_pid_death) и только потом spawn.
-                        crate::log::info("сторож: обновление успешно, закрываю окно");
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        ctx.request_repaint();
-                    } else {
-                        crate::log::err(
-                            "сторож: апдейтер завершился без успеха, откат quit_requested",
-                        );
-                        self.state.quit_requested = false;
-                        self.state.update_pending_since = None;
-                        self.state.update_status =
-                            "Обновление не удалось. Смотрите лог программы.".to_string();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        ctx.request_repaint();
-                    }
                 }
             }
         }
@@ -4293,13 +4263,9 @@ impl TrackerApp {
                     let ctx = ui.ctx().clone();
                     self.start_update_check(&ctx);
                 }
-                if ui
-                    .add_enabled(
-                        self.state.update_pending_since.is_none(),
-                        egui::Button::new("Установить сейчас"),
-                    )
-                    .clicked()
-                {
+                // Новый протокол: процесс выходит сразу по клику, второй
+                // клик невозможен; дубли давит mutex updater на шаге 1.
+                if ui.button("Установить сейчас").clicked() {
                     self.start_update_install();
                 }
                 ui.label(egui::RichText::new(format!(

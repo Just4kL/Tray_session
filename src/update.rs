@@ -76,24 +76,14 @@ pub const TMP_DIR_NAME: &str = "update_tmp";
 pub const REPORT_NAME: &str = "update_report.json";
 /// Имя главного исполняемого файла программы.
 pub const MAIN_EXE: &str = "TraySession.exe";
-/// Маркер живого апдейтера: создаётся при старте run_updater_inner,
-/// удаляется через Drop-guard при любом выходе (включая panic).
-/// Сторож в главном процессе смотрит на него вместо фиксированного
-/// таймаута: пока файл есть — апдейтер жив (качает), файла нет —
-/// завершился.
-pub const UPDATER_LOCK_FILE: &str = "updater.lock";
-/// Страховка сторожа от вечно висящего апдейтера, секунды.
-/// 900 > 3 попытки × 180 с read + задержки retry (≈542 с): сторож
-/// не должен срабатывать раньше, чем download исчерпает попытки.
-pub const UPDATER_HARD_LIMIT_SECS: u64 = 900;
-
-/// Ключ, которым фоновый процесс просит основной программу закрыться.
-///
-/// Основной процесс пишет этот файл, когда пользователь согласился на
-/// обновление, и у себя же проверяет его в цикле отрисовки. Обновление
-/// ждёт файл недолго и, если основной процесс не закрылся, отменяется —
-/// заменять запущенный файл нельзя.
-pub const READY_FLAG: &str = "update_ready.flag";
+/// Имя файла с PID главного процесса. Main пишет его при старте;
+/// updater и --updated-перезапуск читают его, чтобы дождаться
+/// смерти main или завершить её (C5-mutex иначе блокирует рестарт).
+pub const MAIN_PID_FILE: &str = "main_pid.txt";
+/// Флаг «main вышел сам»: main создаёт его перед process::exit(0)
+/// при старте обновления. Updater использует как fallback-подтверждение
+/// готовности к замене (на случай, если PID переиспользован ОС).
+pub const MAIN_EXITED_FLAG: &str = "main_exited.flag";
 
 // ---------------------------------------------------------------------------
 // Что нельзя трогать
@@ -619,15 +609,21 @@ pub fn check_github_connection() -> Result<String, String> {
 
 /// Скачать манифест указанного канала и разобрать его.
 pub fn fetch_manifest_for(channel: &str) -> Result<Manifest, String> {
-    let c = client(20)?;
+    fetch_manifest_for_timeout(channel, 20)
+}
+
+/// То же, с заданным таймаутом. Pipeline берёт 30 с (R3 шаг 4).
+pub fn fetch_manifest_for_timeout(channel: &str, timeout_secs: u64) -> Result<Manifest, String> {
+    let c = client(timeout_secs)?;
+    let url = manifest_url_for(channel);
     let text = c
-        .get(&manifest_url_for(channel))
+        .get(&url)
         .send()
-        .map_err(|e| format!("не скачался манифест: {e}"))?
+        .map_err(|e| format!("не скачался манифест {url}: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("манифест недоступен: {e}"))?
+        .map_err(|e| format!("манифест недоступен {url}: {e}"))?
         .text()
-        .map_err(|e| format!("манифест не прочитан: {e}"))?;
+        .map_err(|e| format!("манифест не прочитан {url}: {e}"))?;
     Manifest::parse(&text)
 }
 
@@ -644,7 +640,12 @@ pub fn fetch_manifest() -> Result<Manifest, String> {
 /// С retry: живой тест показал обрыв соединения посреди 10-МБ тела
 /// ("error decoding response body" — это hyper IncompleteMessage, а не
 /// проблема декодирования). Возвращает размер записанного файла.
-pub fn download_to(url: &str, dest: &Path, expect_sha: &str) -> Result<u64, String> {
+pub fn download_to(
+    base: &Path,
+    url: &str,
+    dest: &Path,
+    expect_sha: &str,
+) -> Result<u64, String> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
@@ -654,9 +655,13 @@ pub fn download_to(url: &str, dest: &Path, expect_sha: &str) -> Result<u64, Stri
                 last_err = e;
                 if attempt < MAX_ATTEMPTS {
                     let delay = std::time::Duration::from_secs(retry_delay_secs(attempt));
-                    crate::log::warn(&format!(
-                        "попытка {attempt}/{MAX_ATTEMPTS} скачать {url} не удалась: {last_err}. Повтор через {delay:?}"
-                    ));
+                    ulog(
+                        base,
+                        "WARN",
+                        &format!(
+                            "попытка {attempt}/{MAX_ATTEMPTS} скачать {url} не удалась: {last_err}. Повтор через {delay:?}"
+                        ),
+                    );
                     std::thread::sleep(delay);
                 }
             }
@@ -746,6 +751,15 @@ pub struct UpdateReport {
     /// Пользовательские файлы, найденные рядом и сохранённые.
     #[serde(default)]
     pub preserved: Vec<String>,
+    /// Этап pipeline, на котором остановился updater
+    /// (mutex, reexec, wait_parent, manifest, plan, download,
+    /// replace, spawn, cleanup, done). Пусто у старых отчётов.
+    #[serde(default)]
+    pub stage: String,
+    /// Машинный вид ошибки (timeout, http, hash, io, spawn...).
+    /// Пусто при успехе и у старых отчётов.
+    #[serde(default)]
+    pub error_kind: String,
 }
 
 impl UpdateReport {
@@ -793,65 +807,95 @@ impl UpdateReport {
 // Планирование замены файлов
 // ---------------------------------------------------------------------------
 
-/// Что нужно сделать с файлами: заменить, удалить лишнее, ничего.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ApplyResult {
-    /// Файлы заменены (перечислены новые хеши, уже применённые — нет).
-    Replaced(Vec<String>),
-    /// Заменять нечего: всё уже новое.
-    NothingToDo,
-}
+// ---------------------------------------------------------------------------
+// Атомарная замена файлов (.old/.new с откатом)
+// ---------------------------------------------------------------------------
 
-/// Заменить файлы программы на скачанные.
+/// Заменить файлы программы на скачанные — атомарно, с откатом.
 ///
-/// Возвращает список ПРОВЕРЕННЫХ файлов — по нему основной процесс
-/// понимает, какие из них действительно поменялись, а какие были уже
-/// такими же (обновлять было нечего).
+/// Протокол для каждого файла (скачанное лежит как `<name>.new` в `tmp`):
+///   a. Удалить `<name>.old` (остаток прошлой попытки).
+///   b. Rename `<name>` -> `<name>.old` (освобождает имя; rename живого
+///      exe Windows разрешает, а перезапись — нет).
+///   c. Rename `<name>.new` -> `<name>`.
+/// При ошибке b/c — откат: всё уже переименованное возвращается
+/// `<name>.old` -> `<name>`, `.new` удаляется, возвращается ошибка.
+/// Защищённые и небезопасные имена пропускаются молча (план их уже
+/// отфильтровал — это вторая линия обороны).
 ///
-/// Сначала читаем размеры, потом заменяем. Важно: сравнение идёт по
-/// размеру на диске, а не по хешу из манифеста. Иначе updater, скачавший
-/// файл самой программы, посчитал бы его изменившимся (хеш манифеста
-/// отличается от хеша только что скачанного, ведь программа теперь на диске
-/// и есть этот файл) и заменил бы файл на его же копию.
-pub fn apply_update(
+/// Возвращает имена заменённых файлов.
+pub fn replace_files_atomic(
     base: &Path,
     tmp: &Path,
     files: &[FileEntry],
-) -> Result<ApplyResult, String> {
-    // 1. Собираем размеры новых файлов и заодно решаем, что менять.
-    let mut to_replace: Vec<(String, u64)> = Vec::new();
+) -> Result<Vec<String>, String> {
+    let mut done: Vec<String> = Vec::new();
     for f in files {
         if is_protected(&f.name) || !is_safe_rel_name(&f.name) {
             continue;
         }
-        let src = tmp.join(&f.name);
-        let Ok(meta) = std::fs::metadata(&src) else { continue };
-        if !meta.is_file() {
-            continue;
+        let staged = tmp.join(format!("{}.new", f.name));
+        if !staged.is_file() {
+            rollback_replaced(base, &done);
+            return Err(format!("нет скачанного файла: {}", staged.display()));
         }
         let dst = base.join(&f.name);
-        let same = dst
-            .metadata()
-            .map(|m| m.is_file() && m.len() == meta.len())
-            .unwrap_or(false);
-        if !same {
-            to_replace.push((f.name.clone(), meta.len()));
+        let old = base.join(format!("{}.old", f.name));
+        // a. Чистим остаток прошлой попытки. Ошибка здесь тоже
+        // откатывает уже заменённое: частичный прогресс недопустим.
+        if old.exists() {
+            if let Err(e) = std::fs::remove_file(&old) {
+                rollback_replaced(base, &done);
+                return Err(format!("не удалён остаток {}: {e}", old.display()));
+            }
+        }
+        // b. Уводим текущий файл в сторону. Его может не быть (первая
+        // установка) — тогда откатывать нечего, идём к c.
+        let had_current = dst.exists();
+        if had_current {
+            if let Err(e) = std::fs::rename(&dst, &old) {
+                rollback_replaced(base, &done);
+                return Err(format!(
+                    "не убран с пути {} -> {}: {e}",
+                    dst.display(),
+                    old.display()
+                ));
+            }
+        }
+        // c. Ставим новый на место.
+        if let Err(e) = std::fs::rename(&staged, &dst) {
+            if had_current {
+                let _ = std::fs::rename(&old, &dst);
+            }
+            rollback_replaced(base, &done);
+            return Err(format!(
+                "не поставлен на место {} -> {}: {e}",
+                staged.display(),
+                dst.display()
+            ));
+        }
+        done.push(f.name.clone());
+    }
+    Ok(done)
+}
+
+/// Откат уже заменённых файлов: `<name>.old` -> `<name>`.
+fn rollback_replaced(base: &Path, done: &[String]) {
+    for name in done.iter().rev() {
+        let dst = base.join(name);
+        let old = base.join(format!("{name}.old"));
+        if old.exists() {
+            let _ = std::fs::rename(&old, &dst);
         }
     }
-    if to_replace.is_empty() {
-        return Ok(ApplyResult::NothingToDo);
+}
+
+/// Убрать `.old`-копии после успешной замены (шаг cleanup pipeline).
+pub fn cleanup_old_files(base: &Path, names: &[String]) {
+    for name in names {
+        let old = base.join(format!("{name}.old"));
+        let _ = std::fs::remove_file(&old);
     }
-    // 2. Меняем. Windows не даёт заменить файл, который сейчас запущен,
-    //    поэтому основной процесс к этому моменту уже должен закрыться.
-    for (name, _) in &to_replace {
-        let src = tmp.join(name);
-        let dst = base.join(name);
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("не заменён {name}: {e}"))?;
-    }
-    Ok(ApplyResult::Replaced(
-        to_replace.into_iter().map(|(n, _)| n).collect(),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -860,42 +904,56 @@ pub fn apply_update(
 
 /// Прочитать аргументы командной строки: запущен ли updater и с какими
 /// параметрами.
+///
+/// Формат pipeline: `--updater --parent-pid <PID> --wait-secs <N>
+/// --channel <stable|beta>`. Всё именованное, у каждого значения есть
+/// разумное умолчание (PID 0 = ждать некого, 60 с, stable) — updater
+/// никогда не падает на разборе аргументов, а пишет отчёт и выходит
+/// по коду pipeline.
 pub fn parse_args(args: &[String]) -> Option<UpdateArgs> {
     if !args.iter().any(|a| a == UPDATER_FLAG) {
         return None;
     }
-    Some(UpdateArgs {
-        wait_secs: args
-            .iter()
-            .position(|a| a == UPDATER_FLAG)
+    let value_of = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
             .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20),
-        // Канал идёт третьим аргументом после числа секунд. Передавать
-        // его нужно обязательно: фоновый процесс — отдельный, и без
-        // явного канала он обновил бы программу по стабильной ветке.
-        channel: args
-            .iter()
-            .position(|a| a == UPDATER_FLAG)
-            .and_then(|i| args.get(i + 2))
             .cloned()
-            .unwrap_or_else(|| CHANNEL_STABLE.to_string()),
+    };
+    Some(UpdateArgs {
+        parent_pid: value_of("--parent-pid")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0),
+        wait_secs: value_of("--wait-secs")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60),
+        // Канал передавать обязательно: фоновый процесс — отдельный, и без
+        // явного канала он обновил бы программу по стабильной ветке.
+        channel: value_of("--channel").unwrap_or_else(|| CHANNEL_STABLE.to_string()),
     })
 }
 
 /// Флаг, которым основная программа запускает сама себя как updater.
 pub const UPDATER_FLAG: &str = "--updater";
+/// Флаг перезапуска после обновления: main с ним обходит C5-mutex
+/// через завершение старого процесса (см. R4), а не через показ окна.
+pub const UPDATED_FLAG: &str = "--updated";
 
 /// Параметры фонового процесса.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateArgs {
-    /// Сколько секунд ждать, пока основная программа закроется.
+    /// PID main-процесса: updater ждёт его смерти перед заменой.
+    /// 0 = ждать некого (ручной запуск updater для диагностики).
+    pub parent_pid: u32,
+    /// Сколько секунд ждать смерти main-процесса.
     pub wait_secs: u64,
     /// Канал обновлений: `stable` или `beta`.
     pub channel: String,
 }
 
-/// Имя, под которым фоновый процесс прячет сам себя на время работы.
+/// Имя, под которым фоновый процесс работает после шага 2 pipeline:
+/// копия себя в update_tmp (имя TraySession.exe тем самым свободно
+/// для замены — запущенный файл Windows перезаписать не даёт).
 pub const UPDATER_NAME: &str = "_updater_running.exe";
 
 /// Убрать себя с пути, освободив имя `TraySession.exe` под новую сборку.
@@ -905,37 +963,6 @@ pub const UPDATER_NAME: &str = "_updater_running.exe";
 /// обновить самого себя: он и есть тот файл, который требуется перезаписать
 /// (ошибка «процесс не может получить доступ к файлу», os error 32).
 ///
-/// Возвращает путь, под которым процесс теперь работает, — его надо удалить
-/// в конце.
-pub fn self_rename_aside(base: &Path) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("не найден свой exe: {e}"))?;
-    rename_aside_from(&exe, base)
-}
-
-/// Переименовать `exe` в `update_tmp/_updater_running.exe`.
-///
-/// Вынесено отдельно от `self_rename_aside`, чтобы можно было проверить
-/// переименование на обычном файле, не трогая реальный исполняемый файл
-/// процесса.
-pub fn rename_aside_from(exe: &Path, base: &Path) -> Result<PathBuf, String> {
-    // Уже переименован (повторный запуск) — тогда инициализировать нечего.
-    if exe.file_name().map(|n| n == UPDATER_NAME).unwrap_or(false) {
-        return Ok(exe.to_path_buf());
-    }
-    let aside = tmp_dir(base).join(UPDATER_NAME);
-    if let Some(d) = aside.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("не создана папка {}: {e}", d.display()))?;
-    }
-    std::fs::rename(exe, &aside).map_err(|e| {
-        format!(
-            "не удалось убрать себя с пути ({} -> {}): {e}",
-            exe.display(),
-            aside.display()
-        )
-    })?;
-    Ok(aside)
-}
-
 /// Удалить переименованную копию фонового процесса после его выхода.
 ///
 /// Windows не даёт удалить исполняемый файл, пока он запущен, поэтому
@@ -952,73 +979,98 @@ pub fn remove_aside_delayed(path: &Path) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// Точка входа фонового процесса.
-///
-/// Тело вынесено отдельно, чтобы переименованная копия себя удалялась на
-/// ЛЮБОМ выходе — и при ошибке, и при отсутствии обновлений. Иначе
-/// `_updater_running.exe` остался бы лежать в папке обновлений.
-pub fn run_updater(wait_secs: u64, channel: &str) -> i32 {
-    let base = program_dir();
-    crate::log::init(&base);
-    let (code, aside) = run_updater_inner(&base, wait_secs, channel);
-    if !aside.as_os_str().is_empty() {
-        finish_aside(&base, &aside);
+// ---------------------------------------------------------------------------
+// Updater pipeline (единый последовательный процесс, R3)
+// ---------------------------------------------------------------------------
+
+/// Имя отдельного лога updater (R6). Шаги pipeline не должны теряться
+/// в main-логе. log.rs не трогаем — пишем прямым append из update.rs.
+pub const UPDATER_LOG_NAME: &str = "updater.log";
+
+/// Одна строка в updater.log. Никогда не паникует и не мешает pipeline:
+/// ошибки записи молча пропускаются (лог не должен ронять обновление).
+pub fn ulog(base: &Path, level: &str, msg: &str) {
+    let line = format!(
+        "{} [{}] {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        level,
+        msg.replace(['\r', '\n'], " ")
+    );
+    let dir = base.join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
     }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(UPDATER_LOG_NAME))
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Завершить pipeline с ошибкой: отчёт + лог + код возврата.
+/// Единая точка выхода — каждый шаг пользуется ею, поэтому ни один путь
+/// не забывает ни отчёт, ни лог.
+fn fail(base: &Path, stage: &str, kind: &str, message: String, code: i32) -> i32 {
+    ulog(base, "ERROR", &format!("[{stage}] {message}"));
+    let _ = write_report(
+        base,
+        UpdateReport {
+            ok: false,
+            message,
+            stage: stage.to_string(),
+            error_kind: kind.to_string(),
+            ..Default::default()
+        },
+    );
     code
 }
 
-/// Что сделать с переименованной копией программы в конце работы.
-///
-/// Копию удаляем, только если новая сборка уже встала на своё место. Иначе
-/// переименованный файл — это и есть программа, и удаление оставляло бы
-/// человека вообще без программы: отменённое обновление, обрыв загрузки,
-/// нехватка прав — всё это стирало TraySession.exe безвозвратно.
-///
-/// Решение принимается по состоянию диска, а не по коду возврата: код
-/// отражает, на каком шаге остановились, а файл — на что реально можно
-/// опереться.
-pub fn finish_aside(base: &Path, aside: &Path) -> AsideOutcome {
-    let main = base.join(MAIN_EXE);
-    if main.is_file() {
-        let _ = remove_aside_delayed(aside);
-        return AsideOutcome::Deleted;
-    }
-    // Программы на месте нет — значит она всё ещё лежит под новым именем.
-    match std::fs::rename(aside, &main) {
-        Ok(()) => {
-            crate::log::info("старая программа возвращена на место");
-            AsideOutcome::Restored
-        }
-        Err(e) => {
-            crate::log::err(&format!(
-                "программа пропала: не смог вернуть {} на место: {e}",
-                aside.display()
-            ));
-            AsideOutcome::Lost
-        }
-    }
+/// Точка входа фонового процесса: единый pipeline из 10 шагов (R3).
+/// На любом шаге возможен только один исход: следующий шаг или fail().
+/// Паники не ожидаются, но если что-то запаниковало — main уже вышел,
+/// файлы целы (замена атомарна через .old), следующий запуск начнёт
+/// с чистого pipeline.
+pub fn run_updater(parent_pid: u32, wait_secs: u64, channel: &str) -> i32 {
+    let base = program_dir();
+    run_updater_inner(&base, parent_pid, wait_secs, channel)
 }
 
-/// Что `finish_aside` сделал с копией.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AsideOutcome {
-    /// Новая сборка встала на место, копия удалена — так и должно быть.
-    Deleted,
-    /// Обновление не вышло, копия возвращена под именем программы.
-    Restored,
-    /// Вернуть не удалось: копия осталась под служебным именем, и её надо
-    /// переименовать вручную.
-    Lost,
+/// Шаг 2: уйти с имени TraySession.exe.
+///
+/// Windows не даёт ПЕРЕЗАПИСАТЬ запущенный файл (os error 32), поэтому
+/// updater копирует себя в update_tmp/_updater_running.exe и
+/// перезапускается оттуда с теми же аргументами; родитель завершается.
+/// Уже запущены под этим именем — пропускаем.
+fn reexec_as_updater(base: &Path) -> bool {
+    let me = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if me.file_name().map(|n| n == UPDATER_NAME).unwrap_or(false) {
+        return false;
+    }
+    let aside = tmp_dir(base).join(UPDATER_NAME);
+    if let Some(d) = aside.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if std::fs::copy(&me, &aside).is_err() {
+        return false;
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let _ = std::process::Command::new(&aside).args(&argv).spawn();
+    true
 }
 
-/// Основная работа обновления. Возвращает код и путь, под которым процесс
-/// себя переименовал (пустой, если не смог).
-fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBuf) {
+/// Основная работа обновления: шаги 1–10 pipeline (R3).
+/// Возвращает код выхода (0 = успех, иначе см. fail() на каждом шаге).
+fn run_updater_inner(base: &Path, parent_pid: u32, wait_secs: u64, channel: &str) -> i32 {
     let base = base.to_path_buf();
-    // C14: второй апдейтер. Два параллельных процесса делили один
-    // TraySession.exe (rename_aside_from) и один update_report.json.
-    // Имя отличается от C5-мутекса main-окна: main + updater обязаны
-    // сосуществовать, C5 намеренно пропускает --updater.
+    // Шаг 1: mutex. Имя отличается от C5-мутекса main-окна: main + updater
+    // обязаны сосуществовать, C5 намеренно пропускает --updater.
+    // (Наследие C14: два параллельных процесса делили отчёт и файлы.)
     #[cfg(windows)]
     let _updater_mutex = {
         use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
@@ -1028,306 +1080,227 @@ fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBu
         unsafe {
             let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
             if GetLastError() == ERROR_ALREADY_EXISTS {
-                crate::log::warn("второй апдейтер уже запущен, выходим");
-                let _ = write_report(
+                return fail(
                     &base,
-                    UpdateReport {
-                        ok: false,
-                        message: "обновление уже выполняется".to_string(),
-                        ..Default::default()
-                    },
+                    "mutex",
+                    "busy",
+                    "обновление уже выполняется".to_string(),
+                    0,
                 );
-                std::process::exit(0);
             }
             h
         }
     };
-    // C13c: маркер живости. Пока файл существует — апдейтер работает
-    // (качает/меняет), сторож главного процесса ждёт. Drop-guard ниже
-    // удаляет файл при любом выходе, включая panic: иначе следующий
-    // запуск решит, что апдейтер жив.
-    let lock_path = tmp_dir(&base).join(UPDATER_LOCK_FILE);
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    ulog(
+        &base,
+        "INFO",
+        &format!(
+            "updater запущен: канал {}, parent_pid={parent_pid}, ждём до {wait_secs} с",
+            channel_label(channel)
+        ),
+    );
+    // Шаг 2: уйти с имени TraySession.exe (копия + перезапуск оттуда).
+    if reexec_as_updater(&base) {
+        ulog(&base, "INFO", "перезапущен из update_tmp, родитель выходит");
+        return 0;
     }
-    if let Err(e) = std::fs::write(&lock_path, "") {
-        crate::log::warn(&format!("не удалось создать {:?}: {e}", lock_path));
-    }
-    struct LockGuard(std::path::PathBuf);
-    impl Drop for LockGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _lock_guard = LockGuard(lock_path);
-    crate::log::info(&format!(
-        "фоновый процесс обновления запущен, канал {}, ждём закрытия программы до {wait_secs} с",
-        channel_label(channel)
-    ));
-    // Первым делом уходим с имени TraySession.exe: иначе нельзя будет
-    // заменить сам этот файл, пока мы его выполняем (os error 32).
-    let aside = match self_rename_aside(&base) {
-        Ok(p) => {
-            crate::log::info(&format!(
-                "освободил имя программы: работаю под именем {}",
-                p.display()
-            ));
-            p
-        }
-        Err(e) => {
-            // Не смертельно: если exe не в use (например, запустили копию),
-            // замена может пройти и без переименования. Пробуем дальше.
-            crate::log::warn(&format!("переименовать себя не вышло: {e}"));
-            PathBuf::new()
-        }
-    };
     let tmp = tmp_dir(&base);
     if let Err(e) = std::fs::create_dir_all(&tmp) {
-        crate::log::err(&format!("не создана папка загрузки {}: {e}", tmp.display()));
-        let _ = write_report(
+        return fail(
             &base,
-            UpdateReport {
-                ok: false,
-                message: format!("не создана папка загрузки {}: {e}", tmp.display()),
-                ..Default::default()
-            },
+            "tmp",
+            "io",
+            format!("не создана папка загрузки {}: {e}", tmp.display()),
+            2,
         );
-        return (2, aside.clone());
     }
     // Отчёт всегда свежий: старый мог остаться от прошлого обновления.
+    // (Сценарий C ручной проверки опирается на это: прибитый updater
+    // не должен оставлять ok=true от прошлого раза.)
     UpdateReport::clear(&base);
-    UpdateReport {
-        ok: false,
-        message: "не удалось получить манифест обновления".to_string(),
-        ..Default::default()
+    // Шаг 3: дождаться смерти main. Main выходит сам сразу после spawn
+    // (R2) — долгого ожидания в норме нет. Fallback — main_exited.flag:
+    // если PID успели переиспользовать, а флаг есть — main подтвердил
+    // готовность. Флаг съедаем сразу, чтобы протухший не разрешил
+    // замену при живом процессе (та же ловушка, что была у READY_FLAG).
+    let exited_flag = tmp_dir(&base).join(MAIN_EXITED_FLAG);
+    let exited_flag_present = exited_flag.exists();
+    let _ = std::fs::remove_file(&exited_flag);
+    if parent_pid != 0 {
+        ulog(&base, "INFO", &format!("жду смерти main pid={parent_pid} до {wait_secs} с"));
+        if !wait_for_pid_death(parent_pid, std::time::Duration::from_secs(wait_secs)) {
+            if exited_flag_present {
+                ulog(
+                    &base,
+                    "WARN",
+                    "main жив по PID, но main_exited.flag был — считаю готовым",
+                );
+            } else {
+                return fail(
+                    &base,
+                    "wait_parent",
+                    "timeout",
+                    format!("main pid={parent_pid} не вышел за {wait_secs} с, файлы не тронуты"),
+                    3,
+                );
+            }
+        } else {
+            ulog(&base, "INFO", "main мёртв, идём дальше");
+        }
+    } else {
+        ulog(&base, "WARN", "parent_pid=0 (диагностика?), ожидание пропущено");
     }
-    .save(&base)
-    .ok();
-
-    // 1. Манифест.
-    crate::log::info(&format!(
-        "запрашиваю манифест: {}",
-        manifest_url_for(channel)
-    ));
-    let manifest = match fetch_manifest_for(channel) {
+    // Шаг 4. Манифест канала (таймаут 30 с).
+    let url = manifest_url_for(channel);
+    ulog(&base, "INFO", &format!("запрашиваю манифест: {url}"));
+    let manifest = match fetch_manifest_for_timeout(channel, 30) {
         Ok(m) => {
-            crate::log::info(&format!(
-                "манифест получен: версия {}, сборка {}, файлов: {}",
-                m.version,
-                m.build,
-                m.files.len()
-            ));
+            ulog(
+                &base,
+                "INFO",
+                &format!(
+                    "манифест получен: версия {}, сборка {}, файлов: {}",
+                    m.version,
+                    m.build,
+                    m.files.len()
+                ),
+            );
             m
         }
         Err(e) => {
-            crate::log::err(&format!("манифест не получен: {e}"));
-            let _ = write_report(&base, UpdateReport { ok: false, message: e, ..Default::default() });
-            return (3, aside.clone());
+            return fail(&base, "manifest", "http", format!("манифест не получен: {e}"), 4);
         }
     };
-    // 2. План: какие файлы отличаются от диска.
+    // Шаг 5. План: какие файлы отличаются от диска.
     let plan = plan_update(&base, &manifest);
-    crate::log::info(&format!(
-        "план: скачать {}, совпадают {}, данных пользователя рядом: {}",
-        plan.to_download.len(),
-        plan.unchanged.len(),
-        plan.preserved.len()
-    ));
+    ulog(
+        &base,
+        "INFO",
+        &format!(
+            "план: скачать {}, совпадают {}, данных пользователя рядом: {}",
+            plan.to_download.len(),
+            plan.unchanged.len(),
+            plan.preserved.len()
+        ),
+    );
     for f in &plan.to_download {
-        crate::log::info(&format!("  к замене: {}", f.name));
+        ulog(&base, "INFO", &format!("  к замене: {}", f.name));
     }
     for f in &plan.unchanged {
-        crate::log::info(&format!("  без изменений: {f}"));
+        ulog(&base, "INFO", &format!("  без изменений: {f}"));
     }
     for f in &plan.preserved {
-        crate::log::info(&format!("  НЕ ТРОГАЕМ (данные пользователя): {f}"));
+        ulog(&base, "INFO", &format!("  НЕ ТРОГАЕМ (данные пользователя): {f}"));
     }
-    let mut report = UpdateReport {
-        preserved: plan.preserved.clone(),
-        ..Default::default()
-    };
     if plan.to_download.is_empty() {
-        report.ok = true;
-        report.unchanged = plan.unchanged.clone();
-        report.message = format!("уже установлена версия {}", manifest.version);
-        crate::log::info("обновлять нечего: файлы совпадают с манифестом");
-        let _ = write_report(&base, report);
-        return (0, aside.clone());
-    }
-    // 3. Скачать в папку рядом с программой.
-    for f in &plan.to_download {
-        let url = file_url_for(channel, &f.name);
-        crate::log::info(&format!("качаю {url}"));
-        if let Err(e) = download_to(&url, &tmp.join(&f.name), &f.sha256) {
-            crate::log::err(&format!("загрузка не удалась: {e}"));
-            let _ = write_report(
-                &base,
-                UpdateReport {
-                    ok: false,
-                    message: e,
-                    preserved: plan.preserved.clone(),
-                    ..Default::default()
-                },
-            );
-            return (4, aside.clone());
-        }
-        crate::log::info(&format!("скачано и сверено по SHA-256: {}", f.name));
-    }
-    // 4. Дождаться, пока основная программа закроется. Она сама закроется,
-    //    когда увидит файл-флаг; если не закрылась — не трогаем файлы.
-    crate::log::info("жду сигнала закрытия от основной программы");
-    if !wait_for_exit(&base, wait_secs) {
-        crate::log::err("сигнала закрытия не было: файлы не тронуты");
+        ulog(&base, "INFO", "обновлять нечего: файлы совпадают с манифестом");
         let _ = write_report(
             &base,
             UpdateReport {
-                ok: false,
-                message: "программа не закрылась, файлы не тронуты".to_string(),
+                ok: true,
+                unchanged: plan.unchanged.clone(),
                 preserved: plan.preserved.clone(),
+                message: format!("уже установлена версия {}", manifest.version),
+                stage: "done".to_string(),
                 ..Default::default()
             },
         );
-        return (5, aside.clone());
+        return 0;
     }
-    crate::log::info("сигнал получен, заменяю файлы");
-    // 5. Заменить файлы.
-    match apply_update(&base, &tmp, &plan.to_download) {
+    // Шаг 6. Скачать во временную папку как <name>.new (не трогая боевые
+    // файлы до атомарной замены на шаге 7).
+    for f in &plan.to_download {
+        let url = file_url_for(channel, &f.name);
+        ulog(&base, "INFO", &format!("качаю {url}"));
+        let staged = tmp.join(format!("{}.new", f.name));
+        if let Err(e) = download_to(&base, &url, &staged, &f.sha256) {
+            return fail(&base, "download", "net", format!("загрузка не удалась: {e}"), 6);
+        }
+        ulog(&base, "INFO", &format!("скачано и сверено по SHA-256: {}", f.name));
+    }
+    // Шаг 7. Атомарная замена через .old/.new с откатом.
+    ulog(&base, "INFO", "заменяю файлы");
+    let replaced = match replace_files_atomic(&base, &tmp, &plan.to_download) {
+        Ok(names) => {
+            ulog(&base, "INFO", &format!("заменено файлов: {}", names.join(", ")));
+            names
+        }
         Err(e) => {
-            crate::log::err(&format!("замена не удалась: {e}"));
-            let _ = write_report(
-                &base,
-                UpdateReport {
-                    ok: false,
-                    message: e,
-                    preserved: plan.preserved.clone(),
-                    ..Default::default()
-                },
-            );
-            return (6, aside.clone());
+            return fail(&base, "replace", "io", format!("замена не удалась: {e}"), 7);
         }
-        Ok(ApplyResult::NothingToDo) => {
-            report.ok = true;
-            report.unchanged = plan.unchanged.clone();
-            report.message = format!("файлы уже обновлены до {}", manifest.version);
-            crate::log::info("файлы оказались уже новыми");
-            let _ = write_report(&base, report);
+    };
+    // Шаг 8. Spawn нового процесса с --updated (R4: обход C5-mutex).
+    // Отчёт пишется ПОСЛЕ spawn (шаг 10): main уже вышел и отчёт не читает.
+    let exe = base.join(MAIN_EXE);
+    if let Err(e) = std::process::Command::new(&exe).arg(UPDATED_FLAG).spawn() {
+        // Новый даже не стартовал — возвращаем старый exe из .old.
+        let old = base.join(format!("{MAIN_EXE}.old"));
+        if old.exists() {
+            let _ = std::fs::rename(&old, &exe);
         }
-        Ok(ApplyResult::Replaced(updated)) => {
-            report.ok = true;
-            // Логируем до переноса: `updated` уходит в move строкой ниже.
-            crate::log::info(&format!("заменено файлов: {}", updated.join(", ")));
-            report.updated = updated;
-            report.unchanged = plan.unchanged.clone();
-            report.message = format!("установлена версия {}", manifest.version);
-            // C15: отчёт СНАЧАЛА, spawn ПОТОМ. Главный процесс читает
-            // отчёт в C13c-стороже и сам закрывается; раньше spawn шёл
-            // до отчёта — ребёнок стартовал раньше, чем main узнавал
-            // об успехе. Клон: оригинал уйдёт в повторную запись,
-            // если spawn провалится (см. ниже).
-            let _ = write_report(&base, report.clone());
-            // 6. Дождаться смерти main и перезапустить программу.
-            // Без ожидания новый процесс упирается в C5-mutex живого
-            // старого (FindWindowW → ShowWindow → exit(0)) и перезапуск
-            // молча не происходит.
-            if !wait_for_main_pid_death(&base, std::time::Duration::from_secs(30)) {
-                crate::log::warn(
-                    "старый процесс не завершился за 30 с, запускаю новый всё равно",
-                );
-            }
-            let exe = base.join(MAIN_EXE);
-            match std::process::Command::new(&exe).spawn() {
-                Ok(_) => crate::log::info(&format!("программа перезапущена: {}", exe.display())),
-                Err(e) => {
-                    // Раньше ошибка перезапуска глоталась: файлы обновлены,
-                    // а человек думал, что всё прошло. Теперь это попадает и
-                    // в лог, и в отчёт.
-                    crate::log::err(&format!(
-                        "не удалось перезапустить программу ({e}); запустите {} вручную",
-                        exe.display()
-                    ));
-                    report.message.push_str(&format!(
-                        ". Файлы обновлены, но перезапуск не удался: {e}. Запустите {} вручную",
-                        exe.display()
-                    ));
-                    let _ = write_report(&base, report);
-                }
-            }
-        }
+        return fail(
+            &base,
+            "spawn",
+            "spawn",
+            format!(
+                "не удалось запустить {}: {e}. Старый exe восстановлен из .old, запустите вручную",
+                exe.display()
+            ),
+            8,
+        );
     }
-    crate::log::info("обновление завершено");
-    (0, aside)
+    ulog(&base, "INFO", &format!("новый процесс запущен: {}", exe.display()));
+    // Шаг 9. Cleanup: .old-копии, своя копия updater (отложенно — файл
+    // держит сам процесс), main_pid.txt (протухший PID страшнее
+    // отсутствующего: ОС переиспользует PID).
+    cleanup_old_files(&base, &replaced);
+    let aside = tmp.join(UPDATER_NAME);
+    if aside.is_file() {
+        let _ = remove_aside_delayed(&aside);
+    }
+    let _ = std::fs::remove_file(tmp.join(MAIN_PID_FILE));
+    // Шаг 10. Отчёт об успехе.
+    ulog(&base, "INFO", "обновление завершено");
+    let _ = write_report(
+        &base,
+        UpdateReport {
+            ok: true,
+            updated: replaced,
+            unchanged: plan.unchanged.clone(),
+            preserved: plan.preserved.clone(),
+            message: format!("установлена версия {}", manifest.version),
+            stage: "done".to_string(),
+            ..Default::default()
+        },
+    );
+    0
 }
 
 fn write_report(base: &Path, r: UpdateReport) -> std::io::Result<()> {
     r.save(base)
 }
 
-/// Ждать сигнала от основной программы: файл `update_ready.flag`.
+/// Дождаться смерти процесса по PID через WinAPI.
 ///
-/// Основная программа пишет его перед выходом. Пока файла нет, ждём;
-/// если за отведённое время не появился — обновление отменяется, чтобы не
-/// бить по работающей программе.
-pub fn wait_for_exit(base: &Path, wait_secs: u64) -> bool {
-    let flag = base.join(READY_FLAG);
-    let start = std::time::Instant::now();
-    // Флаг проверяется ХОТЯ БЫ ОДИН РАЗ, даже если ждать нечего. Иначе
-    // `wait_secs = 0` означал бы «не смотреть вовсе», и программа, которая
-    // уже успела записать файл и выйти, считалась бы ещё работающей:
-    // обновление отменялось бы, а её файл так и лежал бы дальше.
-    loop {
-        if flag.exists() {
-            let _ = std::fs::remove_file(&flag);
-            // Дать основному процессу дописать и выйти.
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            return true;
-        }
-        if start.elapsed().as_secs() >= wait_secs {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-}
-
-/// Попросить основную программу закрыться: записать файл-флаг.
-pub fn signal_ready_to_exit(base: &Path) -> std::io::Result<()> {
-    std::fs::write(base.join(READY_FLAG), b"1")
-}
-
-/// Имя файла с PID главного процесса. Main пишет его при старте
-/// (main.rs, после C5-mutex); updater читает в wait_for_main_pid_death.
-pub const MAIN_PID_FILE: &str = "main_pid.txt";
-
-/// Дождаться смерти главного процесса перед перезапуском.
-///
-/// C15: новый процесс, запущенный при живом main, упирается в C5-mutex
-/// и молча выходит — перезапуск не происходит. Флаг-файл тут не
-/// помощник: он лишь разрешает замену, а не подтверждает смерть.
-/// Поэтому ждём сам PID из main_pid.txt через WinAPI.
-///
-/// Возвращает true, если main мёртв (или его PID неизвестен — тогда
-/// ждать некого и spawn идёт сразу). False — истёк таймаут, main жив.
+/// Чистая функция ожидания (без чтения файлов — PID передаёт вызывающий),
+/// поэтому тестируется напрямую: живой PID + короткий таймаут = false,
+/// мёртвый PID = true.
 #[cfg(windows)]
-fn wait_for_main_pid_death(base: &Path, timeout: std::time::Duration) -> bool {
+fn wait_for_pid_death(pid: u32, timeout: std::time::Duration) -> bool {
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::processthreadsapi::OpenProcess;
     use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::WAIT_OBJECT_0;
     use winapi::um::winnt::SYNCHRONIZE;
 
-    let pid_file = tmp_dir(base).join(MAIN_PID_FILE);
-    let pid: u32 = match std::fs::read_to_string(&pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-    {
-        Some(p) => p,
-        None => return false,
-    };
     unsafe {
         let h = OpenProcess(SYNCHRONIZE, 0, pid);
         if h.is_null() {
+            // Такого процесса нет — значит, уже мёртв (или PID
+            // переиспользован и закрыт между проверками — всё равно идём).
             return true;
         }
-        let ms = timeout.as_millis() as u32;
+        let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         let r = WaitForSingleObject(h, ms);
         CloseHandle(h);
         r == WAIT_OBJECT_0
@@ -1335,39 +1308,32 @@ fn wait_for_main_pid_death(base: &Path, timeout: std::time::Duration) -> bool {
 }
 
 #[cfg(not(windows))]
-fn wait_for_main_pid_death(_base: &Path, _timeout: std::time::Duration) -> bool {
+fn wait_for_pid_death(_pid: u32, _timeout: std::time::Duration) -> bool {
     true
 }
 
-/// Убрать остаточный файл-флаг при старте программы.
+/// Запустить фоновый процесс обновления (новый протокол, R2).
 ///
-/// Флаг живёт рядом с программой и переживает её: если она упала или была
-/// убита в момент установки, файл остаётся. А `wait_for_exit` проверяет его
-/// на первой же итерации и, увидев, разрешает замену файлов немедленно — то
-/// ест�� ровно тот случай, когда заменять нельзя. Поэтому при старте флаг
-/// снимается: он нужен только в текущем сеансе.
-///
-/// Вызывается один раз при запуске главной программы.
-pub fn clear_stale_ready_flag(base: &Path) -> bool {
-    let flag = base.join(READY_FLAG);
-    if flag.exists() {
-        std::fs::remove_file(&flag).is_ok()
-    } else {
-        false
-    }
-}
-
-/// Запустить фоновый процесс обновления.
-///
-/// `exe` — путь к своему исполняемому файлу. Отдельный процесс нужен
-/// затем, что (а) интерфейс не должен висеть на загрузке, (б) заменять
-/// `.exe` может только тот, кто его не держит открытым.
-pub fn spawn_updater(exe: &Path, wait_secs: u64, channel: &str) -> std::io::Result<()> {
+/// `exe` — путь к своему исполняемому файлу, `parent_pid` — PID main
+/// (updater ждёт его смерти), `wait_secs` — лимит ожидания (default 60).
+/// Отдельный процесс нужен затем, что (а) интерфейс не должен висеть
+/// на загрузке, (б) заменять `.exe` может только тот, кто его не держит
+/// открытым. Main после spawn сразу выходит и ничего не ждёт.
+pub fn spawn_updater(
+    exe: &Path,
+    parent_pid: u32,
+    wait_secs: u64,
+    channel: &str,
+) -> std::io::Result<()> {
     std::process::Command::new(exe)
         .arg(UPDATER_FLAG)
+        .arg("--parent-pid")
+        .arg(parent_pid.to_string())
+        .arg("--wait-secs")
         .arg(wait_secs.to_string())
         // Канал обязателен: без него фоновый процесс взял бы стабильную
         // ветку, и бета-сборка молча откатывалась бы на старую версию.
+        .arg("--channel")
         .arg(if channel.eq_ignore_ascii_case(CHANNEL_BETA) {
             CHANNEL_BETA
         } else {
@@ -1400,7 +1366,7 @@ mod real_manifest {
     /// Собирается полный сценарий: манифест требует обновить
     /// пользовательский файл → manifest.validate() его отвергает →
     /// wanted_files() его не возвращает → plan_update() его не качает →
-    /// apply_update() его не трогает. Файл на диске после всего этого
+    /// replace_files_atomic() его не трогает. Файл на диске после всего этого
     /// обязан остаться байт в байт.
     #[test]
     fn session_history_survives_an_attack_by_manifest() {
@@ -1413,11 +1379,12 @@ mod real_manifest {
         let history = b"SESSION-HISTORY-THAT-MUST-SURVIVE";
         std::fs::write(d.join("sessions.db"), history).unwrap();
         std::fs::write(d.join("config.json"), b"{\"api_key\":\"SECRET\"}").unwrap();
-        // «Старая» программа и «новая» в папке загрузки.
+        // «Старая» программа и «новая» в папке загрузки (как .new —
+        // pipeline качает именно туда, см. шаг 6).
         std::fs::write(d.join("TraySession.exe"), b"OLD").unwrap();
         let tmp = d.join("update_tmp");
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("TraySession.exe"), b"NEW-BINARY-0123456789").unwrap();
+        std::fs::write(tmp.join("TraySession.exe.new"), b"NEW-BINARY-0123456789").unwrap();
         // В tmp подложим «новую» историю — обновление и её не должно
         // заметить: файл защищённый.
         std::fs::write(tmp.join("sessions.db"), b"CLOBBERED-ATTEMPT").unwrap();
@@ -1450,7 +1417,9 @@ mod real_manifest {
         assert_eq!(names, vec!["TraySession.exe"], "в плано пошёл лишний файл: {names:?}");
         // 3. Замена трогает только плановые файлы, даже если в tmp лежит
         //    «новая» история.
-        apply_update(d, &tmp, &plan.to_download).unwrap();
+        let replaced = replace_files_atomic(d, &tmp, &plan.to_download).unwrap();
+        assert_eq!(replaced, vec!["TraySession.exe".to_string()]);
+        cleanup_old_files(d, &replaced);
         // 4. Проверка результата: программа обновилась, данные — нет.
         assert_eq!(
             std::fs::read(d.join("TraySession.exe")).unwrap(),
@@ -1475,6 +1444,8 @@ mod real_manifest {
             updated: vec!["TraySession.exe".into()],
             unchanged: vec![],
             preserved: plan.preserved.clone(),
+            stage: "done".into(),
+            error_kind: String::new(),
         };
         let d = r.describe();
         assert!(d.contains("TraySession.exe"), "{d}");

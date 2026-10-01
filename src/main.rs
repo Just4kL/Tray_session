@@ -288,6 +288,36 @@ fn apply_global_hotkeys(
     *current = regs;
 }
 
+/// Завершить старый main-процесс по PID из main_pid.txt (ветка --updated).
+/// Best effort: файла/процесса уже нет — значит, всё хорошо, выходим молча.
+#[cfg(windows)]
+fn kill_old_main_by_pid_file() {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
+    use winapi::um::winnt::PROCESS_TERMINATE;
+    let pid: u32 = match std::fs::read_to_string(
+        crate::update::tmp_dir(&crate::update::program_dir()).join(crate::update::MAIN_PID_FILE),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse().ok())
+    {
+        Some(p) => p,
+        None => return,
+    };
+    if pid == std::process::id() {
+        return;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return;
+        }
+        TerminateProcess(h, 0);
+        CloseHandle(h);
+    }
+    // Лога тут нет: log::init ещё не вызван, запись ушла бы в никуда.
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_app_icon;
@@ -364,8 +394,11 @@ fn main() -> eframe::Result {
     // держит открытым. Окно при этом не создаётся.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(upd) = update::parse_args(&argv) {
-        std::process::exit(update::run_updater(upd.wait_secs, &upd.channel));
+        std::process::exit(update::run_updater(upd.parent_pid, upd.wait_secs, &upd.channel));
     }
+    // Перезапуск после обновления (R4): updater уже заменил файлы и
+    // запустил нас с --updated. Старого процесса уже нет (updater ждал
+    // его смерти), но на всякий случай ветка ниже умеет его завершить.
 
     // Режим деактиватора. Отдельного маленького бинарника не делаем
     // намеренно: он тянул бы за собой копию логирования, работы с базой и
@@ -391,6 +424,11 @@ fn main() -> eframe::Result {
     // Окно ищем по точному title "Tray Session" (см. run_native ниже).
     // Если оно скрыто в трее (Visible(false)), HWND всё равно существует,
     // ShowWindow(SW_SHOW) + SetForegroundWindow его показывают.
+    //
+    // R4: запуск с --updated после замены файлов. Старого процесса быть
+    // не должно (updater ждал смерти), но если mutex всё ещё занят —
+    // завершаем владельца по PID из main_pid.txt, ждём 2 с и захватываем
+    // mutex заново. Без флага — старое поведение (показать окно + exit).
     #[cfg(windows)]
     let _single_instance_mutex = {
         use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
@@ -399,12 +437,18 @@ fn main() -> eframe::Result {
         use winapi::um::winuser::{
             FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
         };
+        let updated_mode = argv.iter().any(|a| a == update::UPDATED_FLAG);
         let mutex_name: Vec<u16> = SINGLE_INSTANCE_MUTEX
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         unsafe {
-            let h = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            let mut h = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            if GetLastError() == ERROR_ALREADY_EXISTS && updated_mode {
+                kill_old_main_by_pid_file();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                h = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            }
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let title: Vec<u16> = "Tray Session\0".encode_utf16().collect();
                 let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
@@ -422,22 +466,11 @@ fn main() -> eframe::Result {
         }
     };
 
-    // C13c: протухший updater.lock от упавшего апдейтера. Если файл
-    // пережил падение, следующий запуск решил бы, что апдейтер жив, и
-    // сторож ждал бы до HARD_LIMIT. Снимаем до log::init (писать в лог
-    // ещё некуда); итог логируем после init ниже.
-    // --updater сюда не доходит (вышел выше), ему маркер нужен живой.
-    let had_stale_updater_lock = {
-        let p = crate::update::tmp_dir(&crate::update::program_dir())
-            .join(crate::update::UPDATER_LOCK_FILE);
-        p.exists() && std::fs::remove_file(&p).is_ok()
-    };
-
-    // C15: PID главного процесса для updater. Updater после замены файлов
-    // должен дождаться смерти main (иначе новый процесс упирается в C5
-    // mutex и молча выходит). PID кладём рядом с остальными маркерами
-    // обновления; читает wait_for_main_pid_death. Пишем до log::init —
-    // запись в файл лога не требует.
+    // PID главного процесса для updater и --updated-перезапуска
+    // (ожидание смерти / завершение владельца C5-mutex). Пишем при
+    // каждом старте, до log::init — запись в файл лога не требует.
+    // main_pid.txt updater удаляет на шаге cleanup; протухший PID
+    // не страшен: wait сверяется со смертью процесса, а не с файлом.
     let pid_path =
         crate::update::tmp_dir(&crate::update::program_dir()).join(crate::update::MAIN_PID_FILE);
     if let Some(parent) = pid_path.parent() {
@@ -448,16 +481,6 @@ fn main() -> eframe::Result {
     // Логи пишутся рядом с программой, с ограничением по объёму.
     crate::log::init(&crate::update::program_dir());
     crate::log::info(&format!("Tray Session {VERSION} запущена"));
-    if had_stale_updater_lock {
-        crate::log::info("снят протухший updater.lock от прошлого запуска апдейтера");
-    }
-
-    // Остаточный файл-флаг от прошлого сеанса снимаем сразу: если он
-    // пережил падение, фоновый процесс увидит его и разрешит замену файлов
-    // при ещё работающей программе.
-    if crate::update::clear_stale_ready_flag(&crate::update::program_dir()) {
-        crate::log::info("найден и снят остаточный файл-флаг от прошлого сеанса");
-    }
 
     let cfg_handle = AppConfig::load();
     // Автоопределение SteamID как в Python-версии
