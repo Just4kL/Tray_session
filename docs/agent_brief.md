@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-01
-Обновил: агент-сессия — C13a/b/c закрыты живым тестом, C15 открыт, бриф — этим коммитом
+Обновил: агент-сессия — bump до 0.7.33-beta.4 (C15 внутри), бриф — этим коммитом
 
 ## Проект
 
@@ -18,7 +18,7 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `dad3c64` (release: 0.7.33-beta.3 binaries + manifest; docs-коммиты — HEAD)
+- HEAD: `6bcd2a3` (release: 0.7.33-beta.4 binaries + manifest; docs-коммит — HEAD)
 - Тесты: 162 зелёных
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
@@ -26,10 +26,10 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## В работе
 
-Pre-release 0.7.33-beta.3 живёт: живой тест beta.2 → beta.3 дал ok=true,
-файлы заменены, но перезапуск не сработал (C15). В работе: C15
-(перезапуск), затем H1. Публикация beta.3 в `app-Tray_session` — после
-фикса C15.
+Pre-release 0.7.33-beta.4 собран: включает фикс C15 (main_pid,
+ожидание смерти, самозакрытие). Опубликованная beta.3 фикса НЕ содержит.
+В работе: живой тест beta.3 → beta.4 для сквозной проверки C15, затем H1.
+Публикация beta.4 в `app-Tray_session` — после зелёного живого теста.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -66,6 +66,9 @@ Pre-release 0.7.33-beta.3 живёт: живой тест beta.2 → beta.3 да
 | `96e3599` | docs: agent_brief под 0.7.33-beta.3 | `docs/agent_brief.md` |
 | `fcf8650` | docs: ARC-1 — make-manifest -Archive архивирует не ту сборку | `docs/tasks.md` (только запись задачи, без фикса) |
 | live-test | beta.2 → beta.3: ok=true, exe заменён, lock снят; перезапуск НЕ сработал → C15 | `update_report.json`, `docs/bugs.md` (C15), `docs/tasks.md` (C15/C16/AU-4/SUI-1) |
+| `847166e` | fix(C15): main_pid.txt, wait_for_main_pid_death, самозакрытие по ok=true | `src/main.rs`, `src/update.rs`, `src/app.rs`, `Cargo.toml` (фичи winapi) |
+| `9e27d3a` | chore: bump to 0.7.33-beta.4 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `6bcd2a3` | release: 0.7.33-beta.4 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
