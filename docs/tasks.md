@@ -310,6 +310,18 @@ comfyui-update-view.png.
 сторожевого периода не выглядело зависанием.
 **Связано:** C15 (перезапуск).
 
+### TOOL-1 - Rate limit bypass via API key pool
+**Status:** [ ] open
+**Priority:** MEDIUM (does not block development)
+**Context:** OpenCode Zen rate limit applies to IP/account, not individual key.
+Multiple keys from same account share quota.
+**Options:**
+1. keymux (princetechs/keymux) - requires tsc, project status unclear, npm
+   package 'keymux@0.3.0' is a library without binary. Risk.
+2. dsh-api-key-pool + dsh-opencode-zen plugins - supported, ready to use.
+3. External proxy (ngrok) + rotating keys.
+**Detected:** 2026-10-01.
+
 ### DOC-1 — Changelog для релизов
 **Статус:** [x] закрыт
 **Закрыто коммитом:** 410bb6c (2026-10-01)
