@@ -394,7 +394,12 @@ fn main() -> eframe::Result {
     // держит открытым. Окно при этом не создаётся.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(upd) = update::parse_args(&argv) {
-        std::process::exit(update::run_updater(upd.parent_pid, upd.wait_secs, &upd.channel));
+        std::process::exit(update::run_updater(
+            &upd.base_dir,
+            upd.parent_pid,
+            upd.wait_secs,
+            &upd.channel,
+        ));
     }
     // Перезапуск после обновления (R4): updater уже заменил файлы и
     // запустил нас с --updated. Старого процесса уже нет (updater ждал

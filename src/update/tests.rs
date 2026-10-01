@@ -648,6 +648,19 @@ fn updater_channel_survives_named_arguments() {
 }
 
 #[test]
+fn updater_base_dir_survives_reexec() {
+    // Шаг 2 pipeline (reexec из update_tmp): копия НЕ должна выводить
+    // корень из своего program_dir() — там будет update_tmp. Base едет
+    // явным аргументом от main.
+    let u = parse_args(&args(&["--updater", "--base", "C:\\Program Files\\Tray Session"])).unwrap();
+    assert_eq!(u.base_dir, PathBuf::from("C:\\Program Files\\Tray Session"));
+    // Без --base — fallback на program_dir() (ручной запуск updater
+    // для диагностики).
+    let u = parse_args(&args(&["--updater"])).unwrap();
+    assert_eq!(u.base_dir, program_dir());
+}
+
+#[test]
 #[cfg(windows)]
 fn pid_death_distinguishes_live_and_dead() {
     // wait_for_pid_death: живой PID + короткий таймаут = false,

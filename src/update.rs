@@ -930,6 +930,11 @@ pub fn parse_args(args: &[String]) -> Option<UpdateArgs> {
         // Канал передавать обязательно: фоновый процесс — отдельный, и без
         // явного канала он обновил бы программу по стабильной ветке.
         channel: value_of("--channel").unwrap_or_else(|| CHANNEL_STABLE.to_string()),
+        // Корень программы: reexec-копия работает из update_tmp, и её
+        // program_dir() указывает туда же — весь pipeline (отчёт, загрузки,
+        // замена, spawn, логи) ушёл бы мимо корня. Поэтому base едет явным
+        // аргументом от main, который знает свой каталог точно.
+        base_dir: value_of("--base").map(PathBuf::from).unwrap_or_else(program_dir),
     })
 }
 
@@ -949,6 +954,10 @@ pub struct UpdateArgs {
     pub wait_secs: u64,
     /// Канал обновлений: `stable` или `beta`.
     pub channel: String,
+    /// Корень программы (каталог заменяемых файлов). Едет явным аргументом,
+    /// т.к. после шага 2 (reexec из update_tmp) program_dir() копии
+    /// указывает в update_tmp, а не в корень.
+    pub base_dir: PathBuf,
 }
 
 /// Имя, под которым фоновый процесс работает после шага 2 pipeline:
@@ -1033,9 +1042,8 @@ fn fail(base: &Path, stage: &str, kind: &str, message: String, code: i32) -> i32
 /// Паники не ожидаются, но если что-то запаниковало — main уже вышел,
 /// файлы целы (замена атомарна через .old), следующий запуск начнёт
 /// с чистого pipeline.
-pub fn run_updater(parent_pid: u32, wait_secs: u64, channel: &str) -> i32 {
-    let base = program_dir();
-    run_updater_inner(&base, parent_pid, wait_secs, channel)
+pub fn run_updater(base: &Path, parent_pid: u32, wait_secs: u64, channel: &str) -> i32 {
+    run_updater_inner(base, parent_pid, wait_secs, channel)
 }
 
 /// Шаг 2: уйти с имени TraySession.exe.
@@ -1331,6 +1339,15 @@ pub fn spawn_updater(
         .arg(parent_pid.to_string())
         .arg("--wait-secs")
         .arg(wait_secs.to_string())
+        // Корень программы: reexec-копия не должна выводить его из своего
+        // program_dir() (там будет update_tmp). Каталог берём из пути exe.
+        .arg("--base")
+        .arg(
+            exe.parent()
+                .unwrap_or(Path::new("."))
+                .to_string_lossy()
+                .into_owned(),
+        )
         // Канал обязателен: без него фоновый процесс взял бы стабильную
         // ветку, и бета-сборка молча откатывалась бы на старую версию.
         .arg("--channel")
