@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-01
-Обновил: агент-сессия — tasks.md как чек-лист со статусами и датами
+Обновил: агент-сессия — статусы DOC/LIC закрыты, pre-release beta.2 в работе
 
 ## Проект
 
@@ -18,19 +18,15 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `9646921` (fix(C9 v2): показ окна из трея через WinAPI + taskbar(false))
-- Тесты: 159 зелёных
+- HEAD: `4f1b389` (docs(DOC-2/3/4): Proprietary LICENSE, TERMS.md, авторство)
+- Тесты: 161 зелёный
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
 - Тег отката: `pre-ui-refactor` (`a48813d`)
 
 ## В работе
 
-**C13a/C13b — критические блокеры pre-release.** Живой тест 0.7.33-beta.1
-вскрыл: апдейтер зависает (C13a), exe пропадает без восстановления (C13b),
-программа не перезапускается, висят два `_updater_running.exe`. Живые тесты
-обновления заблокированы до их фикса. Новые задачи: C12, C14, C15
-(см. `docs/tasks.md`).
+Pre-release 0.7.33-beta.2 в работе: DOC-1/LIC-1/DOC-2/3/4 закрыты, бриф — этим коммитом. Публикация в `app-Tray_session` и живой тест — следующие шаги.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -55,6 +51,12 @@ Python-версия (pythonProject) — эталон для дымовых те�
 | `67101e5` | fix: ComboBox-черновики (C10/C11), show_main_window WinAPI (C9), BUILD из build.rs (C8) | `src/app.rs`, `src/app_state.rs`, `build.rs`, `Cargo.toml` |
 | `04f78cc` | fix(C9): скрытие в трей через Minimized + guard-тест | `src/app.rs` |
 | `9646921` | fix(C9 v2): показ окна из трея через WinAPI + taskbar(false) | `src/main.rs`, `src/app.rs` (hide_tray) |
+| `071da14` | chore: bump version to 0.7.33-beta.2 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `4efcac4` | fix(C6a): скрыть консольное окно в release-сборке | `src/main.rs` |
+| `bdb4760` | release: 0.7.33-beta.2 binaries + manifest | `TraySession.exe`, `Tray_session_setup.exe`, `update_manifest.json` |
+| `410bb6c` | docs(DOC-1): CHANGELOG.md + запись 0.7.33-beta.2 в app.rs | `src/app.rs`, `CHANGELOG.md`, `BRANCHING.md` |
+| `f60c8d2` | docs(LIC-1): аудит лицензий под Proprietary | `docs/licenses.md`, `THIRD_PARTY_LICENSES.md`, `tools/make-licenses.ps1` |
+| `4f1b389` | docs(DOC-2/3/4): Proprietary LICENSE, TERMS.md, авторство | `LICENSE`, `TERMS.md`, `src/app.rs`, `Cargo.toml` |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
