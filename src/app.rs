@@ -4246,6 +4246,13 @@ impl TrackerApp {
                 });
             });
             ui.label(format!("Версия: {VERSION} (сборка {BUILD})"));
+            ui.label("© 2026 Kenig Feodor. Все права защищены (см. LICENSE в репозитории).");
+            ui.label(
+                egui::RichText::new(
+                    "Условия использования: TERMS.md. Третьи стороны: THIRD_PARTY_LICENSES.md.",
+                )
+                .weak(),
+            );
             ui.label("Авто-подсчёт игровых сессий с GPU-гейтом, трей, будильники, таймер, Steam API, экспорт CSV. Rust/egui.");
             ui.label(egui::RichText::new(
                 "Клик по версии внизу боковой панели открывает этот раздел и сразу \

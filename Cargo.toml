@@ -4,7 +4,9 @@ version = "0.7.33-beta.2"
 publish = false
 edition = "2021"
 description = "Game Session Tracker — авто-подсчёт времени игр с GPU-гейтом (Rust/egui)"
-authors = ["Game Session Tracker"]
+authors = ["Kenig Feodor"]
+# license не указан: Proprietary вне SPDX, crates.io не публикуем
+# (publish = false). Права — в файле LICENSE.
 build = "build.rs"
 
 [dependencies]
