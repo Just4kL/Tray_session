@@ -1,14 +1,14 @@
 {
-    "version":  "0.7.33-beta.2",
-    "build":  "20261001",
-    "files":  [
-                  {
-                      "name":  "TraySession.exe",
-                      "sha256":  "a62ccade0db23c8216ffbadad0ca34bc97f44c4b7634a718daaba05b2713da66"
-                  },
-                  {
-                      "name":  "Tray_session_setup.exe",
-                      "sha256":  "ad7e6505fcc2e89322abc44ee6ba3cdddc1aefc8f719ac6dc1067c321cad0bf3"
-                  }
-              ]
+  "version": "0.7.33-beta.3",
+  "build": "20261001",
+  "files": [
+    {
+      "name": "TraySession.exe",
+      "sha256": "0215776a9c129eb7f2b20985503d15de8621373c74c98052027c1610f4128e53"
+    },
+    {
+      "name": "Tray_session_setup.exe",
+      "sha256": "ad7e6505fcc2e89322abc44ee6ba3cdddc1aefc8f719ac6dc1067c321cad0bf3"
+    }
+  ]
 }
