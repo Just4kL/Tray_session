@@ -731,3 +731,13 @@ fn ready_flag_roundtrips() {
     assert!(wait_for_exit(&dir.0, 5), " updater не дождался флага");
     assert!(!flag.exists(), "флаг не удалён после ожидания");
 }
+
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn watchdog_hard_limit_exceeds_download_budget() {
+    // C13c: сторож обязан ждать дольше, чем download исчерпывает попытки:
+    // 3 попытки × 180 с read-таймаут + задержки retry. Иначе сторож
+    // откатывал quit_requested посреди живой загрузки.
+    assert!(900 > 3 * 180 + 10);
+    assert!(UPDATER_HARD_LIMIT_SECS > 3 * 180 + 10);
+}

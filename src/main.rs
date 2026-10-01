@@ -422,9 +422,23 @@ fn main() -> eframe::Result {
         }
     };
 
+    // C13c: протухший updater.lock от упавшего апдейтера. Если файл
+    // пережил падение, следующий запуск решил бы, что апдейтер жив, и
+    // сторож ждал бы до HARD_LIMIT. Снимаем до log::init (писать в лог
+    // ещё некуда); итог логируем после init ниже.
+    // --updater сюда не доходит (вышел выше), ему маркер нужен живой.
+    let had_stale_updater_lock = {
+        let p = crate::update::tmp_dir(&crate::update::program_dir())
+            .join(crate::update::UPDATER_LOCK_FILE);
+        p.exists() && std::fs::remove_file(&p).is_ok()
+    };
+
     // Логи пишутся рядом с программой, с ограничением по объёму.
     crate::log::init(&crate::update::program_dir());
     crate::log::info(&format!("Tray Session {VERSION} запущена"));
+    if had_stale_updater_lock {
+        crate::log::info("снят протухший updater.lock от прошлого запуска апдейтера");
+    }
 
     // Остаточный файл-флаг от прошлого сеанса снимаем сразу: если он
     // пережил падение, фоновый процесс увидит его и разрешит замену файлов

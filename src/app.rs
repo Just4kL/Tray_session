@@ -1431,8 +1431,9 @@ impl TrackerApp {
                 // выходим. Файл-флаг читает updater.
                 let _ = crate::update::signal_ready_to_exit(&crate::update::program_dir());
                 self.state.quit_requested = true;
-                // Сторож в update() следит по этой метке: если апдейтер
-                // не отчитался за 90 с — откат quit_requested (баг C13b).
+                // Сторож в update() следит по этой метке через updater.lock:
+                // пока файл жив — апдейтер работает, откат только по
+                // HARD_LIMIT или завершению без успеха (C13b/C13c).
                 self.state.update_pending_since = Some(std::time::Instant::now());
             }
             Err(e) => {
@@ -2835,21 +2836,32 @@ impl eframe::App for TrackerApp {
                 }
             }
         }
-        // C13b: сторож. Если quit_requested выставлен (идёт установка),
-        // но апдейтер за 90 с не отчитался ok=true — он упал: откатываем
-        // флаг, показываем окно и ошибку вместо вечного чёрного экрана.
-        // Проверка ДО раннего return ниже, иначе сторож сам себя заблокирует.
+        // C13c: сторож по живости апдейтера, а не по фиксированному таймауту.
+        // Фиксированные 90 с срабатывали раньше, чем download исчерпывал
+        // попытки (3 × 180 с), и откатывали quit_requested посреди живой
+        // загрузки. Теперь: пока существует update_tmp/updater.lock —
+        // апдейтер работает, ждём. Файла нет — завершился, проверяем итог.
+        // HARD_LIMIT — только страховка от вечно висящего процесса.
         if self.state.quit_requested {
-            const STALL_TIMEOUT_SECS: u64 = 90;
             if let Some(since) = self.state.update_pending_since {
-                if since.elapsed() > Duration::from_secs(STALL_TIMEOUT_SECS) {
+                let lock_path = crate::update::tmp_dir(&crate::update::program_dir())
+                    .join(crate::update::UPDATER_LOCK_FILE);
+                let updater_alive = lock_path.exists();
+                let should_rollback = if updater_alive {
+                    since.elapsed()
+                        > Duration::from_secs(crate::update::UPDATER_HARD_LIMIT_SECS)
+                } else {
+                    // Файла нет → апдейтер завершился (успешно или с ошибкой).
+                    true
+                };
+                if should_rollback {
                     // UpdateReport::load читает update_tmp/update_report.json.
                     let ok = crate::update::UpdateReport::load(&crate::update::program_dir())
                         .map(|r| r.ok)
                         .unwrap_or(false);
                     if !ok {
                         crate::log::err(
-                            "сторож: апдейтер не отчитался за 90 с, откат quit_requested",
+                            "сторож: апдейтер завершился без успеха, откат quit_requested",
                         );
                         self.state.quit_requested = false;
                         self.state.update_pending_since = None;

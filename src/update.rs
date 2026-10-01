@@ -76,6 +76,16 @@ pub const TMP_DIR_NAME: &str = "update_tmp";
 pub const REPORT_NAME: &str = "update_report.json";
 /// Имя главного исполняемого файла программы.
 pub const MAIN_EXE: &str = "TraySession.exe";
+/// Маркер живого апдейтера: создаётся при старте run_updater_inner,
+/// удаляется через Drop-guard при любом выходе (включая panic).
+/// Сторож в главном процессе смотрит на него вместо фиксированного
+/// таймаута: пока файл есть — апдейтер жив (качает), файла нет —
+/// завершился.
+pub const UPDATER_LOCK_FILE: &str = "updater.lock";
+/// Страховка сторожа от вечно висящего апдейтера, секунды.
+/// 900 > 3 попытки × 180 с read + задержки retry (≈542 с): сторож
+/// не должен срабатывать раньше, чем download исчерпает попытки.
+pub const UPDATER_HARD_LIMIT_SECS: u64 = 900;
 
 /// Ключ, которым фоновый процесс просит основной программу закрыться.
 ///
@@ -1032,6 +1042,24 @@ fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBu
             h
         }
     };
+    // C13c: маркер живости. Пока файл существует — апдейтер работает
+    // (качает/меняет), сторож главного процесса ждёт. Drop-guard ниже
+    // удаляет файл при любом выходе, включая panic: иначе следующий
+    // запуск решит, что апдейтер жив.
+    let lock_path = tmp_dir(&base).join(UPDATER_LOCK_FILE);
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&lock_path, "") {
+        crate::log::warn(&format!("не удалось создать {:?}: {e}", lock_path));
+    }
+    struct LockGuard(std::path::PathBuf);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _lock_guard = LockGuard(lock_path);
     crate::log::info(&format!(
         "фоновый процесс обновления запущен, канал {}, ждём закрытия программы до {wait_secs} с",
         channel_label(channel)
