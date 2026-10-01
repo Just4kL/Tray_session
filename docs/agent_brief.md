@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-01
-Обновил: агент-сессия — bump до 0.7.33-beta.5 + TOOL-1, бриф — этим коммитом
+Обновил: агент-сессия — bump до 0.7.33-beta.6 (--base фикс внутри), бриф — этим коммитом
 
 ## Проект
 
@@ -18,18 +18,19 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `348662e` (release: 0.7.33-beta.5 binaries + manifest; docs-коммит — HEAD)
-- Тесты: 160 зелёных
+- HEAD: `4af3a80` (release: 0.7.33-beta.6 binaries + manifest; docs-коммит — HEAD)
+- Тесты: 161 зелёный
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
 - Тег отката: `pre-ui-refactor` (`a48813d`)
 
 ## В работе
 
-Pre-release 0.7.33-beta.5 собран: полный рерайт updater (pipeline
-вместо патчей C13a/b/c + C15). Опубликованная beta.4 рерайта НЕ содержит.
-В работе: публикация beta.5 в `app-Tray_session`, затем живой тест
-beta.4 → beta.5 для сквозной проверки pipeline, затем H1.
+Pre-release 0.7.33-beta.6 собран локально: включает --base фикс
+(f420aa3) — прошлый живой тест гонял старый updater beta.4, новый
+pipeline в бою не был. В работе: свежий живой тест локальной beta.5
+(+фикс) → beta.6 для сквозной проверки pipeline, затем H1.
+Публикация — после зелёного живого теста, app-Tray_session не трогать.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -72,6 +73,9 @@ beta.4 → beta.5 для сквозной проверки pipeline, затем 
 | `47991c2` | refactor(update): updater как единый pipeline (ulog, reexec, atomic replace, wait_pid, --updated) | `src/update.rs`, `src/app.rs`, `src/app_state.rs`, `src/main.rs`, `src/update/tests.rs` (160 тестов) |
 | `0d6af4f` | chore: bump to 0.7.33-beta.5 + TOOL-1 | `Cargo.toml`, `Cargo.lock`, `src/app.rs`, `docs/tasks.md` |
 | `348662e` | release: 0.7.33-beta.5 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
+| `f420aa3` | fix(update): явный --base сквозь pipeline (reexec ломал program_dir) | `src/update.rs`, `src/update/tests.rs`, `src/main.rs` |
+| `110251d` | chore: bump to 0.7.33-beta.6 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `4af3a80` | release: 0.7.33-beta.6 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
