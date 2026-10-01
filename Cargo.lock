@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "game-session-tracker"
-version = "0.7.33-beta.1"
+version = "0.7.33-beta.2"
 dependencies = [
  "arboard",
  "chrono",
