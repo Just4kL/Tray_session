@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-01
-Обновил: агент-сессия — C13c закрыт, bump до 0.7.33-beta.3, бриф — этим коммитом
+Обновил: агент-сессия — C13a/b/c закрыты живым тестом, C15 открыт, бриф — этим коммитом
 
 ## Проект
 
@@ -18,7 +18,7 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `dad3c64` (release: 0.7.33-beta.3 binaries + manifest; бриф — HEAD)
+- HEAD: `dad3c64` (release: 0.7.33-beta.3 binaries + manifest; docs-коммиты — HEAD)
 - Тесты: 162 зелёных
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
@@ -26,7 +26,10 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## В работе
 
-Pre-release 0.7.33-beta.3 в работе: C13c закрыт, бинарники + манифест собраны, бриф — этим коммитом. Публикация в `app-Tray_session` и живой тест — следующие шаги.
+Pre-release 0.7.33-beta.3 живёт: живой тест beta.2 → beta.3 дал ok=true,
+файлы заменены, но перезапуск не сработал (C15). В работе: C15
+(перезапуск), затем H1. Публикация beta.3 в `app-Tray_session` — после
+фикса C15.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -60,6 +63,9 @@ Pre-release 0.7.33-beta.3 в работе: C13c закрыт, бинарники
 | `9c009c8` | fix(C13c): watchdog по updater.lock вместо таймаута 90 с | `src/update.rs` (lock + guard), `src/app.rs` (сторож), `src/main.rs` (stale-cleanup), `src/update/tests.rs` (budget-тест) |
 | `86d0582` | chore: bump version to 0.7.33-beta.3 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
 | `dad3c64` | release: 0.7.33-beta.3 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
+| `96e3599` | docs: agent_brief под 0.7.33-beta.3 | `docs/agent_brief.md` |
+| `fcf8650` | docs: ARC-1 — make-manifest -Archive архивирует не ту сборку | `docs/tasks.md` (только запись задачи, без фикса) |
+| live-test | beta.2 → beta.3: ok=true, exe заменён, lock снят; перезапуск НЕ сработал → C15 | `update_report.json`, `docs/bugs.md` (C15), `docs/tasks.md` (C15/C16/AU-4/SUI-1) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
