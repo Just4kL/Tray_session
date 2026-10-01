@@ -1219,7 +1219,21 @@ fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBu
             report.updated = updated;
             report.unchanged = plan.unchanged.clone();
             report.message = format!("установлена версия {}", manifest.version);
-            // 6. Перезапустить программу.
+            // C15: отчёт СНАЧАЛА, spawn ПОТОМ. Главный процесс читает
+            // отчёт в C13c-стороже и сам закрывается; раньше spawn шёл
+            // до отчёта — ребёнок стартовал раньше, чем main узнавал
+            // об успехе. Клон: оригинал уйдёт в повторную запись,
+            // если spawn провалится (см. ниже).
+            let _ = write_report(&base, report.clone());
+            // 6. Дождаться смерти main и перезапустить программу.
+            // Без ожидания новый процесс упирается в C5-mutex живого
+            // старого (FindWindowW → ShowWindow → exit(0)) и перезапуск
+            // молча не происходит.
+            if !wait_for_main_pid_death(&base, std::time::Duration::from_secs(30)) {
+                crate::log::warn(
+                    "старый процесс не завершился за 30 с, запускаю новый всё равно",
+                );
+            }
             let exe = base.join(MAIN_EXE);
             match std::process::Command::new(&exe).spawn() {
                 Ok(_) => crate::log::info(&format!("программа перезапущена: {}", exe.display())),
@@ -1235,9 +1249,9 @@ fn run_updater_inner(base: &Path, wait_secs: u64, channel: &str) -> (i32, PathBu
                         ". Файлы обновлены, но перезапуск не удался: {e}. Запустите {} вручную",
                         exe.display()
                     ));
+                    let _ = write_report(&base, report);
                 }
             }
-            let _ = write_report(&base, report);
         }
     }
     crate::log::info("обновление завершено");
@@ -1277,6 +1291,52 @@ pub fn wait_for_exit(base: &Path, wait_secs: u64) -> bool {
 /// Попросить основную программу закрыться: записать файл-флаг.
 pub fn signal_ready_to_exit(base: &Path) -> std::io::Result<()> {
     std::fs::write(base.join(READY_FLAG), b"1")
+}
+
+/// Имя файла с PID главного процесса. Main пишет его при старте
+/// (main.rs, после C5-mutex); updater читает в wait_for_main_pid_death.
+pub const MAIN_PID_FILE: &str = "main_pid.txt";
+
+/// Дождаться смерти главного процесса перед перезапуском.
+///
+/// C15: новый процесс, запущенный при живом main, упирается в C5-mutex
+/// и молча выходит — перезапуск не происходит. Флаг-файл тут не
+/// помощник: он лишь разрешает замену, а не подтверждает смерть.
+/// Поэтому ждём сам PID из main_pid.txt через WinAPI.
+///
+/// Возвращает true, если main мёртв (или его PID неизвестен — тогда
+/// ждать некого и spawn идёт сразу). False — истёк таймаут, main жив.
+#[cfg(windows)]
+fn wait_for_main_pid_death(base: &Path, timeout: std::time::Duration) -> bool {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winbase::WAIT_OBJECT_0;
+    use winapi::um::winnt::SYNCHRONIZE;
+
+    let pid_file = tmp_dir(base).join(MAIN_PID_FILE);
+    let pid: u32 = match std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+    {
+        Some(p) => p,
+        None => return false,
+    };
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return true;
+        }
+        let ms = timeout.as_millis() as u32;
+        let r = WaitForSingleObject(h, ms);
+        CloseHandle(h);
+        r == WAIT_OBJECT_0
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_main_pid_death(_base: &Path, _timeout: std::time::Duration) -> bool {
+    true
 }
 
 /// Убрать остаточный файл-флаг при старте программы.

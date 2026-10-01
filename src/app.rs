@@ -2859,7 +2859,19 @@ impl eframe::App for TrackerApp {
                     let ok = crate::update::UpdateReport::load(&crate::update::program_dir())
                         .map(|r| r.ok)
                         .unwrap_or(false);
-                    if !ok {
+                    if ok {
+                        // C15: обновление успешно — главный процесс должен
+                        // сам закрыться, иначе updater не сможет перезапустить
+                        // программу (новый процесс упрётся в C5-mutex живого
+                        // старого и молча выйдет). При quit_requested=true
+                        // CancelClose не ставится (poll_appcmd), так что
+                        // Close реально завершает цикл и освобождает mutex.
+                        // Updater со своей стороны ждёт смерть по main_pid.txt
+                        // (wait_for_main_pid_death) и только потом spawn.
+                        crate::log::info("сторож: обновление успешно, закрываю окно");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ctx.request_repaint();
+                    } else {
                         crate::log::err(
                             "сторож: апдейтер завершился без успеха, откат quit_requested",
                         );

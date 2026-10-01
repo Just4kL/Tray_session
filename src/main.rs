@@ -433,6 +433,18 @@ fn main() -> eframe::Result {
         p.exists() && std::fs::remove_file(&p).is_ok()
     };
 
+    // C15: PID главного процесса для updater. Updater после замены файлов
+    // должен дождаться смерти main (иначе новый процесс упирается в C5
+    // mutex и молча выходит). PID кладём рядом с остальными маркерами
+    // обновления; читает wait_for_main_pid_death. Пишем до log::init —
+    // запись в файл лога не требует.
+    let pid_path =
+        crate::update::tmp_dir(&crate::update::program_dir()).join(crate::update::MAIN_PID_FILE);
+    if let Some(parent) = pid_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
     // Логи пишутся рядом с программой, с ограничением по объёму.
     crate::log::init(&crate::update::program_dir());
     crate::log::info(&format!("Tray Session {VERSION} запущена"));
