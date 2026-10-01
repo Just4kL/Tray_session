@@ -16,7 +16,7 @@ pub const APP_NAME: &str = "Tray Session";
 /// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
-pub const VERSION: &str = "0.7.33-beta.2";
+pub const VERSION: &str = "0.7.33-beta.3";
 // Номер сборки (дата YYYYMMDD). Генерируется build.rs при каждой сборке,
 // руками не правится (раньше забывался при бампе версии).
 include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
