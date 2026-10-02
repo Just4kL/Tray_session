@@ -1,4 +1,4 @@
-use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateInfo};
+use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateDialogState, UpdateInfo};
 use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, save_known_games, AppConfig, TrackedGame};
 use crate::ui::{theme::{tokens::Tokens, ThemeManager}, views::Views};
 use crate::db::{AlarmRow, Db};
@@ -1264,6 +1264,8 @@ impl TrackerApp {
                 update_rx: None,
                 update_status: startup_update_status,
                 update_checking: false,
+                update_dialog: None,
+                update_pending_changelog: None,
                 update_available: None,
                 update_window_opened_at: 0.0,
                 last_hotkeys: Vec::new(),
@@ -1384,6 +1386,7 @@ impl TrackerApp {
                                 m.version
                             ),
                             new_version: None,
+                            changelog: None,
                         }
                     } else {
                         let names: Vec<String> = plan
@@ -1407,12 +1410,14 @@ impl TrackerApp {
                             ),
                             // Нашли обновление — показываем кнопку в углу.
                             new_version: Some(m.version),
+                            changelog: m.changelog,
                         }
                     }
                 }
                 Err(e) => UpdateInfo {
                     msg: format!("Ошибка проверки: {e}"),
                     new_version: None,
+                    changelog: None,
                 },
             };
             let _ = tx.send(info);
@@ -1455,6 +1460,111 @@ impl TrackerApp {
         }
     }
 
+    /// Открыть модальный диалог подтверждения обновления.
+    /// Установка идёт ТОЛЬКО из диалога (кнопка «Обновить» или автоотсчёт
+    /// в silent). Без известной версии из update_available — не открываем.
+    fn open_update_dialog(&mut self, silent: bool) {
+        let Some(new_version) = self.state.update_available.clone() else {
+            return;
+        };
+        let changelog = self
+            .state
+            .update_pending_changelog
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Список изменений недоступен.".to_string());
+        self.state.update_dialog = Some(UpdateDialogState {
+            old_version: VERSION.to_string(),
+            new_version,
+            changelog,
+            silent,
+            countdown_started_at: None,
+        });
+    }
+
+    /// Модальный диалог подтверждения обновления (см. open_update_dialog).
+    /// Рисуется в конце update(), поверх всех панелей.
+    fn draw_update_dialog(&mut self, ctx: &egui::Context) {
+        use crate::app_state::{update_countdown_remaining, SILENT_COUNTDOWN_SECS};
+        let Some(dlg) = self.state.update_dialog.clone() else {
+            return;
+        };
+        let skin = self.theme.current().clone();
+        let tokens = skin.tokens();
+        let mut close_dialog = false;
+        let mut install_now = false;
+        // Отсчёт тихой установки: стартует с первого кадра диалога.
+        let remaining = if dlg.silent {
+            if self.state.update_dialog.as_ref().and_then(|d| d.countdown_started_at).is_none() {
+                if let Some(d) = self.state.update_dialog.as_mut() {
+                    d.countdown_started_at = Some(std::time::Instant::now());
+                }
+            }
+            let left = update_countdown_remaining(
+                self.state.update_dialog.as_ref().and_then(|d| d.countdown_started_at),
+                std::time::Instant::now(),
+                SILENT_COUNTDOWN_SECS,
+            );
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            left
+        } else {
+            SILENT_COUNTDOWN_SECS
+        };
+        egui::Window::new("Обновление")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([420.0, 280.0])
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("Доступна новая версия");
+                    ui.add_space(tokens.spacing.sm);
+                    ui.label(
+                        egui::RichText::new(format!("{} → {}", dlg.old_version, dlg.new_version))
+                            .strong(),
+                    );
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Что нового:").small().strong());
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.label(&dlg.changelog);
+                    });
+                ui.separator();
+                if dlg.silent {
+                    ui.colored_label(
+                        tokens.palette.semantic.attention,
+                        format!("Автоустановка через {remaining} сек…"),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if ui
+                        .add_sized(
+                            [110.0, 28.0],
+                            egui::Button::new(
+                                egui::RichText::new("Обновить")
+                                    .color(tokens.palette.text.on_accent),
+                            )
+                            .fill(tokens.palette.accent.primary),
+                        )
+                        .clicked()
+                    {
+                        install_now = true;
+                    }
+                    if ui.add_sized([110.0, 28.0], egui::Button::new("Отмена")).clicked() {
+                        close_dialog = true;
+                    }
+                });
+            });
+        if install_now || (dlg.silent && remaining == 0) {
+            self.state.update_dialog = None;
+            self.start_update_install();
+        } else if close_dialog {
+            self.state.update_dialog = None;
+        }
+    }
+
     /// Автоматическая проверка по расписанию (каждый час / сутки / неделю).
     /// Молча скачивает, только если пользователь разрешил `update_silent`.
     fn maybe_scheduled_update(&mut self) {
@@ -1485,34 +1595,20 @@ impl TrackerApp {
                     let base = crate::update::program_dir();
                     let plan = crate::update::plan_update(&base, &m);
                     if !plan.to_download.is_empty() && silent {
-                        // Пользователь разрешил ставить молча: тот же
-                        // протокол, что и ручная установка — spawn updater
-                        // и немедленный выход (иначе замена упрётся в
-                        // запущенный exe). Поток фоновый, но process::exit
-                        // завершает весь процесс — так и задумано.
-                        let exe = std::env::current_exe().unwrap_or_default();
-                        if !exe.as_os_str().is_empty()
-                            && crate::update::spawn_updater(&exe, std::process::id(), 60, channel)
-                                .is_ok()
-                        {
-                            let _ = std::fs::write(
-                                crate::update::tmp_dir(&crate::update::program_dir())
-                                    .join(crate::update::MAIN_EXITED_FLAG),
-                                b"1",
-                            );
-                            crate::log::info(
-                                "тихое обновление запущено, выхожу для замены файлов",
-                            );
-                            std::process::exit(0);
-                        }
+                        // Тихий режим больше НЕ ставит молча с выходом:
+                        // показываем тот же диалог, но с автоотсчётом.
+                        // Решение принимает poll update_rx (там виден silent
+                        // из настроек), сюда только прокидываем версию.
                         UpdateInfo {
                             msg: m.describe(),
                             new_version: Some(m.version),
+                            changelog: m.changelog,
                         }
                     } else if plan.to_download.is_empty() {
                         UpdateInfo {
                             msg: format!("Проверено: установлена свежая версия {}.", m.version),
                             new_version: None,
+                            changelog: None,
                         }
                     } else {
                         // Нашли, но молча ставить не разрешено — показываем
@@ -1523,12 +1619,14 @@ impl TrackerApp {
                                 m.version
                             ),
                             new_version: Some(m.version),
+                            changelog: m.changelog,
                         }
                     }
                 }
                 Err(e) => UpdateInfo {
                     msg: format!("Проверка не удалась: {e}"),
                     new_version: None,
+                    changelog: None,
                 },
             };
             let _ = tx.send(info);
@@ -2840,12 +2938,19 @@ impl eframe::App for TrackerApp {
                 self.state.update_checking = false;
                 // Нашли обновление — включаем кнопку в правом верхнем углу.
                 if let Some(v) = info.new_version {
+                    self.state.update_pending_changelog = info.changelog;
                     if self.state.update_available.as_deref() != Some(v.as_str()) {
                         self.state.update_available = Some(v.clone());
                         self.notify(
                             "Доступно обновление",
                             &format!("Tray Session {v} — нажмите жёлтую кнопку, чтобы поставить."),
                         );
+                    }
+                    // Тихий режим: тот же диалог, но с автоотсчётом —
+                    // ставить молча без показа мы больше не умеем (и не хотим:
+                    // внезапный exit посреди игры хуже диалога).
+                    if self.state.cfg_handle.update_silent {
+                        self.open_update_dialog(true);
                     }
                 }
                 // Пока показываем раздел «О программе» — продолжаем
@@ -2993,9 +3098,9 @@ impl eframe::App for TrackerApp {
                     egui::Layout::right_to_left(egui::Align::Min),
                     |ui| {
                         if update_notice_button(ui, skin.tokens(), &version).clicked() {
-                            // Приложение сейчас закроется, состояние кнопки
-                            // уже неважно.
-                            self.start_update_install();
+                            // Та же дверь, что и «Установить сейчас»:
+                            // подтверждение в диалоге, установка — из него.
+                            self.open_update_dialog(self.state.cfg_handle.update_silent);
                         }
                     },
                 );
@@ -3108,6 +3213,9 @@ impl eframe::App for TrackerApp {
         } else if self.state.cfg_handle.auto_scan_enabled {
             ctx.request_repaint_after(Duration::from_secs(60));
         }
+
+        // Модальный диалог подтверждения обновления — поверх всего.
+        self.draw_update_dialog(ctx);
     }
 }
 
@@ -4263,10 +4371,10 @@ impl TrackerApp {
                     let ctx = ui.ctx().clone();
                     self.start_update_check(&ctx);
                 }
-                // Новый протокол: процесс выходит сразу по клику, второй
-                // клик невозможен; дубли давит mutex updater на шаге 1.
+                // Новый протокол: кнопка открывает диалог подтверждения,
+                // установка — только из него (или автоотсчётом в silent).
                 if ui.button("Установить сейчас").clicked() {
-                    self.start_update_install();
+                    self.open_update_dialog(self.state.cfg_handle.update_silent);
                 }
                 ui.label(egui::RichText::new(format!(
                     "Проверка: {}",

@@ -93,6 +93,44 @@ pub struct UpdateInfo {
     /// Версия найденного обновления, если оно есть. Пока она задана,
     /// в правом верхнем углу показывается кнопка скачивания.
     pub new_version: Option<String>,
+    /// Changelog из манифеста (для диалога подтверждения).
+    pub changelog: Option<String>,
+}
+
+/// Сколько секунд идёт обратный отсчёт тихой установки в диалоге.
+pub const SILENT_COUNTDOWN_SECS: u64 = 10;
+
+/// Состояние модального диалога подтверждения обновления.
+#[derive(Debug, Clone)]
+pub struct UpdateDialogState {
+    /// Установленная версия (VERSION).
+    pub old_version: String,
+    /// Версия из манифеста.
+    pub new_version: String,
+    /// Текст для блока «Что нового» (fallback уже подставлен).
+    pub changelog: String,
+    /// Тихий режим: автоустановка по истечении отсчёта.
+    pub silent: bool,
+    /// Момент первого кадра диалога (None = ещё не показан).
+    pub countdown_started_at: Option<std::time::Instant>,
+}
+
+/// Остаток тихого отсчёта в секундах. Чистая функция — тестируется
+/// без egui: нет старта = полный лимит, будущее = лимит (часы съехали),
+/// просрочка = 0.
+pub fn update_countdown_remaining(
+    started_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    limit_secs: u64,
+) -> u64 {
+    let started = match started_at {
+        Some(s) => s,
+        None => return limit_secs,
+    };
+    match now.checked_duration_since(started) {
+        Some(elapsed) => limit_secs.saturating_sub(elapsed.as_secs()),
+        None => limit_secs,
+    }
 }
 
 /// Бизнес-состояние приложения.
@@ -239,6 +277,10 @@ pub struct AppState {
     pub update_rx: Option<std::sync::mpsc::Receiver<UpdateInfo>>,
     pub update_status: String,
     pub update_checking: bool,
+    /// Модальный диалог подтверждения обновления (None = закрыт).
+    pub update_dialog: Option<UpdateDialogState>,
+    /// Changelog из последнего найденного манифеста — для диалога.
+    pub update_pending_changelog: Option<String>,
     /// Версия найденного обновления, если оно есть. Пока задана — в правом
     /// верхнем углу висит жёлтая кнопка со стрелкой вниз.
     pub update_available: Option<String>,

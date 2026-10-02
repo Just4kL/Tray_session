@@ -158,6 +158,11 @@ pub struct Manifest {
     /// Только их и скачивает обновление.
     #[serde(default)]
     pub files: Vec<FileEntry>,
+    /// Краткий changelog версии для диалога подтверждения.
+    /// Генерируется tools/make-manifest.ps1 из CHANGELOG.md.
+    /// Старые манифесты поля не имеют — None (диалог показывает fallback).
+    #[serde(default)]
+    pub changelog: Option<String>,
 }
 
 /// Один изменившийся файл.
@@ -1547,6 +1552,7 @@ mod real_manifest {
                     sha256: sha256_bytes(b"{}"),
                 },
             ],
+            changelog: None,
         };
         // 1. Валидация отвергает весь манифест — а не «пропускает плохие».
         let err = evil.validate().expect_err("манифест с sessions.db принят!");

@@ -39,6 +39,7 @@ fn manifest_cannot_target_user_files() {
             name: "sessions.db".into(),
             sha256: "00".repeat(32),
         }],
+        changelog: None,
     };
     let err = m.validate().unwrap_err();
     assert!(err.contains("sessions.db"), "неожиданная ошибка: {err}");
@@ -81,6 +82,7 @@ fn manifest_allows_only_executables() {
             name: "update.bat".into(),
             sha256: String::new(),
         }],
+        changelog: None,
     };
     assert!(m.validate().is_err(), "не-.exe просочился в манифест");
 }
@@ -96,6 +98,7 @@ fn manifest_drops_duplicate_files() {
             FileEntry { name: "A.exe".into(), sha256: "11".repeat(32) },
             FileEntry { name: "b.exe".into(), sha256: "22".repeat(32) },
         ],
+        changelog: None,
     };
     let wanted = m.wanted_files();
     assert_eq!(wanted.len(), 2, "дубли не схлопнуты: {wanted:?}");
@@ -181,6 +184,7 @@ fn plan_downloads_only_changed_files() {
             // Защищённый файл в манифесте — в план не попадёт.
             FileEntry { name: "sessions.db".into(), sha256: "00".repeat(32) },
         ],
+        changelog: None,
     };
     let plan = plan_update(&dir.0, &m);
     let names: Vec<&str> = plan.to_download.iter().map(|f| f.name.as_str()).collect();
@@ -319,6 +323,7 @@ fn update_offer_decision_drives_the_notice_button() {
     let matching = Manifest {
         version: manifest.version.clone(),
         build: manifest.build.clone(),
+        changelog: manifest.changelog.clone(),
         files: manifest
             .files
             .iter()
@@ -768,17 +773,61 @@ fn channel_has_a_readable_name() {
 }
 
 #[test]
+fn manifest_changelog_defaults_to_none() {
+    // Старые манифесты поля не имеют — диалог показывает fallback,
+    // а не падает на разборе.
+    let m = Manifest::parse(r#"{"version": "0.7.0", "build": "20260928", "files": []}"#).unwrap();
+    assert_eq!(m.changelog, None);
+    // С полем — разбирается как есть (многострочный текст целиком).
+    let m = Manifest::parse(
+        "{\"version\": \"0.8.0\", \"build\": \"20261002\", \"files\": [], \
+         \"changelog\": \"Fix: кнопки\"}",
+    )
+    .unwrap();
+    assert_eq!(m.changelog.as_deref(), Some("Fix: кнопки"));
+}
+
+#[test]
+fn update_countdown_counts_down_to_zero() {
+    use crate::app_state::{update_countdown_remaining, SILENT_COUNTDOWN_SECS};
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    // Нет старта — полный лимит.
+    assert_eq!(update_countdown_remaining(None, t0, 10), 10);
+    // Старт сейчас — полный лимит.
+    assert_eq!(update_countdown_remaining(Some(t0), t0, 10), 10);
+    // +3 с — остаток 7.
+    assert_eq!(
+        update_countdown_remaining(Some(t0), t0 + Duration::from_secs(3), 10),
+        7
+    );
+    // Просрочка — 0, не уход в минус.
+    assert_eq!(
+        update_countdown_remaining(Some(t0), t0 + Duration::from_secs(99), 10),
+        0
+    );
+    // Часы съехали (now раньше старта) — лимит, не паника.
+    assert_eq!(
+        update_countdown_remaining(Some(t0 + Duration::from_secs(5)), t0, 10),
+        10
+    );
+    // Лимит из константы диалога.
+    assert_eq!(SILENT_COUNTDOWN_SECS, 10);
+}
+
+#[test]
 fn manifest_describe_is_human_readable() {
     let m = Manifest {
         version: "0.8.0".into(),
         build: "20261030".into(),
         files: vec![FileEntry { name: "TraySession.exe".into(), sha256: "a".repeat(64) }],
+        changelog: None,
     };
     let d = m.describe();
     assert!(d.contains("0.8.0"), "{d}");
     assert!(d.contains("TraySession.exe"), "{d}");
     // Пустой манифест тоже должен давать осмысленный текст.
-    let empty = Manifest { version: "0.8.0".into(), build: String::new(), files: vec![] };
+    let empty = Manifest { version: "0.8.0".into(), build: String::new(), files: vec![], changelog: None };
     assert!(empty.describe().contains("0.8.0"), "{}", empty.describe());
 }
 
