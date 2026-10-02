@@ -7,6 +7,13 @@
 Регрессионный тест: `gpu::tests::memory_bytes_to_mb_is_1024_based`.
 Проверять при апгрейде sysinfo > 0.30.
 
+## 2026-10-02 - Updater end-to-end success
+All C13-series (C13a retry download, C13b watchdog, C13c lock file),
+C12 (disable button), C14 (updater mutex), C15 (restart after update)
+closed. Full pipeline works in live test beta.6+fix -> beta.7.
+See logs/updater.log for step-by-step confirmation.
+Committed: 2fba0a1 (mutex race fix), e8e3211 (beta.7 release).
+
 ## C15: перезапуск после успеха не происходит (2026-10-01)
 
 Живой тест beta.2 → beta.3: файлы заменены (ok=true), но старый процесс

@@ -3,8 +3,8 @@
 > Точка входа для любой AI-сессии. Читать ПЕРВОЙ. Обновлять в конце каждого шага.
 > Если противоречит коду — верить коду, но обновить файл.
 
-Последнее обновление: 2026-10-01
-Обновил: агент-сессия — bump до 0.7.33-beta.7 (mutex-фикс внутри), бриф — этим коммитом
+Последнее обновление: 2026-10-02
+Обновил: агент-сессия — updater end-to-end закрыт живым тестом, tasks-догон (ARC-1/MT/UPD-2), бриф — этим коммитом
 
 ## Проект
 
@@ -26,12 +26,8 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## В работе
 
-Pre-release 0.7.33-beta.7 собран локально: включает mutex-фикс
-(2fba0a1: RAII guard, owner-PID stale-detect, диагностика). Прошлый
-живой тест гонял старый updater beta.4. В работе: свежий живой тест
-локальной beta.6 (+фиксы) → beta.7 для сквозной проверки pipeline,
-затем H1. Публикация — после зелёного живого теста,
-app-Tray_session не трогать.
+Пусто: updater end-to-end закрыт живым тестом 2026-10-02 (beta.6+фиксы →
+beta.7, ok=true, перезапуск произошёл). Следующее берётся из очереди ниже.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -80,6 +76,8 @@ app-Tray_session не трогать.
 | `2fba0a1` | fix(update): mutex lifecycle — RAII guard, owner-PID stale-detect, диагностика | `src/update.rs`, `src/update/tests.rs` |
 | `c268a14` | chore: bump to 0.7.33-beta.7 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
 | `aaef02a` | release: 0.7.33-beta.7 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
+| `b3a0507..e8e3211` | updater end-to-end: живой тест успешен 2026-10-02, beta.7 | report ok=true, перезапуск произошёл, `logs/updater.log` пошагово |
+| `3fb82c5` | docs: ARC-1 обновлён, MT-1/MT-2/MT-3, UPD-2 в tasks | `docs/tasks.md` |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
@@ -90,9 +88,10 @@ debug-сборки: 12 секунд полёт нормальный; число 
 ## Очередь следующего
 
 Единый бэклог: `docs/tasks.md` (чек-лист со статусами `[ ]/[~]/[x]`, датами,
-приоритетами; закрытые — в архиве внизу файла).
+приоритетами; закрытые — в архиве внизу файла). Полная очередь — там.
 
-1. **Фаза 2** — `LayoutSpec` + `engine.rs` (H1). Лечит layout со скриншота:
+1. **MT-1** — кнопки мини-трея не работают (HIGH). Следующая задача.
+2. **Фаза 2** — `LayoutSpec` + `engine.rs` (H1, включает MT-2/MT-3). Лечит layout со скриншота:
    панели не привязаны к `screen_rect`, блоки плывут.
 2. **Фаза 3** — вынос `ui_*` в `views/*` (L2).
    Порядок: about → shortcuts → timer → alarms → games → sessions.
@@ -133,15 +132,21 @@ debug-сборки: 12 секунд полёт нормальный; число 
   Док на `gpu::bytes_to_mb`, тест `memory_bytes_to_mb_is_1024_based`,
   заметка в `docs/bugs.md`.
 - Layout сломан (панели плывут) — pre-existing, лечится в фазе 2.
-- Не нажимать «Установить сейчас» в текущей сборке — C13a зависает,
-  C13b: exe пропадает, программа не перезапускается. Требуется taskkill
-  `_updater_running.exe`.
+- «Установить сейчас» до рерайта updater висло (C13a), теряло exe (C13b),
+  не перезапускалось (C15). Закрыто живым тестом 2026-10-02. Если
+  симптомы вернутся — taskkill `_updater_running.exe`, смотри
+  `logs/updater.log` и `update_tmp/update_report.json` (stage/error_kind).
 - В детач-HEAD можно случайно закоммитить мимо ветки. `git status` перед коммитом.
 - В `app.rs` есть растеризаторы часов и превью — их цвета **не подчиняются теме**,
   они в audit-исключениях.
 - Неприменённый stash с бинарниками сборок (`TraySession.exe`,
   `Tray_session_setup.exe`, исходников нет) — оставлен как был, не дропать
   без разбора.
+- ARC-1: `make-manifest.ps1 -Archive` перезаписывает
+  `dist/old/<old-name>.exe` НОВЫМ бинарником. Все
+  `dist/old/TraySession_0.7.33-beta.N.exe` (N=1..6) — stale/wrong.
+  Восстановление настоящего старого: `cmd /c "git show
+  <prev-tag>:TraySession.exe > dist/old/TraySession_X_REAL.exe"`.
 
 ## Артефакты в репо
 
