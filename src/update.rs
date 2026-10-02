@@ -1037,6 +1037,136 @@ fn fail(base: &Path, stage: &str, kind: &str, message: String, code: i32) -> i32
     code
 }
 
+/// Имя файла с PID владельца updater-mutex (диагностика + stale-detect,
+/// FIX 2). Пишется сразу после захвата mutex, удаляется на шаге cleanup
+/// при успехе. Если updater прибили (Stop-Process) между захватом и
+/// cleanup — файл остаётся и следующий запуск по нему понимает, жив ли
+/// владелец.
+pub const UPDATER_OWNER_FILE: &str = "updater_owner.txt";
+
+/// RAII-держатель mutex updater (FIX 1): закрывает handle при любом выходе
+/// из run_updater_inner. Раньше handle не закрывался вовсе.
+#[cfg(windows)]
+struct UpdaterMutexGuard(winapi::um::winnt::HANDLE);
+
+#[cfg(windows)]
+impl Drop for UpdaterMutexGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                winapi::um::handleapi::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct UpdaterMutexGuard;
+
+/// Состояние владельца updater-mutex (FIX 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerState {
+    /// Владелец жив — mutex занят по-настоящему, выходим с диагностикой.
+    Alive(u32),
+    /// Владелец мёртв — owner-файл остался от прибитого прогона,
+    /// ретраим захват.
+    Dead(u32),
+    /// Owner-файла нет или PID не прочитать — сказать нечего.
+    Unknown,
+}
+
+/// Жив ли владелец mutex по owner-файлу.
+///
+/// Мёртвый процесс держать mutex НЕ может (ОС закрывает все хендлы при
+/// завершении, даже при Stop-Process) — поэтому Dead здесь означает:
+/// файл остался от прибитого прогона, а сам mutex уже свободен или
+/// вот-вот освободится. Проверяем именно процесс, а не mutex.
+fn updater_mutex_owner_state(base: &Path) -> OwnerState {
+    let pid: u32 = match std::fs::read_to_string(tmp_dir(base).join(UPDATER_OWNER_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+    {
+        Some(p) if p != 0 => p,
+        _ => return OwnerState::Unknown,
+    };
+    if wait_for_pid_death(pid, std::time::Duration::from_millis(0)) {
+        OwnerState::Dead(pid)
+    } else {
+        OwnerState::Alive(pid)
+    }
+}
+
+/// Шаг 1: захватить mutex updater.
+///
+/// Ok(guard) — держим до конца pipeline; guard живёт до выхода из
+/// run_updater_inner, Drop закрывает handle (FIX 1).
+/// Err(message) — mutex занят: внутри уже выполнена stale-проверка
+/// (FIX 2), вызывающий пишет fail() с диагностикой (FIX 3).
+/// Handle чужого mutex, полученный при ERROR_ALREADY_EXISTS, закрываем
+/// сразу — иначе мы сами держим его открытым.
+#[cfg(windows)]
+fn acquire_updater_mutex(base: &Path) -> Result<UpdaterMutexGuard, String> {
+    use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::synchapi::CreateMutexW;
+    let name: Vec<u16> = "Local\\TraySession_Updater\0".encode_utf16().collect();
+    for attempt in 1..=3u32 {
+        let h = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+        if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+            if h.is_null() {
+                return Err("не создан mutex updater".to_string());
+            }
+            // Мы владельцы: фиксируем PID для диагностики и stale-detect.
+            // Папку создаём здесь же: шаг 1 идёт до create_dir_all(tmp),
+            // а на чистой установке update_tmp ещё нет.
+            let owner = tmp_dir(base).join(UPDATER_OWNER_FILE);
+            if let Some(parent) = owner.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&owner, std::process::id().to_string());
+            return Ok(UpdaterMutexGuard(h));
+        }
+        // Чужой handle закрываем сразу — держать его значит
+        // удерживать чужой mutex открытым.
+        if !h.is_null() {
+            unsafe {
+                CloseHandle(h);
+            }
+        }
+        match updater_mutex_owner_state(base) {
+            OwnerState::Dead(pid) => {
+                ulog(
+                    base,
+                    "WARN",
+                    &format!("mutex занят, но владелец pid={pid} мёртв (попытка {attempt}/3)"),
+                );
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            OwnerState::Alive(pid) => {
+                return Err(format!(
+                    "updater mutex held. owner PID: {pid}. Если процесс жив — дождитесь конца обновления; если мёртв — mutex освободится сам, повторите."
+                ));
+            }
+            OwnerState::Unknown => {
+                return Err(
+                    "updater mutex held. owner PID: unknown. Если обновление точно не идёт — mutex освободится после перезагрузки."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Err(
+        "updater mutex held by dead process, try reboot: владелец мёртв, но mutex всё ещё занят."
+            .to_string(),
+    )
+}
+
+#[cfg(not(windows))]
+fn acquire_updater_mutex(_base: &Path) -> Result<UpdaterMutexGuard, String> {
+    Ok(UpdaterMutexGuard)
+}
+
 /// Точка входа фонового процесса: единый pipeline из 10 шагов (R3).
 /// На любом шаге возможен только один исход: следующий шаг или fail().
 /// Паники не ожидаются, но если что-то запаниковало — main уже вышел,
@@ -1079,24 +1209,14 @@ fn run_updater_inner(base: &Path, parent_pid: u32, wait_secs: u64, channel: &str
     // Шаг 1: mutex. Имя отличается от C5-мутекса main-окна: main + updater
     // обязаны сосуществовать, C5 намеренно пропускает --updater.
     // (Наследие C14: два параллельных процесса делили отчёт и файлы.)
+    // Guard закрывает handle при любом выходе (FIX 1); при занятости
+    // сначала stale-проверка по owner-PID (FIX 2), потом fail с
+    // диагностикой (FIX 3).
     #[cfg(windows)]
-    let _updater_mutex = {
-        use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
-        use winapi::um::errhandlingapi::GetLastError;
-        use winapi::um::synchapi::CreateMutexW;
-        let name: Vec<u16> = "Local\\TraySession_Updater\0".encode_utf16().collect();
-        unsafe {
-            let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                return fail(
-                    &base,
-                    "mutex",
-                    "busy",
-                    "обновление уже выполняется".to_string(),
-                    0,
-                );
-            }
-            h
+    let _updater_mutex = match acquire_updater_mutex(&base) {
+        Ok(g) => g,
+        Err(message) => {
+            return fail(&base, "mutex", "busy", message, 0);
         }
     };
     ulog(
@@ -1267,6 +1387,9 @@ fn run_updater_inner(base: &Path, parent_pid: u32, wait_secs: u64, channel: &str
         let _ = remove_aside_delayed(&aside);
     }
     let _ = std::fs::remove_file(tmp.join(MAIN_PID_FILE));
+    // Owner-файл больше не нужен: mutex свободен (guard закроет handle
+    // при выходе), следующий запуск запишет свой PID сам.
+    let _ = std::fs::remove_file(tmp.join(UPDATER_OWNER_FILE));
     // Шаг 10. Отчёт об успехе.
     ulog(&base, "INFO", "обновление завершено");
     let _ = write_report(

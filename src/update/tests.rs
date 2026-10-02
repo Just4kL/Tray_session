@@ -681,6 +681,82 @@ fn pid_death_distinguishes_live_and_dead() {
 }
 
 #[test]
+fn owner_state_unknown_without_owner_file() {
+    // Owner-файла нет — сказать о владельце нечего (не Windows-специфика:
+    // читается только файл).
+    let dir = TempDir::new("owner_unknown");
+    assert_eq!(
+        updater_mutex_owner_state(&dir.0),
+        OwnerState::Unknown,
+        "без owner-файла должен быть Unknown"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn owner_state_dead_for_reaped_child() {
+    // PID завершённого процесса = Dead (файл остался от прибитого прогона).
+    use std::process::Command;
+    let mut child = Command::new("cmd").args(["/C", "exit"]).spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let dir = TempDir::new("owner_dead");
+    let owner = tmp_dir(&dir.0).join(UPDATER_OWNER_FILE);
+    std::fs::create_dir_all(owner.parent().unwrap()).unwrap();
+    std::fs::write(&owner, dead.to_string()).unwrap();
+    assert_eq!(
+        updater_mutex_owner_state(&dir.0),
+        OwnerState::Dead(dead),
+        "мёртвый владелец не опознан"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn owner_state_alive_for_sleeping_child() {
+    // PID живого процесса = Alive (mutex занят по-настоящему).
+    use std::process::Command;
+    let mut child = Command::new("cmd")
+        .args(["/C", "ping", "127.0.0.1", "-n", "3", ">", "nul"])
+        .spawn()
+        .unwrap();
+    let live = child.id();
+    let dir = TempDir::new("owner_alive");
+    let owner = tmp_dir(&dir.0).join(UPDATER_OWNER_FILE);
+    std::fs::create_dir_all(owner.parent().unwrap()).unwrap();
+    std::fs::write(&owner, live.to_string()).unwrap();
+    assert_eq!(
+        updater_mutex_owner_state(&dir.0),
+        OwnerState::Alive(live),
+        "живой владелец не опознан"
+    );
+    // Прибиваем и дожидаемся: иначе останется зомби (clippy
+    // zombie_processes) и TempDir-чистка будет дольше.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+#[cfg(windows)]
+fn acquire_writes_owner_file_and_releases_on_drop() {
+    // FIX 1: guard пишет owner-PID при захвате и закрывает handle при drop —
+    // повторный захват после drop успешен (без CloseHandle второй acquire
+    // в том же процессе увидел бы ALREADY_EXISTS).
+    let dir = TempDir::new("acquire_owner");
+    {
+        let _guard = acquire_updater_mutex(&dir.0).expect("первый захват сорвался");
+        let pid_file = tmp_dir(&dir.0).join(UPDATER_OWNER_FILE);
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(pid, std::process::id(), "owner-файл содержит чужой PID");
+    }
+    acquire_updater_mutex(&dir.0).expect("повторный захват после drop сорвался");
+}
+
+#[test]
 fn channel_has_a_readable_name() {
     // В логах и интерфейсе канал показывается по-русски: «beta» в сообщении
     // человеку ничего не объясняет.
