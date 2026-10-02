@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-01
-Обновил: агент-сессия — bump до 0.7.33-beta.6 (--base фикс внутри), бриф — этим коммитом
+Обновил: агент-сессия — bump до 0.7.33-beta.7 (mutex-фикс внутри), бриф — этим коммитом
 
 ## Проект
 
@@ -18,19 +18,20 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `4af3a80` (release: 0.7.33-beta.6 binaries + manifest; docs-коммит — HEAD)
-- Тесты: 161 зелёный
+- HEAD: `aaef02a` (release: 0.7.33-beta.7 binaries + manifest; docs-коммит — HEAD)
+- Тесты: 165 зелёных
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
 - Тег отката: `pre-ui-refactor` (`a48813d`)
 
 ## В работе
 
-Pre-release 0.7.33-beta.6 собран локально: включает --base фикс
-(f420aa3) — прошлый живой тест гонял старый updater beta.4, новый
-pipeline в бою не был. В работе: свежий живой тест локальной beta.5
-(+фикс) → beta.6 для сквозной проверки pipeline, затем H1.
-Публикация — после зелёного живого теста, app-Tray_session не трогать.
+Pre-release 0.7.33-beta.7 собран локально: включает mutex-фикс
+(2fba0a1: RAII guard, owner-PID stale-detect, диагностика). Прошлый
+живой тест гонял старый updater beta.4. В работе: свежий живой тест
+локальной beta.6 (+фиксы) → beta.7 для сквозной проверки pipeline,
+затем H1. Публикация — после зелёного живого теста,
+app-Tray_session не трогать.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -76,6 +77,9 @@ pipeline в бою не был. В работе: свежий живой тес�
 | `f420aa3` | fix(update): явный --base сквозь pipeline (reexec ломал program_dir) | `src/update.rs`, `src/update/tests.rs`, `src/main.rs` |
 | `110251d` | chore: bump to 0.7.33-beta.6 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
 | `4af3a80` | release: 0.7.33-beta.6 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
+| `2fba0a1` | fix(update): mutex lifecycle — RAII guard, owner-PID stale-detect, диагностика | `src/update.rs`, `src/update/tests.rs` |
+| `c268a14` | chore: bump to 0.7.33-beta.7 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `aaef02a` | release: 0.7.33-beta.7 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
