@@ -1,14 +1,15 @@
 {
-  "version": "0.7.33-beta.8",
+  "version": "0.7.35",
   "build": "20261002",
   "files": [
     {
       "name": "TraySession.exe",
-      "sha256": "2578c8b709984d1633a22aa1437b730d5db138414b8f7fba51a83e32b1c6f3cb"
+      "sha256": "e88ab6fb71bbc1cce05ae13306966ec9b58628ee2a9c243622793cc2436f3399"
     },
     {
       "name": "Tray_session_setup.exe",
       "sha256": "ad7e6505fcc2e89322abc44ee6ba3cdddc1aefc8f719ac6dc1067c321cad0bf3"
     }
-  ]
+  ],
+  "changelog": "### Summary\nUnder the hood, the update module was rewritten from scratch: the\napplication now reliably performs updates via manual or silent mode,\nwith a confirmation dialog and rollback on failure. The UI theme\nsystem (color tokens) has also been refactored.\n\n### Fixed\n- Update module: retried download, atomic file replace, rollback on failure\n- Restart after update: new process spawns correctly with --updated flag\n- Updater mutex race that caused \"already running\" false errors\n- Single-instance: launching twice now focuses the existing window\n- Build date: generated automatically via build.r…"
 }
