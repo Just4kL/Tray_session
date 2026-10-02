@@ -3,6 +3,39 @@
 Краткая история релизов. Полная — в приложении («О программе» →
 «Журнал изменений»).
 
+## [0.7.35] - 2026-10-02
+
+### Summary
+Under the hood, the update module was rewritten from scratch: the
+application now reliably performs updates via manual or silent mode,
+with a confirmation dialog and rollback on failure. The UI theme
+system (color tokens) has also been refactored.
+
+### Fixed
+- Update module: retried download, atomic file replace, rollback on failure
+- Restart after update: new process spawns correctly with --updated flag
+- Updater mutex race that caused "already running" false errors
+- Single-instance: launching twice now focuses the existing window
+- Build date: generated automatically via build.rs
+- Tray "Show window" via WinAPI (Minimized(true) replaces Visible(false))
+- Update channel / frequency ComboBox now saves selection
+- Update check now respects the selected channel
+
+### New
+- Update confirmation dialog with changelog and countdown (silent mode)
+- Localized updater log at logs/updater.log
+- Channel-aware manifest fetching
+
+### Changed
+- Updater pipeline: mutex -> reexec -> wait_pid -> download -> replace -> spawn
+- Theme tokens centralized (ui/theme/tokens.rs)
+
+### Known issues
+- Layout engine (H1) pending: some UI blocks may float on resized windows
+- Minimap: 9-point positioning edge cases
+- Tooltip contrast on dark theme in some cases
+- Console window visible in debug builds (hidden in release)
+
 ## [0.7.33-beta.2] — 2026-10-01
 
 ### Added

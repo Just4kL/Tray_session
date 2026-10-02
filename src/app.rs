@@ -27,6 +27,16 @@ pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
 pub const STRIP_TITLE: &str = "Сессия — Tray Session";
 
 const CHANGELOG: &[(&str, &str, &[&str])] = &[
+    ("0.7.35", "2026-10-02", &[
+        "New: Update module rewritten: manual/silent update with confirmation dialog and rollback.",
+        "New: Updater log at logs/updater.log; restart via --updated flag.",
+        "Fix: Retried download, atomic replace, updater mutex race fixed.",
+        "Fix: Single-instance focuses existing window; build date via build.rs.",
+        "Fix: Tray Show window via WinAPI; channel-aware update check.",
+        "New: Theme color tokens centralized (ui/theme/tokens.rs).",
+        "Known: Layout engine (H1) pending; minimap 9-point edge cases.",
+        "Known: Tooltip contrast on dark theme; console visible in debug builds.",
+    ]),
     ("0.7.33-beta.2", "2026-10-01", &[
         "New: Сторож обновления: если апдейтер упал, окно оживает через 90 с.",
         "Fix: Скачивание обновления переживает обрыв сети (3 попытки, retry).",
