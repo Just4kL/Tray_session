@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-02
-Обновил: агент-сессия — bump до 0.7.33-beta.8 (диалог в комплекте), бриф — этим коммитом
+Обновил: агент-сессия — стабильный релиз 0.7.35 (EN-changelog), бриф — этим коммитом
 
 ## Проект
 
@@ -18,18 +18,19 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `f0e31d1` (release: 0.7.33-beta.8 binaries + manifest; docs-коммит — HEAD)
-- Тесты: 167 зелёных
+- HEAD: `93de75a` (release: 0.7.35 binaries + manifest; docs-коммит — HEAD)
+- Тесты: 171 зелёный
+- В 0.7.35 входит скелет H1-шаг-1 (`src/ui/layout/`: spec + presets, dead code под `#[allow(dead_code)]` TODO) — engine в шаге 2.
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
 - Тег отката: `pre-ui-refactor` (`a48813d`)
 
 ## В работе
 
-Pre-release 0.7.33-beta.8 собран локально: диалог подтверждения
-обновления (db18223) + mutex-фикс. В работе: публикация beta.8
-(предыдущая попытка публикации db18223 без bump откачена, ветка
-app-Tray_session возвращена на e8e3211), затем живой тест.
+Stable 0.7.35 собран локально (updater pipeline, диалог, токены темы,
+скелет H1-шаг-1 как dead code). В работе: H1 шаг 2 (engine.rs).
+Очередь: H1 шаг 2 → подключение engine (шаг 3) → MT-2/3/4. Публикация
+0.7.35 — отдельным шагом, не в этой сессии.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -83,6 +84,9 @@ app-Tray_session возвращена на e8e3211), затем живой те�
 | `db18223` | feat(update): диалог подтверждения с changelog и тихим отсчётом | `src/app.rs`, `src/app_state.rs`, `src/update.rs`, `src/update/tests.rs`, `tools/make-manifest.ps1` |
 | `1a54655` | chore: bump to 0.7.33-beta.8 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
 | `f0e31d1` | release: 0.7.33-beta.8 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
+| `e67ed19` | chore: bump to 0.7.35 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `f79a0f3` | docs: CHANGELOG for 0.7.35 (English from this version onward) | `CHANGELOG.md`, `src/app.rs` (in-app журнал) |
+| `93de75a` | release: 0.7.35 binaries + manifest | `TraySession.exe`, `update_manifest.json` (+changelog) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
@@ -95,13 +99,13 @@ debug-сборки: 12 секунд полёт нормальный; число 
 Единый бэклог: `docs/tasks.md` (чек-лист со статусами `[ ]/[~]/[x]`, датами,
 приоритетами; закрытые — в архиве внизу файла). Полная очередь — там.
 
-1. **MT-1** — кнопки мини-трея не работают (HIGH). Следующая задача.
-2. **Фаза 2** — `LayoutSpec` + `engine.rs` (H1, включает MT-2/MT-3). Лечит layout со скриншота:
-   панели не привязаны к `screen_rect`, блоки плывут.
-2. **Фаза 3** — вынос `ui_*` в `views/*` (L2).
+1. **H1 шаг 2** — `engine.rs`: `build_window()` поверх spec + presets.
+2. **H1 шаг 3** — подключение engine в `update()` вместо прямых панелей.
+3. **MT-2/3/4** — мини-трей и тултипы после engine.
+4. **Фаза 3** — вынос `ui_*` в `views/*` (L2).
    Порядок: about → shortcuts → timer → alarms → games → sessions.
-3. **Фаза 4** — реестр действий для кнопок (M3).
-4. **TODO:** нативные уведомления через WinRT (L1; сейчас fallback на PowerShell,
+5. **Фаза 4** — реестр действий для кнопок (M3).
+6. **TODO:** нативные уведомления через WinRT (L1; сейчас fallback на PowerShell,
    заголовок «Windows PowerShell», нет иконки).
 
 ## Ключевые решения (не переобсуждать)
