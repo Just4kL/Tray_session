@@ -17,46 +17,77 @@ pub struct WindowCallbacks<'a> {
 }
 
 /// Построить главное окно из спеки: nav слева, status снизу, center
-/// с симметричными полями. Зона с `collapse_below`, превышающим ширину
-/// экрана, пропускается (узкое окно).
+/// с симметричными полями. Тонкий оркестратор поверх build_nav /
+/// build_status / build_center — для инкрементальной интеграции
+/// (шаг 3b+ подключает зоны по одной).
 #[allow(dead_code)] // TODO(H1-step-3): потребитель — update() в app.rs
 pub fn build_window(ctx: &egui::Context, spec: &LayoutSpec, mut cb: WindowCallbacks<'_>) {
-    let screen_w = ctx.screen_rect().width();
+    build_nav(ctx, spec, &mut cb.nav);
+    build_status(ctx, spec, &mut cb.status);
+    build_center(ctx, spec, &mut cb.center);
+}
 
-    let nav_collapsed = spec
+/// Левая панель навигации. Пропускается при collapse.
+#[allow(dead_code)] // TODO(H1-step-3): потребитель — update() в app.rs
+pub fn build_nav(
+    ctx: &egui::Context,
+    spec: &LayoutSpec,
+    cb: &mut dyn FnMut(&mut egui::Ui),
+) {
+    let screen_w = ctx.screen_rect().width();
+    let collapsed = spec
         .nav
         .collapse_below
         .is_some_and(|limit| screen_w < limit);
-    if !nav_collapsed {
-        let sz = &spec.nav;
-        let panel = egui::SidePanel::left("nav")
-            .resizable(sz.resizable)
-            .default_width(sz.default_w)
-            .width_range(sz.min_w..=sz.max_w);
-        let panel = if !sz.resizable && sz.default_w == sz.min_w && sz.default_w == sz.max_w {
-            panel.exact_width(sz.default_w)
-        } else {
-            panel
-        };
-        panel.show(ctx, |ui| (cb.nav)(ui));
+    if collapsed {
+        return;
     }
+    let sz = &spec.nav;
+    let panel = egui::SidePanel::left("nav")
+        .resizable(sz.resizable)
+        .default_width(sz.default_w)
+        .width_range(sz.min_w..=sz.max_w);
+    let panel = if !sz.resizable && sz.default_w == sz.min_w && sz.default_w == sz.max_w {
+        panel.exact_width(sz.default_w)
+    } else {
+        panel
+    };
+    panel.show(ctx, |ui| cb(ui));
+}
 
-    let status_collapsed = spec
+/// Нижняя строка статуса. Пропускается при collapse.
+#[allow(dead_code)] // TODO(H1-step-3): потребитель — update() в app.rs
+pub fn build_status(
+    ctx: &egui::Context,
+    spec: &LayoutSpec,
+    cb: &mut dyn FnMut(&mut egui::Ui),
+) {
+    let screen_w = ctx.screen_rect().width();
+    let collapsed = spec
         .status
         .collapse_below
         .is_some_and(|limit| screen_w < limit);
-    if !status_collapsed {
-        let sz = &spec.status;
-        egui::TopBottomPanel::bottom("status")
-            .resizable(false)
-            .exact_height(sz.min_h)
-            .show(ctx, |ui| (cb.status)(ui));
+    if collapsed {
+        return;
     }
+    let sz = &spec.status;
+    egui::TopBottomPanel::bottom("status")
+        .resizable(false)
+        .exact_height(sz.min_h)
+        .show(ctx, |ui| cb(ui));
+}
 
+/// Центральная область с симметричными полями страницы.
+#[allow(dead_code)] // TODO(H1-step-3): потребитель — update() в app.rs
+pub fn build_center(
+    ctx: &egui::Context,
+    spec: &LayoutSpec,
+    cb: &mut dyn FnMut(&mut egui::Ui),
+) {
     egui::CentralPanel::default().show(ctx, |ui| {
         let m = spec.page_margin.for_width(ui.available_width());
         let frame = egui::Frame::none().inner_margin(egui::Margin::symmetric(m, 0.0));
-        frame.show(ui, |ui| (cb.center)(ui));
+        frame.show(ui, |ui| cb(ui));
     });
 }
 
@@ -128,5 +159,19 @@ mod tests {
         assert!(!*nav_hit.lock().unwrap(), "схлопнутый nav вызван");
         assert!(!*status_hit.lock().unwrap(), "схлопнутый status вызван");
         assert!(*center_hit.lock().unwrap(), "center не вызван");
+    }
+
+    #[test]
+    fn individual_builders_run_headless() {
+        // Шаг 3a: зоны строятся и по отдельности — для инкрементального
+        // подключения в update() (по одной панели за коммит).
+        let ctx = headless_ctx(960.0, 640.0);
+        let spec = default_layout();
+        let input = egui::RawInput::default();
+        let _ = ctx.run(input, |ctx| {
+            build_nav(ctx, &spec, &mut |_| {});
+            build_status(ctx, &spec, &mut |_| {});
+            build_center(ctx, &spec, &mut |_| {});
+        });
     }
 }
