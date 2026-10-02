@@ -247,6 +247,9 @@ pub struct AppState {
     pub stopwatch_expanded: bool,
     /// Последняя командная позиция окошка при перетаскивании (анти-лаг).
     pub stopwatch_drag_pos: Option<egui::Pos2>,
+    /// Точка нажатия текущего жеста (MT-1): OS-move стартует только после
+    /// сдвига > DRAG_THRESHOLD, иначе клик по кнопке уходил в перетаскивание.
+    pub stopwatch_press_pos: Option<egui::Pos2>,
     /// Поставить окошко на запомненную позицию первым кадром.
     pub overlay_place_pending: bool,
     /// ppp при прошлой синхронизации рамок плавающих окон.
@@ -258,6 +261,8 @@ pub struct AppState {
     pub strip_open: bool,
     pub strip_pos: u8,
     pub strip_drag_pos: Option<egui::Pos2>,
+    /// Точка нажатия текущего жеста (MT-1, см. stopwatch_press_pos).
+    pub strip_press_pos: Option<egui::Pos2>,
     pub strip_pinned: bool,
     pub strip_opacity_pct: f32,
     /// Отложить прижатие полоски к краю до первого кадра вьюпорта.

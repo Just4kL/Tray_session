@@ -1253,6 +1253,7 @@ impl TrackerApp {
                 stopwatch_opacity_pct: cfg_handle.stopwatch_opacity_pct,
                 stopwatch_expanded: cfg_handle.stopwatch_expanded,
                 stopwatch_drag_pos: None,
+                stopwatch_press_pos: None,
                 // При старте с уже открытым оверлеем set_stopwatch_overlay
                 // не вызывается, поэтому флаг взводим сразу из конфига:
                 // иначе позиция не восстановится и ОС поставит окно рядом
@@ -1263,6 +1264,7 @@ impl TrackerApp {
                 strip_open: cfg_handle.strip_open,
                 strip_pos: cfg_handle.strip_pos,
                 strip_drag_pos: None,
+                strip_press_pos: None,
                 strip_pinned: cfg_handle.strip_pinned,
                 strip_opacity_pct: cfg_handle.strip_opacity_pct,
                 strip_snap_pending: false,
@@ -2049,6 +2051,7 @@ impl TrackerApp {
                 vp_id,
                 egui::Id::new(("stopwatch_overlay", "drag")),
                 &mut self.state.stopwatch_drag_pos,
+                &mut self.state.stopwatch_press_pos,
                 STOPWATCH_TITLE,
             );
         }
@@ -2403,6 +2406,7 @@ impl TrackerApp {
                 vp_id,
                 egui::Id::new(("session_strip", "drag")),
                 &mut self.state.strip_drag_pos,
+                &mut self.state.strip_press_pos,
                 STRIP_TITLE,
             );
         }
@@ -5581,16 +5585,44 @@ fn clamp_overlay_pos(p: [f32; 2], work: (i32, i32, i32, i32), size: (i32, i32)) 
 /// поэтому окно идёт строго за курсором 1:1 без лагов, двоения и залипаний:
 /// никаких покадровых команд и шторма перерисовок. Вне Windows — запасной
 /// вариант с накоплением дельт (см. accumulate_drag_pos).
+///
+/// MT-1: OS-move стартует НЕ на нажатие, а после сдвига курсора дальше
+/// DRAG_THRESHOLD_PX. Раньше `drag_started_by` (кадр нажатия) сразу уводил
+/// мышь в модальный OS-move, и кнопки оверлеев никогда не получали release:
+/// clicked() не срабатывал. Теперь клик без движения доходит до кнопок,
+/// а потягивание по-прежнему таскает окно.
+pub const DRAG_THRESHOLD_PX: f32 = 3.0;
+
 fn viewport_drag(
     ui: &mut egui::Ui,
     _vp_id: egui::ViewportId,
     drag_id: egui::Id,
     last_cmd: &mut Option<egui::Pos2>,
+    press_origin: &mut Option<egui::Pos2>,
     title: &str,
 ) {
     let bg = ui.interact(ui.max_rect(), drag_id, egui::Sense::drag());
     if bg.drag_started_by(egui::PointerButton::Primary) {
+        // Только запоминаем точку нажатия — OS-move ниже, по порогу.
+        *press_origin = ui.ctx().input(|i| i.pointer.press_origin());
         *last_cmd = None;
+    }
+    // Суммарный сдвиг от точки нажатия (не покадровая дельта: медленное
+    // ведение < 3px/кадр тоже должно схватываться). Однократно за жест:
+    // после старта OS-move владеет мышью, повторный старт не нужен.
+    let moved_far = match (
+        *press_origin,
+        ui.ctx().input(|i| i.pointer.interact_pos()),
+    ) {
+        (Some(o), Some(p)) => p.distance(o) > DRAG_THRESHOLD_PX,
+        _ => false,
+    };
+    if moved_far
+        && ui
+            .ctx()
+            .input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+    {
+        *press_origin = None;
         #[cfg(windows)]
         native_window_drag(title);
     }
@@ -5614,6 +5646,7 @@ fn viewport_drag(
     }
     if bg.drag_stopped() {
         *last_cmd = None;
+        *press_origin = None;
     }
 }
 
