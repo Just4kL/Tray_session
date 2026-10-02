@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-02
-Обновил: агент-сессия — updater end-to-end закрыт живым тестом, tasks-догон (ARC-1/MT/UPD-2), бриф — этим коммитом
+Обновил: агент-сессия — bump до 0.7.33-beta.8 (диалог в комплекте), бриф — этим коммитом
 
 ## Проект
 
@@ -18,16 +18,18 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `aaef02a` (release: 0.7.33-beta.7 binaries + manifest; docs-коммит — HEAD)
-- Тесты: 165 зелёных
+- HEAD: `f0e31d1` (release: 0.7.33-beta.8 binaries + manifest; docs-коммит — HEAD)
+- Тесты: 167 зелёных
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
 - Тег отката: `pre-ui-refactor` (`a48813d`)
 
 ## В работе
 
-Пусто: updater end-to-end закрыт живым тестом 2026-10-02 (beta.6+фиксы →
-beta.7, ok=true, перезапуск произошёл). Следующее берётся из очереди ниже.
+Pre-release 0.7.33-beta.8 собран локально: диалог подтверждения
+обновления (db18223) + mutex-фикс. В работе: публикация beta.8
+(предыдущая попытка публикации db18223 без bump откачена, ветка
+app-Tray_session возвращена на e8e3211), затем живой тест.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -78,6 +80,9 @@ beta.7, ok=true, перезапуск произошёл). Следующее б
 | `aaef02a` | release: 0.7.33-beta.7 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
 | `b3a0507..e8e3211` | updater end-to-end: живой тест успешен 2026-10-02, beta.7 | report ok=true, перезапуск произошёл, `logs/updater.log` пошагово |
 | `3fb82c5` | docs: ARC-1 обновлён, MT-1/MT-2/MT-3, UPD-2 в tasks | `docs/tasks.md` |
+| `db18223` | feat(update): диалог подтверждения с changelog и тихим отсчётом | `src/app.rs`, `src/app_state.rs`, `src/update.rs`, `src/update/tests.rs`, `tools/make-manifest.ps1` |
+| `1a54655` | chore: bump to 0.7.33-beta.8 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
+| `f0e31d1` | release: 0.7.33-beta.8 binaries + manifest | `TraySession.exe`, `update_manifest.json` (installer без изменений) |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
