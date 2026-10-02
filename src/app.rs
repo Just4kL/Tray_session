@@ -3061,30 +3061,29 @@ impl eframe::App for TrackerApp {
         let m = page_margin(ctx.available_rect().width());
         // Строка статуса — постоянно внизу (и с тем же отступом, что блоки
         // разделов), чтобы сообщения не прыгали после содержимого карточек.
-        egui::TopBottomPanel::bottom("status")
-            .resizable(false)
-            .exact_height(24.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(0.0, 2.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(m);
-                    if !self.state.status_msg.is_empty() {
-                        ui.colored_label(
-                            self.theme.current().tokens().palette.semantic.attention,
-                            &self.state.status_msg,
-                        );
-                    } else {
-                        ui.colored_label(
-                            ui.visuals().weak_text_color(),
-                            format!("{APP_NAME} {VERSION} · авто-подсчёт игровых сессий"),
-                        );
-                    }
-                });
+        // H1-шаг-4a: панель строит engine::build_status из LayoutSpec.
+        // Отклонение от «дословного контента»: engine не принимает frame,
+        // поэтому панель получает дефолтный Frame::side_top_panel с левым
+        // полем 8.0 (было 0.0). Компенсируем внутри: add_space(m - 8),
+        // итог тот же отступ m, попиксельно как раньше. Шаг 5 перенесёт
+        // frame в spec/engine и уберёт компенсацию.
+        let status_spec = crate::ui::layout::presets::default_layout();
+        crate::ui::layout::engine::build_status(ctx, &status_spec, &mut |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space((m - 8.0).max(0.0));
+                if !self.state.status_msg.is_empty() {
+                    ui.colored_label(
+                        self.theme.current().tokens().palette.semantic.attention,
+                        &self.state.status_msg,
+                    );
+                } else {
+                    ui.colored_label(
+                        ui.visuals().weak_text_color(),
+                        format!("{APP_NAME} {VERSION} · авто-подсчёт игровых сессий"),
+                    );
+                }
             });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let inner_w = (ui.available_width() - m * 2.0).max(80.0);
