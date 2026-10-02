@@ -114,9 +114,9 @@ pub enum ExportPlan {
 /// Проводник. Файл выгрузки в любом случае не должен остаться внутри папки
 /// программы, откуда его снесёт удаление.
 /// Куда выгружать по умолчанию, если вызывающий не указал путь.
-pub fn prepare_export_default(base: &Path, auto: bool) -> Result<ExportPlan, String> {
+pub fn prepare_export_default(base: &Path) -> Result<ExportPlan, String> {
     let out = crate::export::default_export_path();
-    prepare_export(base, &out, auto)
+    prepare_export(base, &out)
 }
 
 /// То же, но с явным путём выгрузки.
@@ -124,7 +124,13 @@ pub fn prepare_export_default(base: &Path, auto: bool) -> Result<ExportPlan, Str
 /// Путь передаётся извне не для красоты: во-первых, тесты не должны писать
 /// на Рабочий стол, во-вторых, место под выгрузку решает вызывающий —
 /// ему виднее, куда человек ожидает файл.
-pub fn prepare_export(base: &Path, out: &Path, auto: bool) -> Result<ExportPlan, String> {
+///
+/// Проводник здесь НЕ открывается намеренно: раньше был флаг `auto`,
+/// который открывал его внутри, а затем `uninstall_to` открывал его ещё
+/// раз — Проводник всплывал дважды при каждом удалении, а при прогоне
+/// тестов — прямо посреди `cargo test`. Единственное место открытия —
+/// ветка `OfferToSave` в `uninstall_to`.
+pub fn prepare_export(base: &Path, out: &Path) -> Result<ExportPlan, String> {
     if let Some(p) = last_export_path(base) {
         return Ok(ExportPlan::AlreadySaved(p));
     }
@@ -147,9 +153,6 @@ pub fn prepare_export(base: &Path, out: &Path, auto: bool) -> Result<ExportPlan,
         Ok(0) => return Ok(ExportPlan::NoSessions),
         Ok(_) => {}
         Err(e) => return Err(e),
-    }
-    if auto {
-        let _ = crate::export::reveal_in_explorer(out);
     }
     Ok(ExportPlan::OfferToSave)
 }
@@ -286,9 +289,9 @@ pub fn uninstall_to(base: &Path, out: Option<&Path>) -> UninstallReport {
     let plan = match out {
         Some(dir) => {
             let path = crate::export::unique_path(dir);
-            prepare_export(base, &path, true)
+            prepare_export(base, &path)
         }
-        None => prepare_export_default(base, false),
+        None => prepare_export_default(base),
     };
     match plan {
         Ok(ExportPlan::AlreadySaved(p)) => {

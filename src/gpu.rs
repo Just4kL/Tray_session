@@ -99,3 +99,28 @@ pub fn query_gpu() -> GpuSnapshot {
 pub fn vram_mb(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
 }
+
+/// Байты в мегабайты.
+///
+/// sysinfo 0.30+: `Process::memory()` возвращает БАЙТЫ (до 0.30 были
+/// КИЛОБАЙТЫ). Делить нужно на 1024², а не на 1024 — иначе мегабайты
+/// оказываются в 1024 раза больше (процесс на 4 ГБ показывался как
+/// «3905244МБ»). Проверять при апгрейде sysinfo: регрессионный тест
+/// `memory_bytes_to_mb_is_1024_based` ниже.
+pub fn bytes_to_mb(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_bytes_to_mb_is_1024_based() {
+        // sysinfo 0.30+ возвращает Process::memory() в байтах.
+        // 2 ГиБ должны стать 2048 МБ, а не 2097152 и не 2.
+        assert_eq!(bytes_to_mb(2 * 1024 * 1024 * 1024), 2048);
+        assert_eq!(bytes_to_mb(0), 0);
+        assert_eq!(bytes_to_mb(1024 * 1024 - 1), 0); // неполный МБ не округляется вверх
+    }
+}

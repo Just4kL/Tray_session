@@ -1,4 +1,5 @@
 use crate::config::{exe_file_name, normalize_exe, TrackedGame};
+use crate::gpu::bytes_to_mb;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -409,7 +410,7 @@ pub fn list_running_processes() -> Vec<ProcInfo> {
                 name: p.name().to_string(),
                 exe,
                 cpu: p.cpu_usage(),
-                mem_mb: p.memory() / 1024,
+                mem_mb: bytes_to_mb(p.memory()),
             }
         })
         .collect();

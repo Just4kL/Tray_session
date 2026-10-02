@@ -196,7 +196,7 @@ fn export_is_written_outside_the_folder_being_deleted() {
     let out_dir = dir.join("..").join("экспорт_снаружи");
     let _ = std::fs::create_dir_all(&out_dir);
     let outside = out_dir.join("sessions.csv");
-    let plan = prepare_export(&dir, &outside, false);
+    let plan = prepare_export(&dir, &outside);
     match &plan {
         Ok(ExportPlan::OfferToSave) => {}
         other => panic!("ожидалось предложение сохранить, получено {other:?}"),
@@ -291,7 +291,7 @@ fn stale_marker_does_not_block_fresh_export() {
     let out_dir = dir.join("..").join("экспорт_свежий");
     let _ = std::fs::create_dir_all(&out_dir);
     let out = out_dir.join("sessions.csv");
-    let plan = prepare_export(&dir, &out, false);
+    let plan = prepare_export(&dir, &out);
     assert!(
         matches!(plan, Ok(ExportPlan::OfferToSave)),
         "при устаревшей метке нужно выгружать заново, получено {plan:?}"
@@ -310,7 +310,7 @@ fn export_refuses_to_write_inside_the_program_folder() {
     add_fake_sessions(&dir);
 
     let inside = dir.join("sessions.csv");
-    let plan = prepare_export(&dir, &inside, false);
+    let plan = prepare_export(&dir, &inside);
     assert!(
         matches!(plan, Err(_)),
         "выгрузка внутрь папки программы должна отклоняться, получено {plan:?}"
@@ -518,6 +518,53 @@ fn export_to_dir_keeps_the_file_outside_the_program_folder() {
     assert!(text.starts_with("№,Игра"), "нет заголовка: {text}");
     assert!(text.lines().count() >= 2, "в выгрузке только заголовок");
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn explorer_opens_exactly_once_per_uninstall() {
+    // Регрессия: Проводник открывался ДВАЖДЫ при каждом удалении с
+    // выгрузкой — один раз внутри prepare_export (флаг auto), второй раз
+    // в ветке OfferToSave. А при прогоне тестов он всплывал прямо
+    // посреди `cargo test`, потому что тесты идут через тот же код.
+    // Теперь место открытия одно, а в тестовой сборке окно вообще не
+    // открывается — считается счётчик.
+    crate::export::test_reset_reveal_count();
+    let dir = sandbox("once");
+    make_install(&dir);
+    std::fs::remove_file(dir.join("sessions.db")).unwrap();
+    add_fake_sessions(&dir);
+
+    let out_dir = dir.join("..").join("экспорт_один_раз");
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let report = uninstall_to(&dir, Some(&out_dir));
+    assert!(report.is_clean(), "{:?}", report.failed);
+    assert_eq!(
+        crate::export::test_reveal_count(),
+        1,
+        "Проводник должен открываться ровно один раз за удаление"
+    );
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn no_explorer_when_table_was_already_saved() {
+    // Если таблица уже сохранялась, открывать Проводник не на что:
+    // файл как лежал, так и лежит, человек его уже видел.
+    crate::export::test_reset_reveal_count();
+    let dir = sandbox("nosave");
+    make_install(&dir);
+    let exported = dir.join("..").join(format!("выгрузка_уже_{}.csv", std::process::id()));
+    std::fs::write(&exported, "№,Игра\n1,A\n").unwrap();
+    std::fs::write(dir.join(LAST_EXPORT), exported.to_string_lossy().as_bytes()).unwrap();
+
+    let report = uninstall(&dir);
+    assert!(report.is_clean(), "{:?}", report.failed);
+    assert_eq!(
+        crate::export::test_reveal_count(),
+        0,
+        "Проводник открылся, хотя показывать нечего — файл уже сохранён"
+    );
+    let _ = std::fs::remove_file(&exported);
 }
 
 #[test]

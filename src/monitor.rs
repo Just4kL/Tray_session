@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, TrackedGame};
 use crate::detector::{build_match_maps, ProcInfo};
-use crate::gpu::{query_gpu, vram_mb};
+use crate::gpu::{bytes_to_mb, query_gpu, vram_mb};
 use chrono::Local;
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, RwLock};
@@ -91,7 +91,7 @@ pub fn spawn_monitor(
                         name: p.name().to_string(),
                         exe: exe.clone(),
                         cpu: p.cpu_usage(),
-                        mem_mb: p.memory() / 1024,
+                        mem_mb: bytes_to_mb(p.memory()),
                     };
                     let replace = match current.get(&key) {
                         Some(old) => info.cpu > old.cpu,

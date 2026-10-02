@@ -7,11 +7,13 @@
 # known_games.json — личный список игр
 # sessions.db — история игровых сессий
 # shortcuts.json — пользовательские шорткаты
+# m.txt — локальный файл заметок (сообщения коммитов пишутся через него)
 /config.json
 /known_games.json
 /sessions.db
 /sessions.db-journal
 /shortcuts.json
+/m.txt
 
 # Бэкапы 7-Zip (десятки МБ на каждый билд) — хранятся отдельно.
 # А сами готовые сборки (TraySession.exe и установщик) в репозитории есть,

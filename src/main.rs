@@ -1,4 +1,10 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Скрывает консольное окно в release. В debug оставлено для отладки.
+// Причина: .exe без этого атрибута — консольное приложение. При
+// двойном клике Windows открывает консоль, потом программу. Программа
+// скрывается в трей, консоль остаётся.
 mod app;
+mod app_state;
 mod config;
 mod db;
 mod detector;
@@ -9,10 +15,12 @@ mod monitor;
 mod shortcuts;
 mod sound;
 mod testpaths;
+mod ui;
 mod update;
 mod uninstall;
 
-use app::{initial_games, AppCmd, TrackerApp, TrayCmd, VERSION};
+use app::{initial_games, TrackerApp, VERSION};
+use app_state::{AppCmd, TrayCmd};
 use config::AppConfig;
 use std::sync::{mpsc, Arc, RwLock};
 
@@ -87,6 +95,32 @@ pub fn build_app_icon(size: u32) -> Vec<u8> {
     }
     rgba
 }
+
+/// Показать главное окно через WinAPI, минуя event loop eframe.
+/// Нужно для трей-меню: при Minimized(true) eframe спит, AppCmd::Show
+/// не обрабатывается. Прямой ShowWindow разбудит окно.
+#[cfg(windows)]
+fn show_main_window_native() {
+    use winapi::um::winuser::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+    let title: Vec<u16> = "Tray Session\0".encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_main_window_native() {}
 
 fn spawn_tray(rx_tooltip: mpsc::Receiver<TrayCmd>, tx_app: mpsc::Sender<AppCmd>) {
     // ВАЖНО (Windows): tray-icon требует прокачку Win32-сообщений на том потоке,
@@ -164,6 +198,10 @@ fn spawn_tray(rx_tooltip: mpsc::Receiver<TrayCmd>, tx_app: mpsc::Sender<AppCmd>)
             }
             if let Ok(ev) = menu_rx.try_recv() {
                 if ev.id == open_item.id() {
+                    // WinAPI напрямую — eframe спит при Minimized(true).
+                    show_main_window_native();
+                    // AppCmd::Show — на случай, если eframe всё-таки проснётся и
+                    // захочет синхронизировать своё внутреннее состояние viewport.
                     let _ = tx_app.send(AppCmd::Show);
                 } else if ev.id == quit_item.id() {
                     let _ = tx_app.send(AppCmd::Quit);
@@ -176,10 +214,12 @@ fn spawn_tray(rx_tooltip: mpsc::Receiver<TrayCmd>, tx_app: mpsc::Sender<AppCmd>)
                 match ev {
                     TrayIconEvent::Click { button, .. } => {
                         if button == MouseButton::Left {
+                            show_main_window_native();
                             let _ = tx_app.send(AppCmd::Show);
                         }
                     }
                     TrayIconEvent::DoubleClick { .. } => {
+                        show_main_window_native();
                         let _ = tx_app.send(AppCmd::Show);
                     }
                     _ => {}
@@ -248,9 +288,52 @@ fn apply_global_hotkeys(
     *current = regs;
 }
 
+/// Завершить старый main-процесс по PID из main_pid.txt (ветка --updated).
+/// Best effort: файла/процесса уже нет — значит, всё хорошо, выходим молча.
+#[cfg(windows)]
+fn kill_old_main_by_pid_file() {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
+    use winapi::um::winnt::PROCESS_TERMINATE;
+    let pid: u32 = match std::fs::read_to_string(
+        crate::update::tmp_dir(&crate::update::program_dir()).join(crate::update::MAIN_PID_FILE),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse().ok())
+    {
+        Some(p) => p,
+        None => return,
+    };
+    if pid == std::process::id() {
+        return;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return;
+        }
+        TerminateProcess(h, 0);
+        CloseHandle(h);
+    }
+    // Лога тут нет: log::init ещё не вызван, запись ушла бы в никуда.
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_app_icon;
+    use super::SINGLE_INSTANCE_MUTEX;
+
+    /// Имя mutex-а single-instance не должно меняться молча: иначе после
+    /// обновления живые процессы со старым именем не будут находиться
+    /// новыми, и защита от второго экземпляра отключится.
+    #[cfg(windows)]
+    #[test]
+    fn single_instance_mutex_name_is_stable() {
+        assert_eq!(
+            SINGLE_INSTANCE_MUTEX, "Local\\TraySession_SingleInstance",
+            "имя mutex-а изменилось — живые процессы его не найдут"
+        );
+    }
 
     /// Иконка должна быть непрозрачной по центру и прозрачной по углам
     /// (скругление) — иначе в трее будет белый/чёрный квадрат.
@@ -296,6 +379,14 @@ mod tests {
     }
 }
 
+/// Имя именованного мьютекса single-instance.
+///
+/// Вынесено в константу и зафиксировано тестом: если имя поменять, живые
+/// процессы со старым именем перестанут находиться новыми — и защита от
+/// второго экземпляра молча отключится после обновления.
+#[cfg(windows)]
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\TraySession_SingleInstance";
+
 fn main() -> eframe::Result {
     // Фоновый процесс обновления. Это тот же самый .exe, запущенный с
     // флагом --updater: отдельный процесс нужен, чтобы (а) интерфейс не
@@ -303,8 +394,16 @@ fn main() -> eframe::Result {
     // держит открытым. Окно при этом не создаётся.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(upd) = update::parse_args(&argv) {
-        std::process::exit(update::run_updater(upd.wait_secs, &upd.channel));
+        std::process::exit(update::run_updater(
+            &upd.base_dir,
+            upd.parent_pid,
+            upd.wait_secs,
+            &upd.channel,
+        ));
     }
+    // Перезапуск после обновления (R4): updater уже заменил файлы и
+    // запустил нас с --updated. Старого процесса уже нет (updater ждал
+    // его смерти), но на всякий случай ветка ниже умеет его завершить.
 
     // Режим деактиватора. Отдельного маленького бинарника не делаем
     // намеренно: он тянул бы за собой копию логирования, работы с базой и
@@ -317,16 +416,76 @@ fn main() -> eframe::Result {
         std::process::exit(uninstall::run(&argv));
     }
 
+    // Single-instance: не даём запуститься второму экземпляру.
+    // Оверлеи (секундомер, полоска) имеют одинаковый title во всех
+    // процессах — FindWindowW в ensure_thickframe/apply_overlay_opacity
+    // без этого попадает в чужой HWND, и позиция/прозрачность идут
+    // в случайное окно. Баг C5.
+    //
+    // Режимы --updater и --uninstaller вышли выше и mutex не берут —
+    // это короткоживущие вспомогательные процессы, они должны
+    // запускаться параллельно основной программе.
+    //
+    // Окно ищем по точному title "Tray Session" (см. run_native ниже).
+    // Если оно скрыто в трее (Visible(false)), HWND всё равно существует,
+    // ShowWindow(SW_SHOW) + SetForegroundWindow его показывают.
+    //
+    // R4: запуск с --updated после замены файлов. Старого процесса быть
+    // не должно (updater ждал смерти), но если mutex всё ещё занят —
+    // завершаем владельца по PID из main_pid.txt, ждём 2 с и захватываем
+    // mutex заново. Без флага — старое поведение (показать окно + exit).
+    #[cfg(windows)]
+    let _single_instance_mutex = {
+        use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::um::synchapi::CreateMutexW;
+        use winapi::um::winuser::{
+            FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        let updated_mode = argv.iter().any(|a| a == update::UPDATED_FLAG);
+        let mutex_name: Vec<u16> = SINGLE_INSTANCE_MUTEX
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut h = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            if GetLastError() == ERROR_ALREADY_EXISTS && updated_mode {
+                kill_old_main_by_pid_file();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                h = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let title: Vec<u16> = "Tray Session\0".encode_utf16().collect();
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if !hwnd.is_null() {
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    } else {
+                        ShowWindow(hwnd, SW_SHOW);
+                    }
+                    SetForegroundWindow(hwnd);
+                }
+                std::process::exit(0);
+            }
+            h
+        }
+    };
+
+    // PID главного процесса для updater и --updated-перезапуска
+    // (ожидание смерти / завершение владельца C5-mutex). Пишем при
+    // каждом старте, до log::init — запись в файл лога не требует.
+    // main_pid.txt updater удаляет на шаге cleanup; протухший PID
+    // не страшен: wait сверяется со смертью процесса, а не с файлом.
+    let pid_path =
+        crate::update::tmp_dir(&crate::update::program_dir()).join(crate::update::MAIN_PID_FILE);
+    if let Some(parent) = pid_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
     // Логи пишутся рядом с программой, с ограничением по объёму.
     crate::log::init(&crate::update::program_dir());
     crate::log::info(&format!("Tray Session {VERSION} запущена"));
-
-    // Остаточный файл-флаг от прошлого сеанса снимаем сразу: если он
-    // пережил падение, фоновый процесс увидит его и разрешит замену файлов
-    // при ещё работающей программе.
-    if crate::update::clear_stale_ready_flag(&crate::update::program_dir()) {
-        crate::log::info("найден и снят остаточный файл-флаг от прошлого сеанса");
-    }
 
     let cfg_handle = AppConfig::load();
     // Автоопределение SteamID как в Python-версии
@@ -358,6 +517,9 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([720.0, 480.0])
+            // Скрываем из taskbar: сворачивание = «уход в трей», не должно
+            // оставлять кнопку в панели задач.
+            .with_taskbar(false)
             // Та же иконка, что в трее: в заголовке окна была системная
             // картинка по умолчанию, и программа не выглядела «своей».
             .with_icon(egui::IconData {

@@ -86,11 +86,28 @@ if ($entries.Count -eq 0) {
     throw 'Ни одного файла сборки не найдено — манифест пустой, обновление работать не будет'
 }
 
+# Changelog для диалога подтверждения: секция текущей версии из
+# CHANGELOG.md (до следующего заголовка версии), не длиннее ~600 символов.
+# Нет файла или секции — null, диалог покажет fallback.
+$Changelog = $null
+if (Test-Path 'CHANGELOG.md') {
+    $cl = Get-Content 'CHANGELOG.md' -Raw
+    $esc = [regex]::Escape($Version)
+    if ($cl -match "(?ms)^## \[$esc\][^\r\n]*\r?\n(.*?)(?=^## \[|\z)") {
+        $t = $Matches[1].Trim()
+        if ($t.Length -gt 0) {
+            if ($t.Length -gt 600) { $t = $t.Substring(0, 600).Trim() + '…' }
+            $Changelog = $t
+        }
+    }
+}
+
 $manifest = [ordered]@{
     version = $Version
     build   = $Build
     files   = $entries
 }
+if ($null -ne $Changelog) { $manifest['changelog'] = $Changelog }
 
 $json = $manifest | ConvertTo-Json -Depth 5
 # Windows PowerShell 5.1 пишет BOM, а он ломает разбор JSON — убираем.

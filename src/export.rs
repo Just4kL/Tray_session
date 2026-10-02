@@ -143,11 +143,44 @@ pub fn default_export_path() -> std::path::PathBuf {
 
 /// Открыть Проводник на указанном файле, чтобы человек сразу увидел
 /// сохранённую таблицу.
+///
+/// В тестовой сборке окно НЕ открывается: раньше `cargo test` всплывал
+/// Проводником посреди прогона, потому что тесты проходят через тот же
+/// код удаления. Вместо открытия считается счётчик — регрессионный тест
+/// проверяет, что за одно удаление Проводник открывается ровно один раз.
+/// Счётчик потоко-локальный: тесты идут параллельно, и общий счётчик
+/// врал бы.
 pub fn reveal_in_explorer(path: &Path) -> std::io::Result<()> {
-    std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn()
-        .map(|_| ())
+    #[cfg(test)]
+    {
+        REVEAL_COUNT.with(|c| c.set(c.get() + 1));
+        let _ = path;
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REVEAL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Сколько раз Проводник «открывался» в этом тестовом потоке.
+#[cfg(test)]
+pub fn test_reveal_count() -> usize {
+    REVEAL_COUNT.with(|c| c.get())
+}
+
+/// Сбросить счётчик открытий Проводника в этом потоке.
+#[cfg(test)]
+pub fn test_reset_reveal_count() {
+    REVEAL_COUNT.with(|c| c.set(0));
 }
 
 #[cfg(test)]

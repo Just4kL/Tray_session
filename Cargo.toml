@@ -1,9 +1,13 @@
 [package]
 name = "game-session-tracker"
-version = "0.7.31"
+version = "0.7.35"
+publish = false
 edition = "2021"
 description = "Game Session Tracker — авто-подсчёт времени игр с GPU-гейтом (Rust/egui)"
-authors = ["Game Session Tracker"]
+authors = ["Kenig Feodor"]
+# license не указан: Proprietary вне SPDX, crates.io не публикуем
+# (publish = false). Права — в файле LICENSE.
+build = "build.rs"
 
 [dependencies]
 eframe = "0.28"
@@ -22,9 +26,13 @@ tray-icon = "0.20"
 arboard = "3"
 nvml-wrapper = "0.11"
 winreg = "0.52"
-winapi = { version = "0.3", features = ["winuser", "mmsystem"] }
+winapi = { version = "0.3", features = ["winuser", "mmsystem", "synchapi", "errhandlingapi", "winerror", "processthreadsapi", "winnt", "winbase", "handleapi"] }
 # Иконки разделов рисуются вектором (nav_icon_shapes), растровые PNG и крейт
 # `image` больше не нужны.
+
+[build-dependencies]
+# Тот же chrono, что в основных зависимостях: дата сборки для BUILD.
+chrono = "0.4"
 
 [profile.release]
 opt-level = 2
