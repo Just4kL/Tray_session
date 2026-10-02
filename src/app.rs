@@ -3009,50 +3009,50 @@ impl eframe::App for TrackerApp {
 
         // Левая панель навигации (компактно, как в PC Manager):
         // иконка + подпись, три состояния (неактивна / наведение / активна).
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .exact_width(88.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                for (t, label) in NAV_ITEMS {
-                    if self.nav_item(ui, t, label, self.state.tab == t) {
-                        self.state.tab = t;
-                    }
-                    ui.add_space(4.0);
+        // H1-шаг-3b: панель строит engine::build_nav из LayoutSpec;
+        // контент дословно тот же, обёртка заменена.
+        let nav_spec = crate::ui::layout::presets::default_layout();
+        crate::ui::layout::engine::build_nav(ctx, &nav_spec, &mut |ui| {
+            ui.add_space(8.0);
+            for (t, label) in NAV_ITEMS {
+                if self.nav_item(ui, t, label, self.state.tab == t) {
+                    self.state.tab = t;
                 }
-                // Статус внизу панели (с отступом от нижнего края).
-                // Клик по версии открывает проверку обновлений.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    if ui
-                        .link(
-                            egui::RichText::new(format!("v{VERSION}"))
-                                .small()
-                                .weak(),
-                        )
-                        .on_hover_text("Открыть «О программе» и проверить обновления")
-                        .clicked()
-                    {
-                        // Отдельного окна нет: открываем раздел «О программе»
-                        // и сразу запускаем проверку обновлений.
-                        let ctx = ui.ctx().clone();
-                        self.start_update_check(&ctx);
-                    }
-                    let n_active = self.state
-                        .active
-                        .read()
-                        .unwrap()
-                        .values()
-                        .filter(|a| !a.pending)
-                        .count();
-                    if n_active > 0 {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_GREEN,
-                            format!("● {n_active}"),
-                        );
-                    }
-                });
+                ui.add_space(4.0);
+            }
+            // Статус внизу панели (с отступом от нижнего края).
+            // Клик по версии открывает проверку обновлений.
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if ui
+                    .link(
+                        egui::RichText::new(format!("v{VERSION}"))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text("Открыть «О программе» и проверить обновления")
+                    .clicked()
+                {
+                    // Отдельного окна нет: открываем раздел «О программе»
+                    // и сразу запускаем проверку обновлений.
+                    let ctx = ui.ctx().clone();
+                    self.start_update_check(&ctx);
+                }
+                let n_active = self.state
+                    .active
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|a| !a.pending)
+                    .count();
+                if n_active > 0 {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        format!("● {n_active}"),
+                    );
+                }
             });
+        });
 
         // Главная область: поля страницы симметричны слева и справа (5%
         // ширины окна), поэтому блоки всех разделов выровнены по одной
