@@ -1,10 +1,10 @@
 {
-  "version": "0.7.33-beta.6",
-  "build": "20261001",
+  "version": "0.7.33-beta.7",
+  "build": "20261002",
   "files": [
     {
       "name": "TraySession.exe",
-      "sha256": "794fcfb31bdaad3ef7884dbd0a793cb0b3b0747ac7c7d9f1bd96de74d5fae40c"
+      "sha256": "243d75e53910948cb681c07ce40a77263df68c87087056a76af592edd60db252"
     },
     {
       "name": "Tray_session_setup.exe",
