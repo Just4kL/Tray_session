@@ -1,6 +1,6 @@
 [package]
 name = "game-session-tracker"
-version = "0.7.33-beta.8"
+version = "0.7.35"
 publish = false
 edition = "2021"
 description = "Game Session Tracker — авто-подсчёт времени игр с GPU-гейтом (Rust/egui)"
