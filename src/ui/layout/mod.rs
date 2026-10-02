@@ -5,6 +5,7 @@
 //! `engine.rs` — единственное место в проекте, где создаются панели
 //! `SidePanel`/`TopBottomPanel`/`CentralPanel`.
 
+pub mod engine;
 pub mod presets;
 pub mod spec;
 // engine.rs — шаг 2 H1: build_window() поверх spec + presets.
