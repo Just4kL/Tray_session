@@ -1,5 +1,5 @@
 use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateDialogState, UpdateInfo};
-use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, save_known_games, AppConfig, TrackedGame};
+use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, sanitize_timer_presets, save_known_games, AppConfig, TrackedGame, TIMER_PRESET_MAX, TIMER_PRESET_MIN};
 use crate::ui::{theme::{tokens::Tokens, ThemeManager}, views::Views};
 use crate::db::{AlarmRow, Db};
 use crate::detector;
@@ -2243,23 +2243,53 @@ impl TrackerApp {
                     .font(egui::FontId::monospace(big))
                     .color(color),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if running {
+            if running {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Стоп").clicked() {
                         self.state.timer_end = None;
                         self.state.sound.stop();
                     }
-                } else {
-                    for (label, secs) in
-                        [("1м", 60u64), ("5м", 300), ("10м", 600), ("30м", 1800)]
+                });
+            }
+        });
+        // T-17: пресеты берём из конфига (тот же список, что на вкладке
+        // «Таймер»), а не из захардкоженного массива. Клавиатуры в этом окне
+        // нет (WS_EX_NOACTIVATE), поэтому тут только запуск и «+»: он кладёт
+        // текущие «Минуты» в пресеты. Правка самого списка — Настройки → Таймер.
+        if !running {
+            let presets = self.state.cfg_handle.timer_presets.clone();
+            let cur = self
+                .state
+                .timer_min
+                .clamp(TIMER_PRESET_MIN as i32, TIMER_PRESET_MAX as i32) as u32;
+            let cur_in = presets.contains(&cur);
+            ui.horizontal_wrapped(|ui| {
+                for min in presets {
+                    if ui
+                        .small_button(timer_preset_label(min))
+                        .on_hover_text(format!("Запустить таймер на {min} мин"))
+                        .clicked()
                     {
-                        if ui.small_button(label).clicked() {
-                            self.start_timer(secs);
-                        }
+                        self.start_timer(min as u64 * 60);
                     }
                 }
+                // «+» показываем, только когда он что-то даст: если текущие
+                // минуты уже в пресетах, кнопка была бы мёртвой.
+                let add = !cur_in
+                    && ui
+                        .small_button("+")
+                        .on_hover_text(format!(
+                            "Добавить {} в пресеты (правка списка — Настройки → Таймер)",
+                            timer_preset_label(cur)
+                        ))
+                        .clicked();
+                if add {
+                    let mut p = self.state.cfg_handle.timer_presets.clone();
+                    p.push(cur);
+                    self.state.cfg_handle.timer_presets = sanitize_timer_presets(&p);
+                }
             });
-        });
+        }
         // Тонкий индикатор хода: без него длинный таймер «теряется» в окне.
         let frac = if self.state.timer_total > 0 {
             (rem as f32 / self.state.timer_total as f32).clamp(0.0, 1.0)
@@ -4051,10 +4081,17 @@ impl TrackerApp {
         let skin = self.theme.current().clone();
         page_title(ui, skin.tokens(), "Таймер обратного отсчёта");
         card(ui, skin.tokens(), "Таймер", |ui| {
+        // T-17: пресеты — из конфига, а не из захардкоженного массива.
+        // Тот же список показывает развёрнутый оверлей секундомера.
+        let presets = self.state.cfg_handle.timer_presets.clone();
         ui.horizontal_wrapped(|ui| {
-            for (label, secs) in [("1 мин", 60u64), ("5 мин", 300), ("10 мин", 600), ("15 мин", 900), ("30 мин", 1800), ("1 час", 3600)] {
-                if ui.button(label).clicked() {
-                    self.start_timer(secs);
+            for min in presets {
+                if ui
+                    .button(timer_preset_label(min))
+                    .on_hover_text(format!("Запустить таймер на {min} мин"))
+                    .clicked()
+                {
+                    self.start_timer(min as u64 * 60);
                 }
             }
         });
@@ -4070,6 +4107,63 @@ impl TrackerApp {
                 self.state.sound.stop();
             }
         });
+        // ---------- Правка пресетов (T-17) ----------
+        // Полноценный редактор живёт здесь, а не в оверлее: там у окна
+        // WS_EX_NOACTIVATE нет клавиатуры, цифры с клавиатуры не набрать.
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Пресеты:");
+            ui.label(
+                egui::RichText::new("быстрый запуск — здесь и в развёрнутом оверлее секундомера")
+                    .small()
+                    .weak(),
+            );
+        });
+        let mut edited = self.state.cfg_handle.timer_presets.clone();
+        let mut remove: Option<usize> = None;
+        let mut settle = false;
+        ui.horizontal_wrapped(|ui| {
+            for (i, min) in edited.iter_mut().enumerate() {
+                let r = ui.add_sized(
+                    [76.0, 0.0],
+                    egui::DragValue::new(min)
+                        .range(TIMER_PRESET_MIN..=TIMER_PRESET_MAX)
+                        .suffix(" мин"),
+                );
+                if r.drag_stopped() || r.lost_focus() {
+                    settle = true;
+                }
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Убрать пресет")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Добавить:");
+            time_field(ui, &mut self.state.timer_min, 1440);
+            self.state.timer_min = self.state.timer_min.max(1);
+            if ui.button("+ В пресеты").clicked() {
+                edited.push(self.state.timer_min as u32);
+                settle = true;
+            }
+        });
+        if settle {
+            if let Some(i) = remove {
+                if i < edited.len() {
+                    edited.remove(i);
+                }
+            }
+            self.state.cfg_handle.timer_presets = sanitize_timer_presets(&edited);
+        } else if edited != self.state.cfg_handle.timer_presets {
+            // Правка идёт прямо сейчас: значение уже зажато range, но список
+            // НЕ сортируем и не дедуплицируем — иначе поле уезжает из-под
+            // курсора. Порядок наведём, когда правка закончится.
+            self.state.cfg_handle.timer_presets = edited;
+        }
         ui.horizontal_wrapped(|ui| {
             // Ширина полей — доля строки (как в будильниках): блок не
             // разъезжается на широком мониторе и не ломается на узком.
@@ -5169,6 +5263,17 @@ fn detect_day_preset(days: &[bool; 7]) -> Option<DayPreset> {
         }
     }
     None
+}
+
+/// Подпись пресета таймера: минуты → «15м», «1ч», «1ч30м». Компактно, потому
+/// что в развёрнутом оверлее под все пресеты отведена одна строка.
+fn timer_preset_label(min: u32) -> String {
+    let (h, m) = (min / 60, min % 60);
+    match (h, m) {
+        (0, m) => format!("{m}м"),
+        (h, 0) => format!("{h}ч"),
+        (h, m) => format!("{h}ч{m}м"),
+    }
 }
 
 /// Поле времени с жёстким лимитом: ручной ввод больше max невозможен
@@ -8541,5 +8646,16 @@ mod tests {
         let s = format_lap_line(12, Duration::from_millis(34200), Duration::from_millis(131500));
         assert_eq!(s, "К12 · 00:34.200 · Σ02:11.500");
         assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn timer_preset_labels_are_compact() {
+        // T-17: подписи пресетов в оверлее — короткие, одна строка на все.
+        assert_eq!(timer_preset_label(1), "1м");
+        assert_eq!(timer_preset_label(15), "15м");
+        assert_eq!(timer_preset_label(59), "59м");
+        assert_eq!(timer_preset_label(60), "1ч");
+        assert_eq!(timer_preset_label(90), "1ч30м");
+        assert_eq!(timer_preset_label(1440), "24ч");
     }
 }
