@@ -67,6 +67,10 @@ pub struct AppConfig {
     pub stopwatch_pos: Option<[f32; 2]>,
     #[serde(default)]
     pub strip_pos_manual: Option<[f32; 2]>,
+    /// Позиция главного окна (C4): запоминается при перемещении,
+    /// восстанавливается при старте через ViewportBuilder::with_position.
+    #[serde(default)]
+    pub main_window_pos: Option<[f32; 2]>,
     // --- Состояние интерфейса (автозапоминание всех изменений пользователя) ---
     /// Видимость колонок таблицы сессий: №, %, запускал, сессий.
     #[serde(default = "default_cols4")]
@@ -149,6 +153,7 @@ impl Default for AppConfig {
             steam_synced: false,
             stopwatch_pos: None,
             strip_pos_manual: None,
+            main_window_pos: None,
             show_cols: [true; 4],
             show_analog: true,
             strip_open: false,

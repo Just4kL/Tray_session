@@ -3267,6 +3267,18 @@ impl eframe::App for TrackerApp {
 
         // Модальный диалог подтверждения обновления — поверх всего.
         self.draw_update_dialog(ctx);
+
+        // C4: запоминаем позицию главного окна (восстановим при старте).
+        // Свёрнутое не пишем: его outer_rect — место сворачивания, а не выбор.
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if !minimized {
+            if let Some(min) = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min) {
+                let p = [min.x, min.y];
+                if self.state.cfg_handle.main_window_pos != Some(p) {
+                    self.state.cfg_handle.main_window_pos = Some(p);
+                }
+            }
+        }
     }
 }
 

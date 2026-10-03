@@ -471,6 +471,51 @@ fn main() -> eframe::Result {
         }
     };
 
+/// Убрать остатки updater после неудачных/прибитых прогонов (UPD-2):
+/// `.old`-копии в корне и `_updater_running.exe` в update_tmp.
+/// Только если updater НЕ работает (его mutex свободен) — иначе снесём
+/// файлы живого обновления. Вызывается при старте main (updater выходит
+/// раньше и сюда не доходит).
+#[cfg(windows)]
+fn cleanup_stale_updater_leftovers() {
+    use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::synchapi::CreateMutexW;
+    let name: Vec<u16> = "Local\\TraySession_Updater\0".encode_utf16().collect();
+    let busy = unsafe {
+        let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        let busy = GetLastError() == ERROR_ALREADY_EXISTS;
+        if !h.is_null() {
+            CloseHandle(h);
+        }
+        busy
+    };
+    if busy {
+        return;
+    }
+    let base = crate::update::program_dir();
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for e in entries.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("old") {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    // Отложенное удаление копии через cmd могло не сработать (убили cmd).
+    // Mutex свободен — updater мёртв, файл можно сносить напрямую.
+    let aside = crate::update::tmp_dir(&base).join(crate::update::UPDATER_NAME);
+    let _ = std::fs::remove_file(&aside);
+}
+
+#[cfg(not(windows))]
+fn cleanup_stale_updater_leftovers() {}
+
+    // UPD-2: чистим остатки updater (.old, _updater_running.exe),
+    // только если updater не работает. Updater сюда не доходит.
+    cleanup_stale_updater_leftovers();
+
     // PID главного процесса для updater и --updated-перезапуска
     // (ожидание смерти / завершение владельца C5-mutex). Пишем при
     // каждом старте, до log::init — запись в файл лога не требует.
@@ -513,10 +558,15 @@ fn main() -> eframe::Result {
     let _mon_handle = monitor::spawn_monitor(games.clone(), active.clone(), cfg.clone(), tx_mon);
     spawn_tray(rx_tray, tx_app);
 
+    let mut builder = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 640.0])
+        .with_min_inner_size([720.0, 480.0]);
+    // C4: восстанавливаем запомненную позицию главного окна.
+    if let Some(p) = cfg_handle.main_window_pos {
+        builder = builder.with_position(egui::pos2(p[0], p[1]));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 640.0])
-            .with_min_inner_size([720.0, 480.0])
+        viewport: builder
             // Скрываем из taskbar: сворачивание = «уход в трей», не должно
             // оставлять кнопку в панели задач.
             .with_taskbar(false)
