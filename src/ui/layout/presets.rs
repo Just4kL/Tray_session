@@ -3,23 +3,28 @@
 //! Значения — слепок текущих хардкодов `app.rs`. UI не меняется:
 //! engine (шаг 2) прочитает этот же пресет и построит те же панели.
 
-use super::spec::{LayoutSpec, PageMargin, SideZone, Zone};
+use super::spec::{grid, LayoutSpec, PageMargin, SideZone, Zone};
 
 /// Раскладка как сейчас: навигация 88pt фикс, статус 24pt фикс,
 /// центр flex, поля 5% с клампом 8..60.
 #[allow(dead_code)] // TODO(H1-step-2): потребитель — engine::build_window
 pub fn default_layout() -> LayoutSpec {
+    // H1: размеры зон — в единицах сетки темы (1u = 8pt), а не в
+    // «магических» поинтах: nav 11u = 88pt, status 3u = 24pt.
+    let g = grid();
+    let nav_w = g.u(11.0);
+    let status_h = g.u(3.0);
     LayoutSpec {
         nav: SideZone {
-            default_w: 88.0,
-            min_w: 88.0,
-            max_w: 88.0,
+            default_w: nav_w,
+            min_w: nav_w,
+            max_w: nav_w,
             resizable: false,
             collapse_below: None,
         },
         status: Zone {
-            min_h: 24.0,
-            max_h: 24.0,
+            min_h: status_h,
+            max_h: status_h,
             sticky: true,
             collapse_below: None,
         },

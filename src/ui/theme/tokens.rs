@@ -31,6 +31,29 @@ pub struct Strokes {
 #[derive(Clone, Copy)]
 pub struct Typography { pub body: f32, pub caption: f32, pub heading: f32 }
 
+/// Сетка раскладки (H1): базовый шаг и «блок».
+///
+/// Размеры зон и поля страницы задаются в единицах сетки, а не в
+/// «магических» поинтах: `u(11.0)` читается как «одиннадцать шагов».
+/// Держится в токенах темы, чтобы спека раскладки и скин считали
+/// сетку из одного места.
+#[derive(Clone, Copy)]
+pub struct Grid {
+    /// Базовый шаг сетки, поинты. К нему выравниваются размеры зон
+    /// и поля страницы.
+    pub unit: f32,
+    /// Крупный шаг — «блок» из 8 единиц, поинты.
+    pub block: f32,
+}
+
+impl Grid {
+    /// `n` единиц сетки: `u(11.0)` = 88pt при `unit = 8.0`.
+    pub fn u(self, n: f32) -> f32 { self.unit * n }
+    /// `n` блоков сетки: `b(1.0)` = 64pt при `block = 64.0`.
+    #[allow(dead_code)] // TODO(phase-2): потребитель — крупные блоки раскладки
+    pub fn b(self, n: f32) -> f32 { self.block * n }
+}
+
 #[derive(Clone, Copy)]
 pub struct BgPalette {
     pub surface:        Color32,
@@ -112,5 +135,6 @@ pub struct Tokens {
     pub radii:      Radii,
     pub strokes:    Strokes,
     pub typography: Typography,
+    pub grid:       Grid,
     pub palette:    Palette,
 }

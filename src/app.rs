@@ -5446,8 +5446,15 @@ pub const PAGE_MARGIN_MIN: f32 = 8.0;
 pub const PAGE_MARGIN_MAX: f32 = 60.0;
 
 /// Поля страницы разделов для окна шириной w: одинаковые слева и справа.
+/// Формула живёт в `PageMargin::for_width` (ui/layout/spec.rs) — здесь
+/// только обёртка: две копии формулы уже расходились молча (H1).
 pub fn page_margin(w: f32) -> f32 {
-    (w * PAGE_MARGIN_PCT).clamp(PAGE_MARGIN_MIN, PAGE_MARGIN_MAX)
+    crate::ui::layout::spec::PageMargin {
+        percent: PAGE_MARGIN_PCT,
+        min: PAGE_MARGIN_MIN,
+        max: PAGE_MARGIN_MAX,
+    }
+    .for_width(w)
 }
 
 /// Отступ строк уровня раздела (заголовок, пояснение, разделитель, переключатель
@@ -7983,9 +7990,10 @@ mod tests {
     fn page_margin_symmetric_and_bounded() {
         // 5% на обычном окне.
         assert!((page_margin(960.0) - 48.0).abs() < 0.01);
-        // 6K: 5% съело бы 288 точек — ограничиваем 60.
-        assert_eq!(page_margin(5760.0), 60.0);
-        // Узкое окно: минимум 8.
+        // 6K: 5% съело бы 288 точек — ограничиваем 60, затем выравниваем
+        // по сетке 8pt: ближайший шаг к 60 — это 64.
+        assert_eq!(page_margin(5760.0), 64.0);
+        // Узкое окно: минимум 8 (уже кратен сетке).
         assert_eq!(page_margin(120.0), 8.0);
         // Поля слева и справа одинаковые по определению функции.
         assert_eq!(page_margin(1920.0), page_margin(1920.0));
