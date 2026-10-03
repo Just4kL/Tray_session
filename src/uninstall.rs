@@ -483,6 +483,77 @@ pub fn export_target(args: &[String]) -> PathBuf {
     crate::export::unique_path(&export_dir(args))
 }
 
+fn confirmation_text(base: &Path, args: &[String]) -> String {
+    let mut text = format!(
+        "Удаление Tray Session\n\nПапка программы: {}\n\nБудут удалены история сессий и настройки.",
+        base.display()
+    );
+    match last_export_path(base) {
+        Some(path) => text.push_str(&format!(
+            "\n\nТаблица сессий уже сохранена и останется здесь:\n{}",
+            path.display()
+        )),
+        None => text.push_str(&format!(
+            "\n\nПеред удалением таблица сессий будет сохранена сюда:\n{}",
+            export_target(args).display()
+        )),
+    }
+    text.push_str("\n\nПродолжить?");
+    text
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn show_uninstaller_message(text: &str, caption: &str, flags: u32) -> i32 {
+    use winapi::um::winuser::MessageBoxW;
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = caption.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), flags) }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn show_uninstaller_message(text: &str, caption: &str, _flags: u32) -> i32 {
+    println!("{caption}\n{text}");
+    0
+}
+
+fn confirm_uninstall(base: &Path, args: &[String]) -> bool {
+    let text = confirmation_text(base, args);
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        const MB_YESNO: u32 = 0x0000_0004;
+        const MB_ICONWARNING: u32 = 0x0000_0030;
+        const MB_DEFBUTTON2: u32 = 0x0000_0100;
+        const IDYES: i32 = 6;
+        return show_uninstaller_message(
+            &text,
+            "Удаление Tray Session",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES;
+    }
+    #[cfg(not(all(windows, not(debug_assertions))))]
+    {
+        use std::io::Write;
+        print!("{text}\nВведите y для подтверждения: ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .is_ok_and(|_| matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes" | "д" | "да"))
+    }
+}
+
+fn report_text(report: &UninstallReport) -> String {
+    let mut lines = vec![report.summary()];
+    lines.extend(report.notes.iter().cloned());
+    if !report.failed.is_empty() {
+        lines.push(format!("Не удалось удалить: {}", report.failed.join(", ")));
+    }
+    if !report.kept.is_empty() {
+        lines.push(format!("Остались: {}", report.kept.join(", ")));
+    }
+    lines.join("\n\n")
+}
+
 /// Точка входа деактиватора. Вынесена, чтобы её мог вызвать и `main`,
 /// и тесты.
 pub fn run(args: &[String]) -> i32 {
@@ -493,59 +564,31 @@ pub fn run(args: &[String]) -> i32 {
     let list = args.iter().any(|a| a == "--list");
 
     if list {
-        println!("Будут удалены:");
+        let mut lines = vec!["Будут удалены:".to_string()];
         for f in PROGRAM_FILES.iter().chain(DATA_FILES.iter()) {
             if *f == "_uninstall.exe" {
-                println!("  {f} (самоудаление в конце)");
+                lines.push(format!("  {f} (самоудаление в конце)"));
                 continue;
             }
             let mark = if base.join(f).exists() { "есть" } else { "нет " };
-            println!("  [{mark}] {f}");
+            lines.push(format!("  [{mark}] {f}"));
         }
         for d in DIRS {
             let mark = if base.join(d).exists() { "есть" } else { "нет " };
-            println!("  [{mark}] {d}/");
+            lines.push(format!("  [{mark}] {d}/"));
         }
-        println!("Будет сохранено:");
+        lines.push("Будет сохранено:".to_string());
         for (n, why) in KEEP {
             if base.join(n).exists() {
-                println!("  {n} — {why}");
+                lines.push(format!("  {n} — {why}"));
             }
         }
+        show_uninstaller_message(&lines.join("\n"), "Tray Session — список удаления", 0);
         return 0;
     }
 
     if !quiet {
-        println!("Удаление Tray Session");
-        println!("Каталог: {}", base.display());
-        println!("Будет удалена история игровых сессий и все настройки.");
-        // Сначала про таблицу: решение о ней влияет на то, что человек
-        // потеряет, и должно приниматься до подтверждения удаления.
-        match last_export_path(&base) {
-            Some(p) => {
-                println!();
-                println!("Таблица сессий уже сохранялась: {}", p.display());
-                println!("Она останется на месте — её не удаляем.");
-            }
-            None => {
-                println!();
-                println!("Таблица сессий ни разу не выгружалась.");
-                println!("Перед удалением она будет выгружена в:");
-                println!(
-                    "  {}",
-                    export_target(args).display()
-                );
-            }
-        }
-        print!("Удалить программу? (y/N) ");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let mut s = String::new();
-        if std::io::stdin().read_line(&mut s).is_err() {
-            println!("Отмена.");
-            return 1;
-        }
-        if !matches!(s.trim().to_ascii_lowercase().as_str(), "y" | "yes" | "д" | "да") {
+        if !confirm_uninstall(&base, args) {
             println!("Отменено пользователем.");
             crate::log::info("удаление отменено пользователем");
             return 1;
@@ -553,20 +596,12 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     let report = uninstall_to(&base, Some(&export_dir(args)));
-    println!();
-    println!("{}", report.summary());
-    for n in &report.notes {
-        println!("{n}");
-    }
-    if !report.failed.is_empty() {
-        println!("Не удалось:");
-        for f in &report.failed {
-            println!("  {f}");
-        }
-    }
-    if !report.kept.is_empty() {
-        println!("Сохранено: {}", report.kept.join(", "));
-    }
+    let caption = if report.failed.is_empty() {
+        "Удаление Tray Session завершено"
+    } else {
+        "Удаление завершилось с ошибками"
+    };
+    show_uninstaller_message(&report_text(&report), caption, 0);
     if report.failed.is_empty() { 0 } else { 7 }
 }
 
