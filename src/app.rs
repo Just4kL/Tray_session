@@ -3315,6 +3315,14 @@ impl eframe::App for TrackerApp {
             });
         });
 
+        // Отладочная сетка раскладки (H1): рисуется сразу после главного
+        // окна, слоем Foreground — то есть поверх панелей и диалогов.
+        // Тумблер живёт в «О программе»; в обычной работе выключена.
+        if self.state.cfg_handle.debug_grid {
+            let tokens = self.theme.current().tokens();
+            paint_debug_grid(ctx, tokens.grid, tokens.palette.accent.primary);
+        }
+
         self.windows(ctx);
 
         // Маленькое окошко секундомера поверх всех окон.
@@ -3412,6 +3420,55 @@ impl eframe::App for TrackerApp {
                 }
             }
         }
+    }
+}
+
+/// Отладочная сетка раскладки поверх окна (H1): 8pt и 64pt.
+///
+/// Рисуется слоем `Order::Foreground`, поэтому ложится поверх панелей,
+/// окон и диалогов главного окна, но под тултипы. Принимает шаг сетки и
+/// цвет, а не `&Tokens`: так геометрию (и защиту от нулевого шага) можно
+/// проверить headless-тестом без окна и без темы.
+fn paint_debug_grid(
+    ctx: &egui::Context,
+    g: crate::ui::theme::tokens::Grid,
+    accent: egui::Color32,
+) {
+    // Защита от мусора в токенах: нулевой или нечисловой шаг дал бы
+    // деление на ноль, а `as usize` из бесконечности — бесконечный цикл.
+    if !g.unit.is_finite() || g.unit <= 0.0 || !g.block.is_finite() || g.block <= 0.0 {
+        return;
+    }
+    let rect = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("debug_grid"),
+    ));
+    // Мелкая сетка еле видна (альфа 20/255), крупная заметна (80/255):
+    // цель — проверять выравнивание, а не любоваться линиями.
+    let fine = egui::Stroke::new(
+        1.0_f32,
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 20),
+    );
+    let bold = egui::Stroke::new(
+        1.0_f32,
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 80),
+    );
+    // Крупная линия — каждая N-я мелкая: при unit 8, block 64 это каждая 8-я.
+    let per_block = ((g.block / g.unit).round() as usize).max(1);
+    // Потолок на число линий: окно 8K при шаге 1pt дало бы десятки тысяч
+    // фигур, а это отладочный оверлей, а не повод уронить кадр.
+    let nx = ((rect.width() / g.unit).floor() as usize).min(4096);
+    let ny = ((rect.height() / g.unit).floor() as usize).min(4096);
+    for i in 0..=nx {
+        let x = rect.left() + i as f32 * g.unit;
+        let s = if i % per_block == 0 { bold } else { fine };
+        painter.vline(x, rect.y_range(), s);
+    }
+    for j in 0..=ny {
+        let y = rect.top() + j as f32 * g.unit;
+        let s = if j % per_block == 0 { bold } else { fine };
+        painter.hline(rect.x_range(), y, s);
     }
 }
 
@@ -4674,6 +4731,14 @@ impl TrackerApp {
                     ui.label(egui::RichText::new("Проверяем…").weak());
                 });
             }
+            // Отладка раскладки (H1): сетка 8pt/64pt поверх окна. Живёт
+            // здесь, а не в «Параметрах»: это инструмент разработчика,
+            // и в обычной работе он не должен попадаться на глаза.
+            ui.separator();
+            ui.checkbox(&mut self.state.cfg_handle.debug_grid, "Показать сетку (debug)")
+                .on_hover_text(
+                    "Сетка 8pt и 64pt поверх окна — проверка выравнивания раскладки",
+                );
         });
     }
 
@@ -7997,6 +8062,73 @@ mod tests {
         assert_eq!(page_margin(120.0), 8.0);
         // Поля слева и справа одинаковые по определению функции.
         assert_eq!(page_margin(1920.0), page_margin(1920.0));
+    }
+
+    #[test]
+    fn debug_grid_draws_unit_and_block_lines() {
+        // Оверлей проверяется без окна: egui отдаёт нарисованные фигуры
+        // в FullOutput, поэтому геометрию сетки видно прямо в тесте.
+        use crate::ui::theme::Skin;
+        let skin = crate::ui::theme::default::DefaultSkin::default();
+        let tokens = skin.tokens();
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+        let out = ctx.run(input, |ctx| {
+            paint_debug_grid(ctx, tokens.grid, tokens.palette.accent.primary)
+        });
+
+        let mut v: Vec<(f32, u8)> = Vec::new(); // (координата, альфа)
+        let mut h: Vec<(f32, u8)> = Vec::new();
+        for cs in &out.shapes {
+            let egui::Shape::LineSegment { points, stroke } = &cs.shape else {
+                continue;
+            };
+            let egui::epaint::ColorMode::Solid(color) = &stroke.color else {
+                continue;
+            };
+            assert_eq!(stroke.width, 1.0, "толщина линии сетки");
+            if (points[0].x - points[1].x).abs() < 0.001 {
+                v.push((points[0].x, color.a()));
+            } else {
+                h.push((points[0].y, color.a()));
+            }
+        }
+        // Сетка идёт от края окна: 1920/8 + 1 и 1080/8 + 1 линий.
+        assert_eq!(v.len(), 241, "вертикальных линий 8pt");
+        assert_eq!(h.len(), 136, "горизонтальных линий 8pt");
+        // Крупная линия — каждая восьмая (64pt): альфа 80 против 20.
+        assert_eq!(v.iter().filter(|(_, a)| *a == 80).count(), 31, "линий 64pt по X");
+        assert_eq!(h.iter().filter(|(_, a)| *a == 80).count(), 17, "линий 64pt по Y");
+        // Каждая линия стоит ровно на шаге сетки от края окна.
+        for (x, _) in &v {
+            assert_eq!(x % 8.0, 0.0, "вертикальная линия не на сетке: {x}");
+        }
+        for (y, _) in &h {
+            assert_eq!(y % 8.0, 0.0, "горизонтальная линия не на сетке: {y}");
+        }
+    }
+
+    #[test]
+    fn debug_grid_ignores_broken_tokens() {
+        // Нулевой шаг не должен превращаться в бесконечный цикл:
+        // функция обязана просто ничего не рисовать.
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1080.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            let broken = crate::ui::theme::tokens::Grid { unit: 0.0, block: 64.0 };
+            paint_debug_grid(ctx, broken, egui::Color32::WHITE);
+        });
+        assert!(
+            out.shapes.is_empty(),
+            "при нулевом шаге сетка не должна рисоваться"
+        );
     }
 
     #[test]

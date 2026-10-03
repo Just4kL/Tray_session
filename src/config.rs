@@ -135,6 +135,11 @@ pub struct AppConfig {
     /// Последняя открытая вкладка.
     #[serde(default = "default_last_tab")]
     pub last_tab: String,
+    /// Отладочная сетка раскладки (8pt/64pt) поверх окна. По умолчанию
+    /// выключена: это инструмент проверки выравнивания зон, а не режим
+    /// работы, и в обычной работе он только мешает читать интерфейс.
+    #[serde(default)]
+    pub debug_grid: bool,
     // --- Обновления ---
     /// Как часто проверять свежие сборки: 0 — каждый час, 1 — ежедневно,
     /// 2 — раз в неделю, 3 — вручную (код хранится числом, чтобы старые
@@ -201,6 +206,7 @@ impl Default for AppConfig {
             timer_min: 10,
             timer_presets: default_timer_presets(),
             last_tab: "sessions".to_string(),
+            debug_grid: false,
             update_freq: default_update_freq(),
             update_auto: default_update_auto(),
             update_silent: false,
@@ -354,6 +360,9 @@ impl AppConfig {
                         if let Some(s) = v.get("last_tab").and_then(|x| x.as_str()) {
                             cfg.last_tab = s.to_string();
                         }
+                        if let Some(b) = v.get("debug_grid").and_then(|x| x.as_bool()) {
+                            cfg.debug_grid = b;
+                        }
                         // Настройки обновлений. Раньше они вообще не читались
                         // при загрузке: человек выбирал частоту или канал,
                         // нажимал «Сохранить» — а после перезапуска всё
@@ -423,6 +432,7 @@ impl AppConfig {
             "timer_min": self.timer_min,
             "timer_presets": self.timer_presets,
             "last_tab": self.last_tab,
+            "debug_grid": self.debug_grid,
             // Настройки обновлений. Их не было в списке: человек менял
             // частоту или канал, нажимал «Сохранить», а файл их не содержал
             // — при перезапуске всё возвращалось к умолчанию без всякого
@@ -581,5 +591,25 @@ mod tests {
         fs::write(&p3, "{\"timer_presets\": [15, \"x\", 5]}").unwrap();
         assert_eq!(AppConfig::load_from(&p3).timer_presets, vec![5, 15]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_grid_defaults_off_and_survives_a_roundtrip() {
+        // По умолчанию сетка выключена: это отладка, а не режим работы.
+        assert!(!AppConfig::default().debug_grid);
+        let dir = std::env::temp_dir().join(format!("gst_cfg_grid_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let cfg = AppConfig { debug_grid: true, ..Default::default() };
+        cfg.save_to(&path);
+        assert!(AppConfig::load_from(&path).debug_grid, "флаг не пережил save/load");
+        let _ = fs::remove_dir_all(&dir);
+        // Старый config.json без ключа не должен включать сетку.
+        let dir2 = std::env::temp_dir().join(format!("gst_cfg_grid_old_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir2);
+        let old = dir2.join("config.json");
+        fs::write(&old, "{\"timer_min\": 7}").unwrap();
+        assert!(!AppConfig::load_from(&old).debug_grid, "старый конфиг включил сетку");
+        let _ = fs::remove_dir_all(&dir2);
     }
 }
