@@ -24,73 +24,21 @@ use app_state::{AppCmd, TrayCmd};
 use config::AppConfig;
 use std::sync::{mpsc, Arc, RwLock};
 
-/// Иконка программы: скруглённый квадрат в акцентном цвете темы Steam
-/// (#66C0F4) с белым «треугольникомplay» по центру — узнаётся и в трее
-/// (16–32 px), и в заголовке окна.
-///
-/// Раньше в трее рисовался безликий зелёный квадрат, а у окна стояла
-/// системная иконка по умолчанию — программа выглядела «не своей».
-/// Теперь это одна и та же картинка в обоих местах.
+/// Значок приложения из набора assets/icons, используемый окном и треем.
 pub fn build_app_icon(size: u32) -> Vec<u8> {
-    let w = size;
-    let h = size;
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    // Радиус скругления ~22% от стороны.
-    let r = (w as f32) * 0.22;
-    let cx = w as f32 / 2.0;
-    let cy = h as f32 / 2.0;
-    // Треугольник (play) в центре.
-    let tri_h = h as f32 * 0.34;
-    let tri_w = tri_h * 0.86;
-    for y in 0..h {
-        for x in 0..w {
-            let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-            // Скругление: вне радиуса углов — прозрачно.
-            let in_corner = (cx - fx).abs() > cx - r && (cy - fy).abs() > cy - r;
-            let outside = if in_corner {
-                let qx = (cx - fx).abs() - (cx - r);
-                let qy = (cy - fy).abs() - (cy - r);
-                qx.max(0.0).powi(2) + qy.max(0.0).powi(2) > r * r
-            } else {
-                false
-            };
-            if outside {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            // Треугольник: вершины (cx - tri_w/2, cy - tri_h/2),
-            // (cx - tri_w/2, cy + tri_h/2), (cx + tri_w/2, cy).
-            let x0 = cx - tri_w / 2.0;
-            let x1 = cx + tri_w / 2.0;
-            let y0 = cy - tri_h / 2.0;
-            let y1 = cy + tri_h / 2.0;
-            let inside_tri = {
-                // Точка внутри треугольника, если знаки векторных
-                // произведений по всем трём рёбрам совпадают. Проверка
-                // знаков, а не «>= 0», — чтобы не зависеть от порядка
-                // обхода вершин (он инвертирован, т.к. y растёт вниз).
-                let cross = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| {
-                    (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)
-                };
-                let p = (fx, fy);
-                let d1 = cross((x0, y0), (x0, y1), p);
-                let d2 = cross((x0, y1), (x1, cy), p);
-                let d3 = cross((x1, cy), (x0, y0), p);
-                let s = |v: f32| if v > 0.0 {
-                    1
-                } else if v < 0.0 {
-                    -1
-                } else {
-                    0
-                };
-                s(d1) == s(d2) && s(d2) == s(d3) && s(d1) != 0
-            };
-            if inside_tri {
-                rgba.extend_from_slice(&[0xFF, 0xFF, 0xFF, 255]);
-            } else {
-                rgba.extend_from_slice(&[0x66, 0xC0, 0xF4, 255]);
-            }
+    const ICON_SIZE: usize = 32;
+    let source = include_bytes!("../assets/icons/app/logo.rgba");
+    if size == ICON_SIZE as u32 {
+        return source.to_vec();
+    }
+    let size = size as usize;
+    let mut rgba = Vec::with_capacity(size.saturating_mul(size).saturating_mul(4));
+    for y in 0..size {
+        for x in 0..size {
+            let sx = x * ICON_SIZE / size.max(1);
+            let sy = y * ICON_SIZE / size.max(1);
+            let offset = (sy * ICON_SIZE + sx) * 4;
+            rgba.extend_from_slice(&source[offset..offset + 4]);
         }
     }
     rgba

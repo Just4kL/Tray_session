@@ -319,10 +319,7 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
 
 /// Пункты боковой навигации: вкладка, иконка, подпись.
 ///
-/// Иконки рисуются ВЕКТОРОМ (`nav_icon_shapes`) в духе Material: сетка
-/// 24dp, обводка 2dp, скруглённые концы. Растровые PNG выглядели
-/// «пластиковыми» заливками и мылились при масштабировании, поэтому
-/// assets больше не используются.
+/// Цветные пиктограммы из единого набора приложения.
 const NAV_ITEMS: [(Tab, &str); 6] = [
     (Tab::Sessions, "Сессии"),
     (Tab::Games, "Игры"),
@@ -332,189 +329,52 @@ const NAV_ITEMS: [(Tab, &str); 6] = [
     (Tab::About, "О программе"),
 ];
 
-/// Толщина обводки иконки в системе координат 24dp — как в Material (2dp).
-pub const ICON_STROKE: f32 = 2.0;
+const NAV_ICON_SIZE: usize = 48;
 
-/// Геометрия иконки раздела в нормализованной сетке 24×24.
-///
-/// Возвращает список фигур: контуры (`closed` = замкнуть) и заливки.
-/// Сделано чистой функцией без `egui::Painter`, чтобы тесты могли
-/// проверить, что иконка не выходит за свою клетку и не пустая.
-fn nav_icon_shapes(tab: Tab) -> Vec<IconShape> {
-    // Ось Y вниз, начало — левый верхний угол клетки 24×24.
-    let line = |pts: &[(f32, f32)]| IconShape::Line(pts.to_vec());
+fn nav_icon_pixels(tab: Tab) -> &'static [u8] {
     match tab {
-        // Сессии: play-треугольник в круге (контур круга + заливка знака).
-        Tab::Sessions => vec![
-            IconShape::Circle { c: (12.0, 12.0), r: 9.0, filled: false, knockout: false },
-            IconShape::Poly {
-                pts: vec![(9.5, 8.0), (9.5, 16.0), (16.0, 12.0)],
-                fill: true,
-                knockout: false,
-            },
-        ],
-        // Игры: геймпад. Корпус ЗАЛИТ, а крестовина и кнопки «прорезаны»
-        // фоном — в контуре на 22px детали сливались в нечитаемую кляксу,
-        // а заливка с прорезями держит форму при любом размере.
-        Tab::Games => vec![
-            IconShape::Poly {
-                pts: vec![
-                    (6.5, 8.5), (9.5, 7.5), (14.5, 7.5), (17.5, 8.5),
-                    (20.5, 11.0), (21.0, 15.0), (18.5, 16.0), (16.0, 13.0),
-                    (8.0, 13.0), (5.5, 16.0), (3.0, 15.0), (3.5, 11.0),
-                ],
-                fill: true,
-                knockout: false,
-            },
-            // Крестовина d-pad — прорезью.
-            IconShape::Poly {
-                pts: vec![
-                    (5.8, 9.8), (7.2, 9.8), (7.2, 10.7), (8.1, 10.7),
-                    (8.1, 12.1), (7.2, 12.1), (7.2, 13.0), (5.8, 13.0),
-                    (5.8, 12.1), (4.9, 12.1), (4.9, 10.7), (5.8, 10.7),
-                ],
-                fill: true,
-                knockout: true,
-            },
-            // Две кнопки справа — прорезью.
-            IconShape::Circle { c: (15.8, 10.2), r: 1.05, filled: true, knockout: true },
-            IconShape::Circle { c: (18.0, 11.6), r: 1.05, filled: true, knockout: true },
-        ],
-        // Будильники: колокол с язычком.
-        Tab::Alarms => vec![
-            IconShape::Poly {
-                pts: vec![
-                    (12.0, 3.0), (8.5, 5.0), (6.5, 8.5), (5.5, 12.0),
-                    (3.5, 15.0), (5.0, 16.5), (19.0, 16.5), (20.5, 15.0),
-                    (18.5, 12.0), (17.5, 8.5), (15.5, 5.0),
-                ],
-                fill: false,
-                knockout: false,
-            },
-            line(&[(10.0, 19.0), (14.0, 19.0)]),
-        ],
-        // Таймер: циферблат со стрелками.
-        Tab::Timer => vec![
-            IconShape::Circle { c: (12.0, 12.0), r: 9.0, filled: false, knockout: false },
-            line(&[(12.0, 7.0), (12.0, 12.0)]),
-            line(&[(12.0, 12.0), (15.5, 14.5)]),
-        ],
-        // Параметры: три ползунка — настройки.
-        Tab::Shortcuts => vec![
-            line(&[(4.0, 7.0), (20.0, 7.0)]),
-            line(&[(4.0, 12.0), (20.0, 12.0)]),
-            line(&[(4.0, 17.0), (20.0, 17.0)]),
-            IconShape::Poly {
-                pts: vec![(7.0, 5.0), (9.0, 5.0), (9.0, 9.0), (7.0, 9.0)],
-                fill: true,
-                knockout: false,
-            },
-            IconShape::Poly {
-                pts: vec![(15.0, 10.0), (17.0, 10.0), (17.0, 14.0), (15.0, 14.0)],
-                fill: true,
-                knockout: false,
-            },
-            IconShape::Poly {
-                pts: vec![(10.0, 15.0), (12.0, 15.0), (12.0, 19.0), (10.0, 19.0)],
-                fill: true,
-                knockout: false,
-            },
-        ],
-        // О программе: буква «i» в круге.
-        Tab::About => vec![
-            IconShape::Circle { c: (12.0, 12.0), r: 9.0, filled: false, knockout: false },
-            line(&[(12.0, 11.0), (12.0, 16.5)]),
-            IconShape::Circle { c: (12.0, 7.5), r: 1.2, filled: true, knockout: false },
-        ],
+        Tab::Sessions => include_bytes!("../assets/icons/nav/sessions.rgba"),
+        Tab::Games => include_bytes!("../assets/icons/nav/games.rgba"),
+        Tab::Alarms => include_bytes!("../assets/icons/nav/alarms.rgba"),
+        Tab::Timer => include_bytes!("../assets/icons/nav/timer.rgba"),
+        Tab::Shortcuts => include_bytes!("../assets/icons/nav/settings.rgba"),
+        Tab::About => include_bytes!("../assets/icons/nav/about.rgba"),
     }
 }
 
-/// Одна фигура иконки в сетке 24×24.
-#[derive(Debug, Clone, PartialEq)]
-pub enum IconShape {
-    /// Ломаная: рисуется обводкой цветом иконки; ровно 2 или 4 точки.
-    Line(Vec<(f32, f32)>),
-    /// Ломаная из 3+ точек; `fill` = залить, иначе замкнуть контур.
-    /// `knockout` = залить ФОНОМ (прорезь в залитой фигуре).
-    Poly { pts: Vec<(f32, f32)>, fill: bool, knockout: bool },
-    /// Круг: контур или заливка; `knockout` = заливка фоном.
-    Circle { c: (f32, f32), r: f32, filled: bool, knockout: bool },
-}
-
-impl IconShape {
-    /// Все точки фигуры в сетке 24×24 (для проверки попадания в клетку).
-    /// Нужно только тестам геометрии иконок.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn points(&self) -> Vec<(f32, f32)> {
-        match self {
-            IconShape::Line(p) | IconShape::Poly { pts: p, .. } => p.clone(),
-            IconShape::Circle { c, r, .. } => {
-                let (cx, cy) = *c;
-                // 4 крайние точки по кресту — этого достаточно, чтобы
-                // проверить, что круг не вылезает за клетку.
-                vec![
-                    (cx - r, cy - r),
-                    (cx + r, cy - r),
-                    (cx + r, cy + r),
-                    (cx - r, cy + r),
-                ]
-            }
-        }
+fn nav_icon_index(tab: Tab) -> usize {
+    match tab {
+        Tab::Sessions => 0,
+        Tab::Games => 1,
+        Tab::Alarms => 2,
+        Tab::Timer => 3,
+        Tab::Shortcuts => 4,
+        Tab::About => 5,
     }
 }
 
-/// Нарисовать иконку раздела в прямоугольнике `rect` цветом `color`.
-///
-/// Иконка рисуется по сетке 24×24, масштабируется в `rect` и красится
-/// обводкой `ICON_STROKE` (в тех же единицах), поэтому линии остаются
-/// одинаковой толщины при любом размере.
-///
-/// `bg` — цвет подложки: им прорезаются детали внутри залитых фигур
-/// (геймпад). Он должен совпадать с фоном, на котором лежит иконка.
-fn paint_nav_icon(
-    p: &egui::Painter,
-    rect: egui::Rect,
-    tab: Tab,
-    color: egui::Color32,
-    bg: egui::Color32,
-) {
-    let k = rect.width() / 24.0;
-    let to_screen = |x: f32, y: f32| egui::pos2(rect.min.x + x * k, rect.min.y + y * k);
-    let stroke = egui::Stroke::new(ICON_STROKE * k, color);
-    let shapes: Vec<egui::Shape> = nav_icon_shapes(tab)
-        .into_iter()
-        .map(|s| match s {
-            IconShape::Line(p) => {
-                let pts: Vec<egui::Pos2> = p.iter().map(|&(x, y)| to_screen(x, y)).collect();
-                egui::Shape::line(pts, stroke)
-            }
-            IconShape::Poly { pts, fill, knockout } => {
-                let sp: Vec<egui::Pos2> =
-                    pts.iter().map(|&(x, y)| to_screen(x, y)).collect();
-                if fill {
-                    let c = if knockout { bg } else { color };
-                    egui::Shape::convex_polygon(sp, c, egui::Stroke::NONE)
-                } else {
-                    egui::Shape::closed_line(sp, stroke)
-                }
-            }
-            IconShape::Circle { c, r, filled, knockout } => {
-                let center = to_screen(c.0, c.1);
-                let rad = r * k;
-                if filled {
-                    let col = if knockout { bg } else { color };
-                    egui::Shape::circle_filled(center, rad, col)
-                } else {
-                    egui::Shape::circle_stroke(center, rad, stroke)
-                }
-            }
-        })
-        .collect();
-    // Обрезка по клетке иконки: иконка не должна «вылезать» на подпись.
-    let clip = p.with_clip_rect(rect);
-    for s in shapes {
-        clip.add(s);
+type NavIconCache = [Option<egui::TextureHandle>; 6];
+
+fn paint_nav_icon(ui: &mut egui::Ui, rect: egui::Rect, tab: Tab, cache: &mut NavIconCache) {
+    let index = nav_icon_index(tab);
+    if cache[index].is_none() {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [NAV_ICON_SIZE, NAV_ICON_SIZE],
+            nav_icon_pixels(tab),
+        );
+        cache[index] = Some(ui.ctx().load_texture(
+            format!("nav-icon-{index}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        ));
     }
+    let texture_id = cache[index].as_ref().expect("icon loaded").id();
+    ui.painter().image(
+        texture_id,
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 
 /// Растеризовать результат `Context::tessellate` в RGBA-буфер.
@@ -1141,6 +1001,7 @@ pub struct TrackerApp {
     /// (переключатель скинов), пока висит `None`.
     #[allow(dead_code)] // TODO(phase-1.4): читать при смене скина в update()
     last_skin_id: Option<&'static str>,
+    nav_icons: NavIconCache,
 }
 
 impl TrackerApp {
@@ -1294,6 +1155,7 @@ impl TrackerApp {
                 crate::ui::theme::default::DefaultSkin::default(),
             )),
             last_skin_id: None,
+            nav_icons: std::array::from_fn(|_| None),
         };
         app.refresh_agg();
         app.refresh_alarms();
@@ -3489,7 +3351,7 @@ fn paint_debug_grid(
 }
 
 impl TrackerApp {
-    /// Кнопка навигации сайдбара: векторная иконка + подпись.
+    /// Кнопка навигации сайдбара: цветная иконка + подпись.
     ///
     /// Состояния как в Material Design: покой (только акцентная полоска) →
     /// наведение (слой +12% акцента) → нажатие (слой +24%, иконка
@@ -3532,24 +3394,14 @@ impl TrackerApp {
                 );
                 ui.painter().rect_filled(bar, 1.5, p.fg);
             }
-            // Иконка 22×22 по центру верхней части кнопки. Векторная, рисуется
-            // цветом состояния — единообразно с подписью.
-            let icon_size = 22.0;
+            // Иконки сохраняют исходные цвета; выбранный раздел выделяет
+            // подложка кнопки и акцентная полоска.
+            let icon_size = 25.0;
             let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.center().x, rect.top() + 8.0 + icon_size / 2.0),
                 egui::vec2(icon_size, icon_size),
             );
-            // При нажатии иконка слегка притухает (Material «state layer»).
-            let tint = if p.pressed {
-                blend(p.fg, ui.visuals().panel_fill, 0.25)
-            } else {
-                p.fg
-            };
-            // Фон под иконкой = подложка кнопки поверх панели: он же нужен
-            // для «прорезей» внутри залитых иконок (геймпад).
-            let icon_bg = blend(p.bg, ui.visuals().panel_fill, 0.0);
-            let icon_bg = if icon_bg.a() == 0 { ui.visuals().panel_fill } else { icon_bg };
-            paint_nav_icon(ui.painter(), icon_rect, tab, tint, icon_bg);
+            paint_nav_icon(ui, icon_rect, tab, &mut self.nav_icons);
             ui.painter().text(
                 rect.center_bottom() - egui::vec2(0.0, 12.0),
                 egui::Align2::CENTER_CENTER,
@@ -7009,6 +6861,7 @@ mod tests {
         ctx.set_pixels_per_point(1.0);
         let ppp = 1.0_f32;
         let vis = DefaultSkin::default().egui_style().visuals;
+        let mut icon_cache: NavIconCache = std::array::from_fn(|_| None);
         let shapes: Vec<egui::epaint::ClippedShape> = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -7055,14 +6908,13 @@ mod tests {
                             );
                             // Сама иконка: белая, на тёмном фоне — контрастно.
                             paint_nav_icon(
-                                ui.painter(),
+                                ui,
                                 egui::Rect::from_min_size(
                                     origin + egui::vec2(8.0, 8.0),
                                     egui::vec2(cell - 16.0, cell - 16.0),
                                 ),
                                 *tab,
-                                egui::Color32::WHITE,
-                                vis.panel_fill,
+                                &mut icon_cache,
                             );
                             let _ = label;
                         }
@@ -7093,6 +6945,7 @@ mod tests {
         // Раскладка: 4 колонки состояний кнопки × строки.
         let (w, h) = (900.0_f32, 420.0_f32);
         let ctx = egui::Context::default();
+        let mut icon_cache: NavIconCache = std::array::from_fn(|_| None);
         ctx.set_style(egui::Style {
             visuals: DefaultSkin::default().egui_style().visuals,
             ..Default::default()
@@ -7159,14 +7012,13 @@ mod tests {
                                         egui::Sense::hover(),
                                     ).0;
                                     paint_nav_icon(
-                                        ui.painter(),
+                                        ui,
                                         egui::Rect::from_center_size(
                                             egui::pos2(r.center().x, r.center().y - 8.0),
                                             egui::vec2(28.0, 28.0),
                                         ),
                                         tab,
-                                        egui::Color32::from_rgb(0x9A, 0xA4, 0xAF),
-                                        DefaultSkin::default().egui_style().visuals.panel_fill,
+                                        &mut icon_cache,
                                     );
                                     ui.painter().text(
                                         r.center() + egui::vec2(0.0, 22.0),
@@ -7206,14 +7058,13 @@ mod tests {
                                     ui.painter().rect_filled(bar, 1.5, p.fg);
                                 }
                                 paint_nav_icon(
-                                    ui.painter(),
+                                    ui,
                                     egui::Rect::from_center_size(
                                         egui::pos2(rect.center().x, rect.top() + 8.0 + 11.0),
                                         egui::vec2(22.0, 22.0),
                                     ),
                                     Tab::Sessions,
-                                    p.fg,
-                                    DefaultSkin::default().egui_style().visuals.panel_fill,
+                                    &mut icon_cache,
                                 );
                                 ui.painter().text(
                                     rect.center_bottom() - egui::vec2(0.0, 12.0),
@@ -7872,14 +7723,13 @@ mod tests {
 
     #[test]
     fn all_navigation_items_have_icons() {
-        // Все 6 разделов идут с иконкой и непустой подписью. Пропущенная
-        // иконка тихо превратилась бы в пустую кнопку.
+        // Все разделы должны иметь полноценный RGBA значок.
         assert_eq!(NAV_ITEMS.len(), 6);
         for (t, label) in NAV_ITEMS {
             assert!(!label.trim().is_empty(), "{t:?}: пустая подпись");
             assert!(
-                !nav_icon_shapes(t).is_empty(),
-                "{t:?}: иконка без фигур"
+                nav_icon_pixels(t).len() == NAV_ICON_SIZE * NAV_ICON_SIZE * 4,
+                "{t:?}: неверный размер RGBA иконки"
             );
         }
         // Разделы не должны повторяться.
@@ -7890,75 +7740,11 @@ mod tests {
     }
 
     #[test]
-    fn nav_icons_fit_their_cell() {
-        // Геометрия задана в сетке 24×24: всё, что рисуется, должно лежать
-        // внутри клетки (с учётом обводки), иначе иконка вылезет на подпись
-        // или обрежется краем кнопки.
-        const CELL: f32 = 24.0;
+    fn nav_icon_assets_have_visible_pixels() {
         for (tab, _) in NAV_ITEMS {
-            for shape in nav_icon_shapes(tab) {
-                for (x, y) in shape.points() {
-                    assert!(
-                        x >= -0.01 && x <= CELL + 0.01 && y >= -0.01 && y <= CELL + 0.01,
-                        "{tab:?}: точка ({x}, {y}) выходит за клетку {CELL}×{CELL}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn nav_icons_are_outline_style() {
-        // Material: иконки контурные, обводка 2dp в сетке 24dp. Проверяем,
-        // что толщина не «съедает» мелкие фигуры и не нулевая.
-        assert_eq!(ICON_STROKE, 2.0);
-        for (tab, _) in NAV_ITEMS {
-            let shapes = nav_icon_shapes(tab);
-            // Заливка без прорезей — это «пластиковая» клякса, а не иконка.
-            let knockout = shapes
-                .iter()
-                .any(|s| matches!(s, IconShape::Poly { knockout: true, .. }
-                    | IconShape::Circle { knockout: true, .. }));
-            // Контурная часть обязательна.
-            let has_outline = shapes.iter().any(|s| match s {
-                IconShape::Line(_) => true,
-                IconShape::Poly { fill, .. } => !fill,
-                IconShape::Circle { filled, .. } => !filled,
-            });
-            // Или контур есть, или заливка «прорезана» деталями — третьего
-            // (глухая заливка) быть не должно.
-            assert!(
-                has_outline || knockout,
-                "{tab:?}: глухая заливка без прорезей и без контура"
-            );
-            // Геймпад — единственная залитая иконка: она специально залита с
-            // прорезями, иначе на 22px детали сливались.
-            if tab == Tab::Games {
-                assert!(
-                    knockout,
-                    "геймпад должен быть залит с прорезями: на 22px контур не читается"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn nav_icons_have_no_degenerate_geometry() {
-        // Ни одна фигура не должна схлопнуться в точку или иметь NaN —
-        // иначе в кадре появляются артефакты.
-        for (tab, _) in NAV_ITEMS {
-            for shape in nav_icon_shapes(tab) {
-                for (x, y) in shape.points() {
-                    assert!(
-                        x.is_finite() && y.is_finite(),
-                        "{tab:?}: нечисловая координата ({x}, {y})"
-                    );
-                }
-                // Ломаная из одной точки не рисуется — брак геометрии.
-                if let IconShape::Line(p) | IconShape::Poly { pts: p, .. } = &shape {
-                    assert!(p.len() >= 2, "{tab:?}: ломаная из одной точки");
-                }
-            }
+            let pixels = nav_icon_pixels(tab);
+            assert_eq!(pixels.len(), NAV_ICON_SIZE * NAV_ICON_SIZE * 4);
+            assert!(pixels.chunks_exact(4).any(|px| px[3] != 0), "{tab:?}: иконка прозрачная");
         }
     }
 
