@@ -1,9 +1,9 @@
 use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateDialogState, UpdateInfo};
 use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, sanitize_timer_presets, save_known_games, AppConfig, TrackedGame, TIMER_PRESET_MAX, TIMER_PRESET_MIN};
 use crate::ui::{theme::{tokens::Tokens, ThemeManager}, views::Views, widgets::status_dot};
-use crate::db::{AlarmRow, Db};
+use crate::db::{AggRow, AlarmRow, Db};
 use crate::detector;
-use crate::gpu::query_gpu;
+use crate::gpu::{query_gpu, GpuSnapshot};
 use crate::monitor::{ActiveInfo, MonitorEvent, SharedActive, SharedConfig, SharedGames};
 use crate::shortcuts::{action_label, Shortcut, ShortcutStore};
 use crate::sound::SoundPlayer;
@@ -25,6 +25,43 @@ pub const ISSUE_URL: &str = "https://example.com/issues";
 pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
 /// Заголовок тонкой полоски сессии.
 pub const STRIP_TITLE: &str = "Сессия — Tray Session";
+
+/// Постоянный поток для блокирующей работы. Результат будит UI, чтобы он
+/// обработался, даже когда окно в остальное время простаивает.
+struct BackgroundWorker<T> {
+    request_tx: mpsc::SyncSender<Option<egui::Context>>,
+    result_rx: mpsc::Receiver<T>,
+}
+
+impl<T: Send + 'static> BackgroundWorker<T> {
+    fn spawn(mut work: impl FnMut() -> T + Send + 'static) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<Option<egui::Context>>(1);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(ctx) = request_rx.recv() {
+                let result = work();
+                if result_tx.send(result).is_err() {
+                    break;
+                }
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            }
+        });
+        Self {
+            request_tx,
+            result_rx,
+        }
+    }
+
+    fn request(&self, ctx: Option<&egui::Context>) -> bool {
+        self.request_tx.try_send(ctx.cloned()).is_ok()
+    }
+
+    fn try_recv(&self) -> Result<T, mpsc::TryRecvError> {
+        self.result_rx.try_recv()
+    }
+}
 
 const CHANGELOG: &[(&str, &str, &[&str])] = &[
     ("0.7.35", "2026-10-02", &[
@@ -1143,6 +1180,12 @@ pub struct TrackerApp {
     last_skin_id: Option<&'static str>,
     /// Последнее применённое значение пользовательского масштаба.
     last_applied_scale: Option<f32>,
+    agg_worker: BackgroundWorker<Vec<AggRow>>,
+    agg_refresh_pending: bool,
+    agg_refresh_again: bool,
+    gpu_worker: BackgroundWorker<GpuSnapshot>,
+    gpu_query_pending: bool,
+    repaint_ctx: Option<egui::Context>,
 }
 
 impl TrackerApp {
@@ -1173,6 +1216,11 @@ impl TrackerApp {
                 }
             })
             .unwrap_or_default();
+        let agg_worker = {
+            let db = Arc::clone(&db);
+            BackgroundWorker::spawn(move || db.aggregated())
+        };
+        let gpu_worker = BackgroundWorker::spawn(query_gpu);
         let mut app = Self {
             state: AppState {
                 db,
@@ -1297,8 +1345,13 @@ impl TrackerApp {
             )),
             last_skin_id: None,
             last_applied_scale: None,
+            agg_worker,
+            agg_refresh_pending: false,
+            agg_refresh_again: false,
+            gpu_worker,
+            gpu_query_pending: false,
+            repaint_ctx: None,
         };
-        app.refresh_agg();
         app.refresh_alarms();
         // Время в форме добавления: запомненное, а не текущее.
         app
@@ -1340,8 +1393,47 @@ impl TrackerApp {
     }
 
     fn refresh_agg(&mut self) {
-        self.state.agg = self.state.db.aggregated();
-        self.state.last_agg_refresh = Instant::now();
+        if self.agg_refresh_pending {
+            self.agg_refresh_again = true;
+            return;
+        }
+        if self.agg_worker.request(self.repaint_ctx.as_ref()) {
+            self.agg_refresh_pending = true;
+            self.state.last_agg_refresh = Instant::now();
+        }
+    }
+
+    fn poll_background_results(&mut self) {
+        match self.agg_worker.try_recv() {
+            Ok(rows) => {
+                self.state.agg = rows;
+                self.state.last_agg_refresh = Instant::now();
+                self.agg_refresh_pending = false;
+                if self.agg_refresh_again {
+                    self.agg_refresh_again = false;
+                    self.refresh_agg();
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.agg_refresh_pending = false;
+                self.agg_refresh_again = false;
+                self.state.last_agg_refresh = Instant::now();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        match self.gpu_worker.try_recv() {
+            Ok(snapshot) => {
+                self.state.gpu_usable_cache = snapshot.usable;
+                self.state.gpu_util_cache = snapshot.gpu_util_pct;
+                self.gpu_query_pending = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.gpu_query_pending = false;
+                self.state.last_gpu_check = Instant::now();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     /// Применить масштаб интерфейса и сохранить в config.json.
@@ -3023,10 +3115,11 @@ impl TrackerApp {
             self.spawn_autoscan();
         }
         // GPU-кэш для вкладки Активные
-        if self.state.last_gpu_check.elapsed() > Duration::from_secs(5) {
-            let snap = query_gpu();
-            self.state.gpu_usable_cache = snap.usable;
-            self.state.gpu_util_cache = snap.gpu_util_pct;
+        if !self.gpu_query_pending
+            && self.state.last_gpu_check.elapsed() > Duration::from_secs(5)
+            && self.gpu_worker.request(self.repaint_ctx.as_ref())
+        {
+            self.gpu_query_pending = true;
             self.state.last_gpu_check = Instant::now();
         }
     }
@@ -3107,6 +3200,8 @@ impl TrackerApp {
 
 impl eframe::App for TrackerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.repaint_ctx = Some(ctx.clone());
+        self.poll_background_results();
         self.poll_monitor();
         self.poll_appcmd(ctx);
         self.check_alarms_timer();
