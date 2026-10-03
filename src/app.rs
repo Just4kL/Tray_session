@@ -2592,17 +2592,34 @@ impl TrackerApp {
     /// сейчас или где курсор. Итоговые координаты зажаты внутрь рабочей
     /// области монитора, чтобы полоска не вылезала за край экрана.
     fn snap_strip_now(&mut self, c: &egui::Context, vp_id: egui::ViewportId) {
-        // Сетка 3×3 считается в пикселях экрана, поэтому размер окна
-        // переводим из поинтов в пиксели через ppp.
-        let ppp = c.pixels_per_point();
-        let pts = strip_window_size();
-        let size = egui::vec2(pts.x * ppp, pts.y * ppp);
+        // T-15b: вся математика — В ПОИНТАХ. egui-winit умножает
+        // OuterPosition на ppp ещё раз (0.28 lib.rs:1370), поэтому слать
+        // надо поинты: work area делим на ppp, размер берём как есть
+        // (strip_window_size уже в поинтах), ручная позиция
+        // (outer_rect.min) тоже в поинтах. Раньше слали физические
+        // пиксели — при ppp>1 окно приземлялось в ppp раз дальше и
+        // уходило за экран (при ui_scale 1.3 — всегда).
+        // ppp — именно стрип-вьюпорта (параметр c), не главного окна:
+        // на мульти-DPI они могут различаться.
+        let ppp = c.pixels_per_point().max(0.01);
+        let size = strip_window_size();
         #[cfg(windows)]
         {
-            let mons = enum_monitor_work_areas();
-            if mons.is_empty() {
+            let mons_px = enum_monitor_work_areas();
+            if mons_px.is_empty() {
                 return;
             }
+            let mons: Vec<(i32, i32, i32, i32)> = mons_px
+                .iter()
+                .map(|(l, t, r, b)| {
+                    (
+                        (*l as f32 / ppp).round() as i32,
+                        (*t as f32 / ppp).round() as i32,
+                        (*r as f32 / ppp).round() as i32,
+                        (*b as f32 / ppp).round() as i32,
+                    )
+                })
+                .collect();
             let w = size.x as i32;
             let h = size.y as i32;
             // 1) Запомненное вручную место — если окно целиком влезает
@@ -2616,7 +2633,10 @@ impl TrackerApp {
             // 2) Иначе — пресет 3×3 на мониторе самой полоски / курсора.
             if placed.is_none() {
                 let center = c.input(|i| i.viewport().outer_rect).map(|r| r.center());
-                let cur = cursor_pos();
+                // Курсор WinAPI — в физических пикселях, приводим к поинтам.
+                let cur = cursor_pos().map(|(x, y)| {
+                    ((x as f32 / ppp).round() as i32, ((y as f32 / ppp).round() as i32))
+                });
                 let idx = center
                     .and_then(|p| monitor_containing(&mons, p.x as i32, p.y as i32))
                     .or_else(|| cur.and_then(|(x, y)| monitor_containing(&mons, x, y)))
@@ -2649,7 +2669,12 @@ impl TrackerApp {
                     egui::ViewportCommand::OuterPosition([p[0], p[1]].into()),
                 );
             } else if let Some(m) = c.input(|i| i.viewport().monitor_size) {
-                let (x, y) = strip_pos_coords((m.x, m.y), size, self.state.strip_pos);
+                // monitor_size — физические пиксели, приводим к поинтам.
+                let (x, y) = strip_pos_coords(
+                    (m.x / ppp, m.y / ppp),
+                    size,
+                    self.state.strip_pos,
+                );
                 c.send_viewport_cmd_to(
                     vp_id,
                     egui::ViewportCommand::OuterPosition([x, y].into()),
