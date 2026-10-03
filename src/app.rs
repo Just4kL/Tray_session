@@ -1,9 +1,9 @@
 use crate::app_state::{AppCmd, AppState, Tab, TrayCmd, UpdateDialogState, UpdateInfo};
-use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, save_known_games, AppConfig, TrackedGame};
-use crate::ui::{theme::{tokens::Tokens, ThemeManager}, views::Views};
-use crate::db::{AlarmRow, Db};
+use crate::config::{exe_file_name, format_duration, game_day_key, load_known_games, merge_games, sanitize_timer_presets, save_known_games, AppConfig, TrackedGame, TIMER_PRESET_MAX, TIMER_PRESET_MIN};
+use crate::ui::{theme::{tokens::Tokens, ThemeManager}, views::Views, widgets::status_dot};
+use crate::db::{AggRow, AlarmRow, Db};
 use crate::detector;
-use crate::gpu::query_gpu;
+use crate::gpu::{query_gpu, GpuSnapshot};
 use crate::monitor::{ActiveInfo, MonitorEvent, SharedActive, SharedConfig, SharedGames};
 use crate::shortcuts::{action_label, Shortcut, ShortcutStore};
 use crate::sound::SoundPlayer;
@@ -16,8 +16,8 @@ pub const APP_NAME: &str = "Tray Session";
 /// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
-pub const VERSION: &str = "0.7.35";
-// Номер сборки (дата YYYYMMDD). Генерируется build.rs при каждой сборке,
+pub const VERSION: &str = "0.7.36";
+// Дата сборки (DD.MM.YYYY). Генерируется build.rs при каждой сборке,
 // руками не правится (раньше забывался при бампе версии).
 include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 pub const ISSUE_URL: &str = "https://example.com/issues";
@@ -26,7 +26,50 @@ pub const STOPWATCH_TITLE: &str = "Секундомер — Tray Session";
 /// Заголовок тонкой полоски сессии.
 pub const STRIP_TITLE: &str = "Сессия — Tray Session";
 
+/// Постоянный поток для блокирующей работы. Результат будит UI, чтобы он
+/// обработался, даже когда окно в остальное время простаивает.
+struct BackgroundWorker<T> {
+    request_tx: mpsc::SyncSender<Option<egui::Context>>,
+    result_rx: mpsc::Receiver<T>,
+}
+
+impl<T: Send + 'static> BackgroundWorker<T> {
+    fn spawn(mut work: impl FnMut() -> T + Send + 'static) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<Option<egui::Context>>(1);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(ctx) = request_rx.recv() {
+                let result = work();
+                if result_tx.send(result).is_err() {
+                    break;
+                }
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            }
+        });
+        Self {
+            request_tx,
+            result_rx,
+        }
+    }
+
+    fn request(&self, ctx: Option<&egui::Context>) -> bool {
+        self.request_tx.try_send(ctx.cloned()).is_ok()
+    }
+
+    fn try_recv(&self) -> Result<T, mpsc::TryRecvError> {
+        self.result_rx.try_recv()
+    }
+}
+
 const CHANGELOG: &[(&str, &str, &[&str])] = &[
+    ("0.7.36", "2026-10-03", &[
+        "New: Clearer section tabs, quick settings, button tips, and a persistent status bar.",
+        "Fix: UI scale follows each monitor's native DPI instead of resetting it every frame.",
+        "Fix: GPU and session total refreshes run in the background to reduce UI hitches.",
+        "Changed: Restored the native Windows title bar for reliable move and double-click maximize.",
+    ]),
     ("0.7.35", "2026-10-02", &[
         "New: Update module rewritten: manual/silent update with confirmation dialog and rollback.",
         "New: Updater log at logs/updater.log; restart via --updated flag.",
@@ -55,7 +98,7 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
     ]),
     ("0.7.31", "2026-09-29", &[
         "Fix: Отменённое обновление уничтожало программу. Фоновый процесс переименовывает файл, чтобы освободить имя под новую сборку, и раньше удалял переименованную копию при ЛЮБОМ исходе. Если обновление срывалось — обрыв загрузки, программа не закрылась за отведённое время, не хватило прав — человек оставался вообще без программы: файла не было, а сообщение говорило «файлы не тронуты». Теперь копию возвращают на место, если новая сборка не встала.",
-        "Fix: Релиз 0.7.30 был собран до поднятия версии, и внутри него стоял 0.7.29. Манифест объявлял 0.7.30, файл отдавался новый, а программа называла себя прошлой версией. Оба файла — текстовые, поэтому проверки были довольны. Скрипт make-manifest.ps1 -Archive теперь сам кладёт свежую сборку в корень, и порядок «собрал → положил → посчитал хеш» больше нельзя нарушить случайно.",
+        "Fix: Релиз 0.7.30 был собран до поднятия версии, и внутри него стоял 0.7.29. Манифест объявлял 0.7.30, файл отдавался новый, а программа называла себя прошлой версией. Оба файла — текстовые, поэтому проверки были довольны. Скрипт make-manifest.ps1 -Archive теперь сам кладёт свежую сборку в корень, и порядок «собрал › положил › посчитал хеш» больше нельзя нарушить случайно.",
         "Fix: Две новые проверки ловят именно эту ошибку: одна читает версию прямо из собранного .exe, вторая сверяет хеш манифеста с файлом в корне.",
         "Fix: При ожидании 0 секунд файл-сигнал не проверялся ни разу. Программа, которая уже успела записать сигнал и выйти, считалась работающей: обновление отменялось, а её файл оставался лежать и в следующий раз разрешал бы замену файлов на живых.",
         "Fix: Тест горячих клавиш писал свой файл в системный %TEMP%, то есть на диск C:. Переведён в папку программы.",
@@ -90,7 +133,7 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
         "New: 24 теста: лимит и вращение логов, выбор самых старых, безопасность при недоступной папке, состав целей деактиватора, удаление всех файлов и данных, сохранение инструкции, переименование себя.",
     ]),
     ("0.7.28", "2026-09-28", &[
-        "Fix: Установщик переименован: Tray_sesstion_setup.exe → Tray_session_setup.exe. Опечатка в имени вызывала лишние вопросы у тех, кто скачивал сборку.",
+        "Fix: Установщик переименован: Tray_sesstion_setup.exe › Tray_session_setup.exe. Опечатка в имени вызывала лишние вопросы у тех, кто скачивал сборку.",
         "Fix: Новое имя проведено сквозь весь проект — сборка установщика, манифест обновлений, тесты и инструкции; старое больше не используется нигде.",
         "New: Кнопка-уведомление об обновлении в правом верхнем углу: жёлтая окантовка, подсветка изнутри и жёлтая стрелка вниз (знак загрузки).",
         "New: Подсказка на кнопке показывает версию обновления («Скачать обновление v0.9.1»).",
@@ -122,7 +165,7 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
         "Fix: У кнопок боковой навигации не было отклика на нажатие вообще — `is_pointer_button_down_on()` не проверялся. Теперь: слой +16% при наведении, +32% при нажатии, кнопка опускается на 1px, иконка притухает.",
         "New: Иконки разделов перерисованы вектором в стиле Material (сетка 24dp, обводка 2dp) вместо растровых PNG 64×64 с заливками — чётче на любом DPI и красятся цветом состояния.",
         "New: Иконка «Игры» (геймпад) сделана залитой с прорезями: в контуре на 22px крестовина и кнопки сливались в нечитаемую кляксу.",
-        "New: Кнопки-«чипы» (PIN, ⤢) в едином стиле: скругление 10px, акцентная обводка в активном состоянии.",
+        "New: Кнопки-«чипы» (PIN, ⛶) в едином стиле: скругление 10px, акцентная обводка в активном состоянии.",
         "New: Превью оформления без окна: `cargo test -- --ignored` рисует кнопки и иконки в target/*.png. Нужно потому, что снимок окна через WinAPI отдаёт чёрный кадр (winit рисует через GPU), а оценивать оформление на глаз было нечем.",
         "New: 9 тестов оформления: контраст WCAG во всех состояниях кнопок, видимость эффекта нажатия, запрет своего цвета текста в кнопках, геометрия иконок (в клетке, контурная, без вырожденных фигур).",
         "Fix: Убрана ставшая ненужной зависимость крейта `image` вместе с папкой assets.",
@@ -163,11 +206,11 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
     ]),
     ("0.7.20", "2026-09-28", &[
         "New: Иконки разделов из assets (6 шт.) в боковой навигации, красятся в цвет состояния.",
-        "New: Кнопка ⤢ разворачивает окошко секундомера почти вдвое и добавляет таймер обратного отсчёта.",
+        "New: Кнопка ⛶ разворачивает окошко секундомера почти вдвое и добавляет таймер обратного отсчёта.",
         "New: Клик по версии внизу сайдбара открывает окно проверки обновлений и сразу запускает проверку.",
         "New: Все блоки разделов выровнены по единым отступам (5% ширины, симметрично слева и справа).",
         "New: Постоянная строка статуса внизу с тем же отступом, что и блоки.",
-        "Fix: Стрелки (RShift+←↑→↓) работают и на мини-трее: RShift+←/→ позиция 3×3, RShift+↑/↓ прозрачность ±5%.",
+        "Fix: Стрелки (RShift+⬅⬆➡⬇) работают и на мини-трее: RShift+⬅/➡ позиция 3×3, RShift+⬆/⬇ прозрачность ±5%.",
         "Fix: Мини-трей не выходит за рабочую область монитора; автопоправка при смене разрешения (раз в 2 с).",
         "New: Мини-трей тоньше (26px) и чище: убрана прошлая сессия (теперь в ховере), рамка нейтральная.",
         "Fix: Поля URL и Звук в будильниках и таймере сжаты (доля ширины строки), кнопка «Добавить» не уезжает за край.",
@@ -205,7 +248,7 @@ const CHANGELOG: &[(&str, &str, &[&str])] = &[
     ]),
     ("0.7.12", "2026-09-28", &[
         "Fix: Рамки плавающих окон догоняют масштаб (InnerSize при смене ppp) — внутренности больше не перерастают окно.",
-        "New: Список кругов просторнее (220px), справа ползунок, стрелки ▲▼ и колесо для прокрутки.",
+        "New: Список кругов просторнее (220px), справа ползунок, стрелки ⏶⏷ и колесо для прокрутки.",
     ]),
     ("0.7.11", "2026-09-28", &[
         "Fix: Подсказки-Tips внутри полей ввода (hint), а не снаружи.",
@@ -683,63 +726,51 @@ fn png_rgba(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Сторона кнопки-уведомления об обновлении (квадратная).
-pub const UPDATE_BTN: f32 = 40.0;
+/// Ширина кнопки-пилюли в верхней панели.
+pub const UPDATE_BTN: f32 = 132.0;
+/// Высота кнопки-пилюли.
+const UPDATE_BTN_HEIGHT: f32 = 28.0;
 /// Радиус скругления кнопки.
-const UPDATE_BTN_ROUND: f32 = 10.0;
+const UPDATE_BTN_ROUND: f32 = 14.0;
 
 /// Цвета кнопки-уведомления в одном состоянии.
 #[derive(Debug, Clone, Copy)]
 pub struct UpdateNoticePaint {
     /// Фон кнопки.
     pub bg: egui::Color32,
-    /// Окантовка (жёлтая, чуть темнее на наведении).
+    /// Окантовка в цвет акцента.
     pub border: egui::Color32,
     /// Цвет стрелки вниз.
     pub arrow: egui::Color32,
-    /// Внутренняя подсветка — жёлтым по всей площади с прозрачностью.
+    /// Лёгкая внутренняя подсветка.
     pub glow: egui::Color32,
-    /// Кнопка нажата.
-    pub pressed: bool,
 }
 
-/// Оформление кнопки «скачать обновление».
-///
-/// Затребовано: жёлтая окантовка, подсветка изнутри и жёлтая стрелка.
-/// Состояния — как у любой кнопки: покой, наведение (светлее), нажатие
-/// (темнее и стрелка гаснет), чтобы отклик был виден.
+/// Оформление компактной кнопки обновления в верхней панели.
 pub fn update_notice_paint(
     tokens: &Tokens,
     hovered: bool,
     down: bool,
 ) -> UpdateNoticePaint {
-    let panel = tokens.palette.bg.surface;
-    let y = tokens.palette.semantic.warn_soft;
-    // Фон: тёплый тёмный, чтобы жёлтая рамка читалась на нём, а сам он
-    // не спорил с основной тёмно-синей темой.
-    let base = blend(y, panel, 0.86); // 14% жёлтого в фоне панели
+        let panel = tokens.palette.bg.surface;
+    let accent = tokens.palette.accent.selection;
+    // Фон опирается на синюю палитру акцента.
     let bg = if down {
         // Нажатие темнее покоя — кнопка «уходит вглубь», как в Material
-        // при снятии тени. Важно: `blend(fg, bg, t)`, чем меньше t, тем
-        // больше жёлтого, поэтому здесь t больше, а не меньше.
-        blend(y, panel, 0.94)
+        // при снятии тени.
+        blend(accent, panel, 0.35)
     } else if hovered {
-        blend(y, panel, 0.70) // наведение светлее: жёлтого заметно больше
+        blend(tokens.palette.accent.primary, accent, 0.82)
     } else {
-        base
+        accent
     };
     UpdateNoticePaint {
         bg,
-        border: y,
-        arrow: if down {
-            // На нажатии стрелка чуть притухает — «вдавлилась» вместе с кнопкой.
-            blend(y, bg, 0.30)
-        } else {
-            y
-        },
-        // Внутренняя подсветка: жёлтый по всей площади с малой прозрачностью.
-        glow: egui::Color32::from_rgba_unmultiplied(y.r(), y.g(), y.b(), if hovered { 46 } else { 30 }),
-        pressed: down,
+        border: tokens.palette.accent.dim,
+        arrow: tokens.palette.text.on_accent,
+        glow: egui::Color32::from_rgba_unmultiplied(
+            accent.r(), accent.g(), accent.b(), if hovered { 28 } else { 0 },
+        ),
     }
 }
 
@@ -767,35 +798,21 @@ fn paint_update_arrow(p: &egui::Painter, rect: egui::Rect, color: egui::Color32)
     clip.add(line(&[(4.5, 19.5), (19.5, 19.5)]));
 }
 
-/// Кнопка-уведомление «скачать обновление»: жёлтая окантовка, внутренняя
-/// подсветка и стрелка вниз. Подсказка — с версией обновления.
+/// Компактная кнопка-пилюля. Подсказка показывает предлагаемую версию.
 fn update_notice_button(
     ui: &mut egui::Ui,
     tokens: &Tokens,
     version: &str,
 ) -> egui::Response {
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(UPDATE_BTN, UPDATE_BTN), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(UPDATE_BTN, UPDATE_BTN_HEIGHT),
+        egui::Sense::click(),
+    );
     let p = update_notice_paint(tokens, resp.hovered(), resp.is_pointer_button_down_on());
     let rounding = egui::Rounding::same(UPDATE_BTN_ROUND);
-    // Внешняя мягкая подсветка вокруг кнопки — «свечение», чтобы её было
-    // видно сразу, а не только при наведении.
-    ui.painter().rect_stroke(
-        rect.expand(1.5),
-        rounding,
-        egui::Stroke::new(
-            1.0_f32,
-            egui::Color32::from_rgba_unmultiplied(
-                p.border.r(),
-                p.border.g(),
-                p.border.b(),
-                if resp.hovered() { 150 } else { 90 },
-            ),
-        ),
-    );
     // Фон.
     ui.painter().rect_filled(rect, rounding, p.bg);
-    // Подсветка изнутри: жёлтым по всей площади, чуть меньше рамки.
+    // Подсветка изнутри при наведении.
     if p.glow.a() > 0 {
         ui.painter().rect_filled(
             rect.shrink(2.0),
@@ -803,19 +820,22 @@ fn update_notice_button(
             p.glow,
         );
     }
-    // Окантовка.
     ui.painter().rect_stroke(
         rect,
         rounding,
-        egui::Stroke::new(2.0_f32, p.border),
+        egui::Stroke::new(1.0_f32, p.border),
     );
     // Стрелка.
     paint_update_arrow(
         ui.painter(),
-        egui::Rect::from_center_size(
-            rect.center(),
-            egui::vec2(rect.width() * 0.56, rect.height() * 0.56),
-        ),
+        egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 6.0), egui::vec2(16.0, 16.0)),
+        p.arrow,
+    );
+    ui.painter().text(
+        egui::pos2(rect.min.x + 31.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Обновить",
+        egui::FontId::proportional(13.0),
         p.arrow,
     );
     resp.on_hover_text(update_tooltip(version))
@@ -858,7 +878,7 @@ pub const MANUAL_SECTIONS: &[(&str, &str)] = &[
     (
         "Сессии",
         "Главный экран: что происходит прямо сейчас. Сверху — живые сессии с \
-         метками ● запись и текущей нагрузкой (CPU, RAM, VRAM). Ниже сводная \
+         метками • запись и текущей нагрузкой (CPU, RAM, VRAM). Ниже сводная \
          таблица по играм: общее время, доля от суммы, сколько раз запускали, \
          число сессий.\n\
          Кнопка «Детали» открывает сессии выбранной игры. Двойной клик по \
@@ -899,7 +919,7 @@ pub const MANUAL_SECTIONS: &[(&str, &str)] = &[
          вместе с курсором; размер меняется, если тянуть мышью за край. Помнит \
          последние круги (до 99), показывает их списком.\n\
          PIN запрещает перетаскивание. Прозрачность настраивается от 2% до 100% \
-         — на 100% окошко не мешает вообще. Кнопка ⤢ разворачивает окошко почти \
+         — на 100% окошко не мешает вообще. Кнопка ⛶ разворачивает окошко почти \
          вдвое и добавляет таймер обратного отсчёта с полоской хода.\n\
          Глобальные горячие клавики работают поверх игры, пока окошко открыто.",
     ),
@@ -1141,6 +1161,14 @@ pub struct TrackerApp {
     /// (переключатель скинов), пока висит `None`.
     #[allow(dead_code)] // TODO(phase-1.4): читать при смене скина в update()
     last_skin_id: Option<&'static str>,
+    /// Последнее применённое значение пользовательского масштаба.
+    last_applied_scale: Option<f32>,
+    agg_worker: BackgroundWorker<Vec<AggRow>>,
+    agg_refresh_pending: bool,
+    agg_refresh_again: bool,
+    gpu_worker: BackgroundWorker<GpuSnapshot>,
+    gpu_query_pending: bool,
+    repaint_ctx: Option<egui::Context>,
 }
 
 impl TrackerApp {
@@ -1171,6 +1199,11 @@ impl TrackerApp {
                 }
             })
             .unwrap_or_default();
+        let agg_worker = {
+            let db = Arc::clone(&db);
+            BackgroundWorker::spawn(move || db.aggregated())
+        };
+        let gpu_worker = BackgroundWorker::spawn(query_gpu);
         let mut app = Self {
             state: AppState {
                 db,
@@ -1227,6 +1260,7 @@ impl TrackerApp {
                 started_at: Instant::now(),
                 last_autoscan: Instant::now(),
                 quit_requested: false,
+                close_dialog: false,
                 gpu_usable_cache: false,
                 gpu_util_cache: 0,
                 last_gpu_check: Instant::now() - Duration::from_secs(99),
@@ -1253,6 +1287,7 @@ impl TrackerApp {
                 stopwatch_opacity_pct: cfg_handle.stopwatch_opacity_pct,
                 stopwatch_expanded: cfg_handle.stopwatch_expanded,
                 stopwatch_drag_pos: None,
+                stopwatch_press_pos: None,
                 // При старте с уже открытым оверлеем set_stopwatch_overlay
                 // не вызывается, поэтому флаг взводим сразу из конфига:
                 // иначе позиция не восстановится и ОС поставит окно рядом
@@ -1263,6 +1298,7 @@ impl TrackerApp {
                 strip_open: cfg_handle.strip_open,
                 strip_pos: cfg_handle.strip_pos,
                 strip_drag_pos: None,
+                strip_press_pos: None,
                 strip_pinned: cfg_handle.strip_pinned,
                 strip_opacity_pct: cfg_handle.strip_opacity_pct,
                 strip_snap_pending: false,
@@ -1282,6 +1318,9 @@ impl TrackerApp {
                 last_tooltip: Instant::now() - Duration::from_secs(99),
                 prev_tab: Tab::from_str(&cfg_handle.last_tab),
                 about_sub: 0,
+                games_sub: 0,
+                alarms_sub: 0,
+                timer_sub: 0,
                 last_saved: cfg_handle.clone(),
             },
             views: Views::default(),
@@ -1291,8 +1330,14 @@ impl TrackerApp {
                 crate::ui::theme::default::DefaultSkin::default(),
             )),
             last_skin_id: None,
+            last_applied_scale: None,
+            agg_worker,
+            agg_refresh_pending: false,
+            agg_refresh_again: false,
+            gpu_worker,
+            gpu_query_pending: false,
+            repaint_ctx: None,
         };
-        app.refresh_agg();
         app.refresh_alarms();
         // Время в форме добавления: запомненное, а не текущее.
         app
@@ -1334,8 +1379,47 @@ impl TrackerApp {
     }
 
     fn refresh_agg(&mut self) {
-        self.state.agg = self.state.db.aggregated();
-        self.state.last_agg_refresh = Instant::now();
+        if self.agg_refresh_pending {
+            self.agg_refresh_again = true;
+            return;
+        }
+        if self.agg_worker.request(self.repaint_ctx.as_ref()) {
+            self.agg_refresh_pending = true;
+            self.state.last_agg_refresh = Instant::now();
+        }
+    }
+
+    fn poll_background_results(&mut self) {
+        match self.agg_worker.try_recv() {
+            Ok(rows) => {
+                self.state.agg = rows;
+                self.state.last_agg_refresh = Instant::now();
+                self.agg_refresh_pending = false;
+                if self.agg_refresh_again {
+                    self.agg_refresh_again = false;
+                    self.refresh_agg();
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.agg_refresh_pending = false;
+                self.agg_refresh_again = false;
+                self.state.last_agg_refresh = Instant::now();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        match self.gpu_worker.try_recv() {
+            Ok(snapshot) => {
+                self.state.gpu_usable_cache = snapshot.usable;
+                self.state.gpu_util_cache = snapshot.gpu_util_pct;
+                self.gpu_query_pending = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.gpu_query_pending = false;
+                self.state.last_gpu_check = Instant::now();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     /// Применить масштаб интерфейса и сохранить в config.json.
@@ -1412,15 +1496,40 @@ impl TrackerApp {
                                 plan.preserved.join(", ")
                             )
                         };
-                        UpdateInfo {
-                            msg: format!(
-                                "{}\nБудет скачано и заменено: {}.{keep}\nОбновление ставится отдельным фоновым процессом во временную папку рядом с программой.",
-                                m.describe(),
-                                names.join(", ")
-                            ),
-                            // Нашли обновление — показываем кнопку в углу.
-                            new_version: Some(m.version),
-                            changelog: m.changelog,
+                        // AU-2/C16: решает версия, а не хеш. Ту же или более
+                        // старую не предлагаем; ту же при других файлах —
+                        // с предупреждением.
+                        match crate::update::classify_offer(
+                            VERSION,
+                            &m.version,
+                            !plan.to_download.is_empty(),
+                        ) {
+                            crate::update::OfferKind::SameVersionWarn => UpdateInfo {
+                                msg: format!(
+                                    "Файлы отличаются, но версия та же ({}). Обновить?",
+                                    m.version
+                                ),
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
+                            crate::update::OfferKind::Offer => UpdateInfo {
+                                msg: format!(
+                                    "{}\nБудет скачано и заменено: {}.{keep}\nОбновление ставится отдельным фоновым процессом во временную папку рядом с программой.",
+                                    m.describe(),
+                                    names.join(", ")
+                                ),
+                                // Нашли обновление — показываем кнопку в углу.
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
+                            crate::update::OfferKind::None => UpdateInfo {
+                                msg: format!(
+                                    "Установлена версия {}, новее в канале нет.",
+                                    VERSION
+                                ),
+                                new_version: None,
+                                changelog: None,
+                            },
                         }
                     }
                 }
@@ -1530,7 +1639,7 @@ impl TrackerApp {
                     ui.heading("Доступна новая версия");
                     ui.add_space(tokens.spacing.sm);
                     ui.label(
-                        egui::RichText::new(format!("{} → {}", dlg.old_version, dlg.new_version))
+                        egui::RichText::new(format!("{} › {}", dlg.old_version, dlg.new_version))
                             .strong(),
                     );
                 });
@@ -1608,11 +1717,26 @@ impl TrackerApp {
                         // Тихий режим больше НЕ ставит молча с выходом:
                         // показываем тот же диалог, но с автоотсчётом.
                         // Решение принимает poll update_rx (там виден silent
-                        // из настроек), сюда только прокидываем версию.
-                        UpdateInfo {
-                            msg: m.describe(),
-                            new_version: Some(m.version),
-                            changelog: m.changelog,
+                        // из настроек), сюда только прокидываем версию —
+                        // тоже через classify_offer (AU-2/C16).
+                        match crate::update::classify_offer(
+                            crate::app::VERSION,
+                            &m.version,
+                            true,
+                        ) {
+                            crate::update::OfferKind::None => UpdateInfo {
+                                msg: format!(
+                                    "Проверено: установлена версия {}, новее нет.",
+                                    crate::app::VERSION
+                                ),
+                                new_version: None,
+                                changelog: None,
+                            },
+                            _ => UpdateInfo {
+                                msg: m.describe(),
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
                         }
                     } else if plan.to_download.is_empty() {
                         UpdateInfo {
@@ -1622,14 +1746,28 @@ impl TrackerApp {
                         }
                     } else {
                         // Нашли, но молча ставить не разрешено — показываем
-                        // кнопку в углу.
-                        UpdateInfo {
-                            msg: format!(
-                                "Доступно обновление до {}. Нажмите жёлтую кнопку со стрелкой в правом верхнем углу, чтобы поставить.",
-                                m.version
-                            ),
-                            new_version: Some(m.version),
-                            changelog: m.changelog,
+                        // кнопку в углу. Версию тоже сверяем (AU-2/C16).
+                        match crate::update::classify_offer(
+                            crate::app::VERSION,
+                            &m.version,
+                            true,
+                        ) {
+                            crate::update::OfferKind::None => UpdateInfo {
+                                msg: format!(
+                                    "Проверено: установлена версия {}, новее нет.",
+                                    crate::app::VERSION
+                                ),
+                                new_version: None,
+                                changelog: None,
+                            },
+                            _ => UpdateInfo {
+                                msg: format!(
+                                    "Доступно обновление до {}. Нажмите «Обновить» в верхней панели, чтобы продолжить.",
+                                    m.version
+                                ),
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
                         }
                     }
                 }
@@ -2049,6 +2187,7 @@ impl TrackerApp {
                 vp_id,
                 egui::Id::new(("stopwatch_overlay", "drag")),
                 &mut self.state.stopwatch_drag_pos,
+                &mut self.state.stopwatch_press_pos,
                 STOPWATCH_TITLE,
             );
         }
@@ -2088,7 +2227,12 @@ impl TrackerApp {
                     self.set_stopwatch_overlay(false);
                 }
                 // Расширение: двойной размер окна + таймер обратного отсчёта.
-                let exp = if self.state.stopwatch_expanded { "⤡" } else { "⤢" };
+                // Обе стороны — «четыре угла» (⛶ U+26F6). Глифов ⤢/⤡ нет ни
+                // в одном шрифте пропорционального семейства egui: они
+                // рисовались пустым квадратом. Развёрнутость показывает сама
+                // кнопка (chip_button подсвечивает активное состояние) плюс
+                // подсказка ниже.
+                let exp = "⛶";
                 if chip_button(ui, self.theme.current().tokens(), exp, self.state.stopwatch_expanded)
                     .on_hover_text(if self.state.stopwatch_expanded {
                         "Свернуть окошко"
@@ -2138,6 +2282,10 @@ impl TrackerApp {
                 if ui.small_button("Круг").clicked() {
                     self.stopwatch_lap();
                 }
+                // T-12: сброс прямо в оверлее (раньше только на вкладке).
+                if ui.small_button("Сброс").clicked() {
+                    self.stopwatch_reset();
+                }
             });
             // Развёрнутое окошко: снизу таймер обратного отсчёта — тот же,
             // что на вкладке «Таймер» (одна сущность, два места показа).
@@ -2181,23 +2329,53 @@ impl TrackerApp {
                     .font(egui::FontId::monospace(big))
                     .color(color),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if running {
+            if running {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Стоп").clicked() {
                         self.state.timer_end = None;
                         self.state.sound.stop();
                     }
-                } else {
-                    for (label, secs) in
-                        [("1м", 60u64), ("5м", 300), ("10м", 600), ("30м", 1800)]
+                });
+            }
+        });
+        // T-17: пресеты берём из конфига (тот же список, что на вкладке
+        // «Таймер»), а не из захардкоженного массива. Клавиатуры в этом окне
+        // нет (WS_EX_NOACTIVATE), поэтому тут только запуск и «+»: он кладёт
+        // текущие «Минуты» в пресеты. Правка самого списка — Настройки → Таймер.
+        if !running {
+            let presets = self.state.cfg_handle.timer_presets.clone();
+            let cur = self
+                .state
+                .timer_min
+                .clamp(TIMER_PRESET_MIN as i32, TIMER_PRESET_MAX as i32) as u32;
+            let cur_in = presets.contains(&cur);
+            ui.horizontal_wrapped(|ui| {
+                for min in presets {
+                    if ui
+                        .small_button(timer_preset_label(min))
+                        .on_hover_text(format!("Запустить таймер на {min} мин"))
+                        .clicked()
                     {
-                        if ui.small_button(label).clicked() {
-                            self.start_timer(secs);
-                        }
+                        self.start_timer(min as u64 * 60);
                     }
                 }
+                // «+» показываем, только когда он что-то даст: если текущие
+                // минуты уже в пресетах, кнопка была бы мёртвой.
+                let add = !cur_in
+                    && ui
+                        .small_button("+")
+                        .on_hover_text(format!(
+                            "Добавить {} в пресеты (правка списка — Настройки › Таймер)",
+                            timer_preset_label(cur)
+                        ))
+                        .clicked();
+                if add {
+                    let mut p = self.state.cfg_handle.timer_presets.clone();
+                    p.push(cur);
+                    self.state.cfg_handle.timer_presets = sanitize_timer_presets(&p);
+                }
             });
-        });
+        }
         // Тонкий индикатор хода: без него длинный таймер «теряется» в окне.
         let frac = if self.state.timer_total > 0 {
             (rem as f32 / self.state.timer_total as f32).clamp(0.0, 1.0)
@@ -2381,7 +2559,13 @@ impl TrackerApp {
     }
 
     /// Поставить полоску на позицию (первым кадром вьюпорта через флаг).
+    /// T-15: сбрасываем ручную позицию — иначе snap_strip_now веткой 1
+    /// ставит окно обратно на старое ручное место и пресет игнорируется.
+    /// Следующий кадр draw_session_strip запомнит уже новую позицию.
+    /// Drag пишет strip_pos_manual напрямую, не через snap_strip, —
+    /// его поведение не меняется.
     fn snap_strip(&mut self) {
+        self.state.cfg_handle.strip_pos_manual = None;
         self.state.strip_snap_pending = true;
     }
 
@@ -2403,6 +2587,7 @@ impl TrackerApp {
                 vp_id,
                 egui::Id::new(("session_strip", "drag")),
                 &mut self.state.strip_drag_pos,
+                &mut self.state.strip_press_pos,
                 STRIP_TITLE,
             );
         }
@@ -2582,17 +2767,34 @@ impl TrackerApp {
     /// сейчас или где курсор. Итоговые координаты зажаты внутрь рабочей
     /// области монитора, чтобы полоска не вылезала за край экрана.
     fn snap_strip_now(&mut self, c: &egui::Context, vp_id: egui::ViewportId) {
-        // Сетка 3×3 считается в пикселях экрана, поэтому размер окна
-        // переводим из поинтов в пиксели через ppp.
-        let ppp = c.pixels_per_point();
-        let pts = strip_window_size();
-        let size = egui::vec2(pts.x * ppp, pts.y * ppp);
+        // T-15b: вся математика — В ПОИНТАХ. egui-winit умножает
+        // OuterPosition на ppp ещё раз (0.28 lib.rs:1370), поэтому слать
+        // надо поинты: work area делим на ppp, размер берём как есть
+        // (strip_window_size уже в поинтах), ручная позиция
+        // (outer_rect.min) тоже в поинтах. Раньше слали физические
+        // пиксели — при ppp>1 окно приземлялось в ppp раз дальше и
+        // уходило за экран (при ui_scale 1.3 — всегда).
+        // ppp — именно стрип-вьюпорта (параметр c), не главного окна:
+        // на мульти-DPI они могут различаться.
+        let ppp = c.pixels_per_point().max(0.01);
+        let size = strip_window_size();
         #[cfg(windows)]
         {
-            let mons = enum_monitor_work_areas();
-            if mons.is_empty() {
+            let mons_px = enum_monitor_work_areas();
+            if mons_px.is_empty() {
                 return;
             }
+            let mons: Vec<(i32, i32, i32, i32)> = mons_px
+                .iter()
+                .map(|(l, t, r, b)| {
+                    (
+                        (*l as f32 / ppp).round() as i32,
+                        (*t as f32 / ppp).round() as i32,
+                        (*r as f32 / ppp).round() as i32,
+                        (*b as f32 / ppp).round() as i32,
+                    )
+                })
+                .collect();
             let w = size.x as i32;
             let h = size.y as i32;
             // 1) Запомненное вручную место — если окно целиком влезает
@@ -2606,7 +2808,10 @@ impl TrackerApp {
             // 2) Иначе — пресет 3×3 на мониторе самой полоски / курсора.
             if placed.is_none() {
                 let center = c.input(|i| i.viewport().outer_rect).map(|r| r.center());
-                let cur = cursor_pos();
+                // Курсор WinAPI — в физических пикселях, приводим к поинтам.
+                let cur = cursor_pos().map(|(x, y)| {
+                    ((x as f32 / ppp).round() as i32, ((y as f32 / ppp).round() as i32))
+                });
                 let idx = center
                     .and_then(|p| monitor_containing(&mons, p.x as i32, p.y as i32))
                     .or_else(|| cur.and_then(|(x, y)| monitor_containing(&mons, x, y)))
@@ -2639,7 +2844,12 @@ impl TrackerApp {
                     egui::ViewportCommand::OuterPosition([p[0], p[1]].into()),
                 );
             } else if let Some(m) = c.input(|i| i.viewport().monitor_size) {
-                let (x, y) = strip_pos_coords((m.x, m.y), size, self.state.strip_pos);
+                // monitor_size — физические пиксели, приводим к поинтам.
+                let (x, y) = strip_pos_coords(
+                    (m.x / ppp, m.y / ppp),
+                    size,
+                    self.state.strip_pos,
+                );
                 c.send_viewport_cmd_to(
                     vp_id,
                     egui::ViewportCommand::OuterPosition([x, y].into()),
@@ -2752,15 +2962,61 @@ impl TrackerApp {
                 AppCmd::StripOpacity(d) => self.apply_strip_opacity_delta(d),
             }
         }
-        // Скрытие в трей вместо закрытия
+        // Крестик: спрашиваем явно (T-1), молча в трей больше не уходим.
+        // quit_requested (выход из трея/апдейтер) идёт мимо диалога.
         if ctx.input(|i| i.viewport().close_requested()) && !self.state.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            // Minimized(true), а не Visible(false): при Visible(false) eframe
-            // перестаёт звать update(), poll_appcmd не крутится, AppCmd::Show
-            // из трея не обрабатывается. Минимизированное окно остаётся
-            // живым для event loop. with_taskbar(false) (main.rs:437)
-            // скрывает его из панели задач — визуально это «трей».
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.state.close_dialog = true;
+        }
+    }
+
+    /// Диалог «Вы точно хотите завершить программу?» (T-1).
+    /// «Завершить» — выход, «Свернуть в трей» — старое поведение
+    /// (Minimized, окно живо для event loop), «Отмена» — просто закрыть.
+    fn draw_close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.state.close_dialog {
+            return;
+        }
+        let mut action: Option<u8> = None;
+        egui::Window::new("Завершить программу?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Сессии продолжат записываться в трее только если свернуть.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Завершить").clicked() {
+                        action = Some(0);
+                    }
+                    if ui.button("Свернуть в трей").clicked() {
+                        action = Some(1);
+                    }
+                    if ui.button("Отмена").clicked() {
+                        action = Some(2);
+                    }
+                });
+            });
+        match action {
+            Some(0) => {
+                self.state.close_dialog = false;
+                // quit_requested снимает CancelClose-ветку выше —
+                // следующее Close реально завершит цикл.
+                self.state.quit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(1) => {
+                self.state.close_dialog = false;
+                // Minimized(true), а не Visible(false): при Visible(false)
+                // eframe перестаёт звать update(), poll_appcmd не крутится,
+                // AppCmd::Show из трея не обрабатывается.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            _ => {
+                if action.is_some() {
+                    self.state.close_dialog = false;
+                }
+            }
         }
     }
 
@@ -2792,7 +3048,7 @@ impl TrackerApp {
                         }
                     } else if let Some(s) = &a.standard_sound {
                         if !s.is_empty() && s != "Нет" {
-                            self.state.sound.play_standard(&s.to_lowercase().replace("beep", "beep"), 180);
+                            self.state.sound.play_standard(&s.to_lowercase(), 180);
                         }
                     }
                     self.state.alarm_dialog = Some(a.clone());
@@ -2820,8 +3076,10 @@ impl TrackerApp {
                         SoundPlayer::play_file(&ff);
                     }
                 } else if let Some(ss) = s {
+                    // T-4: таймер играл всегда "beep" вне зависимости от
+                    // выбора — теперь уважаем настройку, как будильник.
                     if !ss.is_empty() && ss != "Нет" {
-                        self.state.sound.play_standard("beep", 180);
+                        self.state.sound.play_standard(&ss.to_lowercase(), 180);
                     }
                 }
                 self.state.timer_dialog = true;
@@ -2843,10 +3101,11 @@ impl TrackerApp {
             self.spawn_autoscan();
         }
         // GPU-кэш для вкладки Активные
-        if self.state.last_gpu_check.elapsed() > Duration::from_secs(5) {
-            let snap = query_gpu();
-            self.state.gpu_usable_cache = snap.usable;
-            self.state.gpu_util_cache = snap.gpu_util_pct;
+        if !self.gpu_query_pending
+            && self.state.last_gpu_check.elapsed() > Duration::from_secs(5)
+            && self.gpu_worker.request(self.repaint_ctx.as_ref())
+        {
+            self.gpu_query_pending = true;
             self.state.last_gpu_check = Instant::now();
         }
     }
@@ -2927,6 +3186,8 @@ impl TrackerApp {
 
 impl eframe::App for TrackerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.repaint_ctx = Some(ctx.clone());
+        self.poll_background_results();
         self.poll_monitor();
         self.poll_appcmd(ctx);
         self.check_alarms_timer();
@@ -2953,7 +3214,7 @@ impl eframe::App for TrackerApp {
                         self.state.update_available = Some(v.clone());
                         self.notify(
                             "Доступно обновление",
-                            &format!("Tray Session {v} — нажмите жёлтую кнопку, чтобы поставить."),
+                            &format!("Tray Session {v} — нажмите «Обновить» в верхней панели."),
                         );
                     }
                     // Тихий режим: тот же диалог, но с автоотсчётом —
@@ -3004,55 +3265,144 @@ impl eframe::App for TrackerApp {
         // spacing/animation_time остаются дефолтными. Переход на полную
         // замену стиля — фаза 1.4, одним коммитом (см. roadmap в аудите).
         ctx.set_visuals(self.theme.current().egui_style().visuals);
-        // Масштаб интерфейса (читаемость на больших мониторах)
-        ctx.set_pixels_per_point(self.state.cfg_handle.ui_scale.clamp(0.8, 2.0));
+        let ui_scale = self.state.cfg_handle.ui_scale.clamp(0.8, 2.0);
+        if self.last_applied_scale != Some(ui_scale) {
+            // Пользовательский масштаб — zoom относительно нативного DPI.
+            // BASE_SCALE сохраняет прежний смысл 100%: без дополнительного zoom.
+            if let Some(native_ppp) = ctx.input(|i| i.viewport().native_pixels_per_point) {
+                let target_ppp = native_ppp * (ui_scale / BASE_SCALE);
+                if (ctx.pixels_per_point() - target_ppp).abs() > 0.01 {
+                    ctx.set_pixels_per_point(target_ppp);
+                }
+            }
+            self.last_applied_scale = Some(ui_scale);
+        }
 
+        let layout_spec = crate::ui::layout::presets::default_layout();
         // Левая панель навигации (компактно, как в PC Manager):
         // иконка + подпись, три состояния (неактивна / наведение / активна).
-        egui::SidePanel::left("nav")
-            .resizable(false)
-            .exact_width(88.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                for (t, label) in NAV_ITEMS {
-                    if self.nav_item(ui, t, label, self.state.tab == t) {
-                        self.state.tab = t;
-                    }
-                    ui.add_space(4.0);
+        // H1-шаг-3b: панель строит engine::build_nav из LayoutSpec;
+        // контент дословно тот же, обёртка заменена.
+        crate::ui::layout::engine::build_nav(ctx, &layout_spec, &mut |ui| {
+            ui.add_space(8.0);
+            for (t, label) in NAV_ITEMS {
+                if self.nav_item(ui, t, label, self.state.tab == t) {
+                    self.state.tab = t;
                 }
-                // Статус внизу панели (с отступом от нижнего края).
-                // Клик по версии открывает проверку обновлений.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    if ui
-                        .link(
-                            egui::RichText::new(format!("v{VERSION}"))
-                                .small()
-                                .weak(),
-                        )
-                        .on_hover_text("Открыть «О программе» и проверить обновления")
-                        .clicked()
-                    {
-                        // Отдельного окна нет: открываем раздел «О программе»
-                        // и сразу запускаем проверку обновлений.
-                        let ctx = ui.ctx().clone();
-                        self.start_update_check(&ctx);
+                ui.add_space(4.0);
+            }
+            // Статус внизу панели (с отступом от нижнего края).
+            // Клик по версии открывает проверку обновлений.
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if ui
+                    .link(
+                        egui::RichText::new(format!("v{VERSION}"))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text("Открыть «О программе» и проверить обновления")
+                    .clicked()
+                {
+                    // Отдельного окна нет: открываем раздел «О программе»
+                    // и сразу запускаем проверку обновлений.
+                    let ctx = ui.ctx().clone();
+                    self.start_update_check(&ctx);
+                }
+                let n_active = self.state
+                    .active
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|a| !a.pending)
+                    .count();
+                if n_active > 0 {
+                    // Кружок — векторный (`status_dot`): глифа `●` нет в
+                    // пропорциональном семействе шрифтов egui, он есть
+                    // только в Hack, а Hack подключён лишь к Monospace.
+                    ui.horizontal(|ui| {
+                        status_dot(ui, egui::Color32::LIGHT_GREEN, true);
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{n_active}"));
+                    });
+                }
+            });
+        });
+
+        let config_skin = self.theme.current().clone();
+        crate::ui::layout::engine::build_configurator(ctx, &layout_spec, &mut |ui| {
+            ui.add_space(8.0);
+            ui.heading("Настройки");
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("Быстрые настройки").weak().small());
+
+            card(ui, config_skin.tokens(), "Вид", |ui| {
+                ui.label("Масштаб интерфейса");
+                ui.horizontal(|ui| {
+                    let mut draft = self.state.scale_draft
+                        .unwrap_or(self.state.cfg_handle.ui_scale.clamp(0.8, 2.0));
+                    let slider_w = (ui.available_width() - 54.0).max(64.0);
+                    let response = ui.add_sized(
+                        egui::vec2(slider_w, 20.0),
+                        egui::Slider::new(&mut draft, 0.8..=2.0)
+                            .fixed_decimals(2)
+                            .show_value(false),
+                    );
+                    if response.changed() {
+                        self.state.scale_draft = Some(draft);
+                        if !response.dragged() {
+                            self.commit_scale(draft);
+                        }
                     }
-                    let n_active = self.state
-                        .active
-                        .read()
-                        .unwrap()
-                        .values()
-                        .filter(|a| !a.pending)
-                        .count();
-                    if n_active > 0 {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_GREEN,
-                            format!("● {n_active}"),
-                        );
+                    if response.drag_stopped() {
+                        self.commit_scale(draft);
+                    }
+                    if ui.small_button("−").on_hover_text("Уменьшить масштаб").clicked() {
+                        self.commit_scale(self.state.cfg_handle.ui_scale - 0.05);
+                    }
+                    if ui.small_button("+").on_hover_text("Увеличить масштаб").clicked() {
+                        self.commit_scale(self.state.cfg_handle.ui_scale + 0.05);
                     }
                 });
+                ui.horizontal(|ui| {
+                    let shown = self.state.scale_draft
+                        .unwrap_or(self.state.cfg_handle.ui_scale);
+                    ui.label(egui::RichText::new(format!(
+                        "{}%",
+                        (shown / BASE_SCALE * 100.0).round() as i32
+                    )).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Сбросить").clicked() {
+                            self.commit_scale(BASE_SCALE);
+                        }
+                    });
+                });
             });
+
+            card(ui, config_skin.tokens(), "Автоматизация", |ui| {
+                let mut scan_enabled = self.state.cfg_handle.auto_scan_enabled;
+                if ui.checkbox(&mut scan_enabled, "Сканировать игры каждый час").changed() {
+                    self.state.cfg_handle.auto_scan_enabled = scan_enabled;
+                    if let Ok(mut stored) = self.state.cfg.write() {
+                        *stored = self.state.cfg_handle.clone();
+                    }
+                    self.persist_if_changed();
+                }
+            });
+
+            card(ui, config_skin.tokens(), "Оформление", |ui| {
+                if ui.checkbox(&mut self.state.cfg_handle.debug_grid, "Показать сетку").changed() {
+                    if let Ok(mut stored) = self.state.cfg.write() {
+                        *stored = self.state.cfg_handle.clone();
+                    }
+                    self.persist_if_changed();
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(
+                egui::RichText::new("Больше параметров — в разделе «Параметры».").weak().small(),
+            ).wrap());
+        });
 
         // Главная область: поля страницы симметричны слева и справа (5%
         // ширины окна), поэтому блоки всех разделов выровнены по одной
@@ -3061,87 +3411,78 @@ impl eframe::App for TrackerApp {
         let m = page_margin(ctx.available_rect().width());
         // Строка статуса — постоянно внизу (и с тем же отступом, что блоки
         // разделов), чтобы сообщения не прыгали после содержимого карточек.
-        egui::TopBottomPanel::bottom("status")
-            .resizable(false)
-            .exact_height(24.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(0.0, 2.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(m);
-                    if !self.state.status_msg.is_empty() {
-                        ui.colored_label(
-                            self.theme.current().tokens().palette.semantic.attention,
-                            &self.state.status_msg,
-                        );
-                    } else {
-                        ui.colored_label(
-                            ui.visuals().weak_text_color(),
-                            format!("{APP_NAME} {VERSION} · авто-подсчёт игровых сессий"),
-                        );
-                    }
-                });
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let inner_w = (ui.available_width() - m * 2.0).max(80.0);
-            // Кнопка-уведомление об обновлении — правый верхний угол.
-            // Живёт ВНЕ прокрутки, поэтому не уезжает вниз при листании,
-            // и стоит в отдельной строке, а не поверх текста: так ничего
-            // не перекрывается. Если обновления нет — строка не занимает
-            // места вовсе.
-            let notice = self.state
-                .update_available
-                .clone()
-                .filter(|v| should_show_update_notice(Some(v)));
-            if let Some(version) = notice {
-                let w = ui.available_width();
-                // skin — локальный Arc: замыкание ниже берёт &mut self,
-                // а токены нужны рядом. Через self.theme напрямую было бы
-                // два пересекающихся заимствования self.
-                let skin = self.theme.current().clone();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(w, UPDATE_BTN),
-                    egui::Layout::right_to_left(egui::Align::Min),
-                    |ui| {
-                        if update_notice_button(ui, skin.tokens(), &version).clicked() {
-                            // Та же дверь, что и «Установить сейчас»:
-                            // подтверждение в диалоге, установка — из него.
-                            self.open_update_dialog(self.state.cfg_handle.update_silent);
-                        }
-                    },
-                );
-                ui.add_space(4.0);
-            }
-            ui.horizontal_top(|ui| {
-                ui.add_space(m);
-                ui.vertical(|ui| {
-                    ui.set_min_width(inner_w);
-                    ui.set_max_width(inner_w);
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            // Ширина фиксируется ДО содержимого: иначе egui
-                            // берёт её по самой широкой строке, и блоки
-                            // разделов разъезжаются по ширине.
-                            ui.set_min_width(inner_w);
-                            ui.set_max_width(inner_w);
-                            match self.state.tab {
-                                Tab::Sessions => self.ui_sessions(ui),
-                                Tab::Games => self.ui_games(ui),
-                                Tab::Alarms => self.ui_alarms(ui),
-                                Tab::Timer => self.ui_timer(ui),
-                                Tab::Shortcuts => self.ui_shortcuts(ui),
-                                Tab::About => self.ui_about(ui),
-                            }
-                        });
-                });
-                ui.add_space(m);
+        // H1-шаг-4a: панель строит engine::build_status из LayoutSpec.
+        // Отклонение от «дословного контента»: engine не принимает frame,
+        // поэтому панель получает дефолтный Frame::side_top_panel с левым
+        // полем 8.0 (было 0.0). Компенсируем внутри: add_space(m - 8),
+        // итог тот же отступ m, попиксельно как раньше. Шаг 5 перенесёт
+        // frame в spec/engine и уберёт компенсацию.
+        crate::ui::layout::engine::build_status(ctx, &layout_spec, &mut |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space((m - 8.0).max(0.0));
+                if !self.state.status_msg.is_empty() {
+                    status_dot(ui, self.theme.current().tokens().palette.semantic.attention, false);
+                    ui.colored_label(
+                        self.theme.current().tokens().palette.semantic.attention,
+                        &self.state.status_msg,
+                    );
+                } else {
+                    status_dot(ui, egui::Color32::LIGHT_GREEN, false);
+                    ui.colored_label(
+                        ui.visuals().weak_text_color(),
+                        format!("Готово · {APP_NAME} {VERSION}"),
+                    );
+                }
             });
         });
+
+        // H1-шаг-4b: центр строит engine::build_center из LayoutSpec.
+        crate::ui::layout::engine::build_center(ctx, &layout_spec, &mut |ui| {
+            if let Some(version) = self
+                .state
+                .update_available
+                .clone()
+                .filter(|v| should_show_update_notice(Some(v)))
+            {
+                let skin = self.theme.current().clone();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if update_notice_button(ui, skin.tokens(), &version).clicked() {
+                        self.open_update_dialog(self.state.cfg_handle.update_silent);
+                    }
+                });
+                ui.add_space(4.0);
+            }
+            let inner_w = ui.available_width().max(80.0);
+            ui.vertical(|ui| {
+                ui.set_min_width(inner_w);
+                ui.set_max_width(inner_w);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Ширина фиксируется ДО содержимого: иначе egui
+                        // берёт её по самой широкой строке, и блоки
+                        // разделов разъезжаются по ширине.
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        match self.state.tab {
+                            Tab::Sessions => self.ui_sessions(ui),
+                            Tab::Games => self.ui_games(ui),
+                            Tab::Alarms => self.ui_alarms(ui),
+                            Tab::Timer => self.ui_timer(ui),
+                            Tab::Shortcuts => self.ui_shortcuts(ui),
+                            Tab::About => self.ui_about(ui),
+                        }
+                    });
+            });
+        });
+
+        // Отладочная сетка раскладки (H1): рисуется сразу после главного
+        // окна, слоем Foreground — то есть поверх панелей и диалогов.
+        // Тумблер живёт в «О программе»; в обычной работе выключена.
+        if self.state.cfg_handle.debug_grid {
+            let tokens = self.theme.current().tokens();
+            paint_debug_grid(ctx, tokens.grid, tokens.palette.accent.primary);
+        }
 
         self.windows(ctx);
 
@@ -3226,6 +3567,69 @@ impl eframe::App for TrackerApp {
 
         // Модальный диалог подтверждения обновления — поверх всего.
         self.draw_update_dialog(ctx);
+        // Диалог выхода по крестику (T-1).
+        self.draw_close_dialog(ctx);
+
+        // C4: запоминаем позицию главного окна (восстановим при старте).
+        // Свёрнутое не пишем: его outer_rect — место сворачивания, а не выбор.
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if !minimized {
+            if let Some(min) = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min) {
+                let p = [min.x, min.y];
+                if self.state.cfg_handle.main_window_pos != Some(p) {
+                    self.state.cfg_handle.main_window_pos = Some(p);
+                }
+            }
+        }
+    }
+}
+
+/// Отладочная сетка раскладки поверх окна (H1): 8pt и 64pt.
+///
+/// Рисуется слоем `Order::Foreground`, поэтому ложится поверх панелей,
+/// окон и диалогов главного окна, но под тултипы. Принимает шаг сетки и
+/// цвет, а не `&Tokens`: так геометрию (и защиту от нулевого шага) можно
+/// проверить headless-тестом без окна и без темы.
+fn paint_debug_grid(
+    ctx: &egui::Context,
+    g: crate::ui::theme::tokens::Grid,
+    accent: egui::Color32,
+) {
+    // Защита от мусора в токенах: нулевой или нечисловой шаг дал бы
+    // деление на ноль, а `as usize` из бесконечности — бесконечный цикл.
+    if !g.unit.is_finite() || g.unit <= 0.0 || !g.block.is_finite() || g.block <= 0.0 {
+        return;
+    }
+    let rect = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("debug_grid"),
+    ));
+    // Мелкая сетка еле видна (альфа 20/255), крупная заметна (80/255):
+    // цель — проверять выравнивание, а не любоваться линиями.
+    let fine = egui::Stroke::new(
+        1.0_f32,
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 20),
+    );
+    let bold = egui::Stroke::new(
+        1.0_f32,
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 80),
+    );
+    // Крупная линия — каждая N-я мелкая: при unit 8, block 64 это каждая 8-я.
+    let per_block = ((g.block / g.unit).round() as usize).max(1);
+    // Потолок на число линий: окно 8K при шаге 1pt дало бы десятки тысяч
+    // фигур, а это отладочный оверлей, а не повод уронить кадр.
+    let nx = ((rect.width() / g.unit).floor() as usize).min(4096);
+    let ny = ((rect.height() / g.unit).floor() as usize).min(4096);
+    for i in 0..=nx {
+        let x = rect.left() + i as f32 * g.unit;
+        let s = if i % per_block == 0 { bold } else { fine };
+        painter.vline(x, rect.y_range(), s);
+    }
+    for j in 0..=ny {
+        let y = rect.top() + j as f32 * g.unit;
+        let s = if j % per_block == 0 { bold } else { fine };
+        painter.hline(rect.x_range(), y, s);
     }
 }
 
@@ -3316,17 +3720,24 @@ impl TrackerApp {
                 for a in &act {
                 let secs = (now - a.start).num_seconds().max(0);
                 ui.horizontal_wrapped(|ui| {
-                    if a.pending {
-                        ui.colored_label(
+                    // Индикатор — векторный кружок. Символы `◌` и `●` есть
+                    // только в Hack (Monospace), поэтому в пропорциональной
+                    // подписи они рисовались пустым квадратом.
+                    let (color, text, filled) = if a.pending {
+                        (
                             self.theme.current().tokens().palette.semantic.attention,
-                            "◌ проверка GPU…",
-                        );
+                            "проверка GPU…",
+                            false,
+                        )
                     } else {
-                        ui.colored_label(
+                        (
                             self.theme.current().tokens().palette.semantic.recording,
-                            "● запись",
-                        );
-                    }
+                            "запись",
+                            true,
+                        )
+                    };
+                    status_dot(ui, color, filled);
+                    ui.colored_label(color, text);
                     ui.strong(&a.game_name);
                     ui.label(format!(
                         "{} | CPU {:.1}% | RAM {}МБ | VRAM {}МБ{}",
@@ -3365,13 +3776,13 @@ impl TrackerApp {
                                 let idx = (row * 3 + col) as u8;
                                 let label = match idx {
                                     0 => "↖",
-                                    1 => "↑",
+                                    1 => "⬆",
                                     2 => "↗",
-                                    3 => "←",
+                                    3 => "⬅",
                                     4 => "•",
-                                    5 => "→",
+                                    5 => "➡",
                                     6 => "↙",
-                                    7 => "↓",
+                                    7 => "⬇",
                                     _ => "↘",
                                 };
                                 if ui.selectable_label(self.state.strip_pos == idx, label).clicked()
@@ -3404,7 +3815,7 @@ impl TrackerApp {
             // и слайдер, пока она открыта, нельзя. Дублируем управление
             // стрелками (глобальные хоткеи) — работают всегда.
             ui.label(egui::RichText::new(
-                "При открытой полоске: RShift+←/→ — позиция 3×3, RShift+↑/↓ — прозрачность ±5%, Ctrl+Num± — прозрачность (PIN).",
+                "При открытой полоске: RShift+⬅/➡ — позиция 3×3, RShift+⬆/⬇ — прозрачность ±5%, Ctrl+Num± — прозрачность (PIN).",
             )
             .weak()
             .small());
@@ -3469,7 +3880,13 @@ impl TrackerApp {
                     let is_live = active_map.values().any(|a| !a.pending && a.game_name == row.game_name);
                     tcell(ui, w_game, |ui| {
                         if is_live {
-                            ui.colored_label(egui::Color32::LIGHT_GREEN, format!("● {}", row.game_name));
+                            // Кружок — вектором, а не символом `●`: см.
+                            // `status_dot`. Ячейка таблицы — вертикальная
+                            // раскладка, поэтому кружок и имя в строке.
+                            ui.horizontal(|ui| {
+                                status_dot(ui, egui::Color32::LIGHT_GREEN, true);
+                                ui.colored_label(egui::Color32::LIGHT_GREEN, &row.game_name);
+                            });
                         } else {
                             ui.add(egui::Label::new(&row.game_name).truncate())
                                 .on_hover_text(&row.game_name);
@@ -3516,14 +3933,16 @@ impl TrackerApp {
         // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
         let skin = self.theme.current().clone();
         page_title(ui, skin.tokens(), "Игры и программы под наблюдением");
+        section_tabs(ui, &[("Игры", "Добавляйте игры и находите их в списке."), ("Steam", "Сохраните данные Steam, чтобы сверять общее время игры.")], &mut self.state.games_sub);
+        if self.state.games_sub == 0 {
         // Подраздел 1: сканирование + список.
         card(ui, skin.tokens(), "Сканирование и список игр", |ui| {
             ui.horizontal_wrapped(|ui| {
-            if ui.button("Сканировать Steam").clicked() {
+            if ui.button("Сканировать Steam").on_hover_text("Добавить игры, найденные в установленном Steam").clicked() {
                 let found = detector::scan_steam_games(None);
                 self.merge_scan(found, "Steam");
             }
-            if ui.button("Сканировать Windows").clicked() {
+            if ui.button("Сканировать Windows").on_hover_text("Найти установленные игры по данным Windows").clicked() {
                 let found = detector::scan_windows_games();
                 if found.is_empty() {
                     self.state.scan_msg = "В реестре ничего игрового не найдено.".to_string();
@@ -3531,14 +3950,14 @@ impl TrackerApp {
                     self.merge_scan(found, "Windows");
                 }
             }
-            if ui.button("Указать папку с игрой").clicked() {
+            if ui.button("Указать папку с игрой").on_hover_text("Выбрать папку, где лежит игра").clicked() {
                 self.pick_folder();
             }
-            if ui.button("Из активных процессов").clicked() {
+            if ui.button("Из активных процессов").on_hover_text("Добавить игру, которая сейчас запущена").clicked() {
                 self.state.show_picker = true;
                 self.refresh_picker_list();
             }
-            if ui.button("Вручную (exe)").clicked() {
+            if ui.button("Вручную (exe)").on_hover_text("Выбрать файл запуска игры (.exe)").clicked() {
                 self.pick_exe_manual();
             }
             });
@@ -3621,6 +4040,7 @@ impl TrackerApp {
                 });
             });
         });
+        } else {
         // Подраздел 2: Steam Web API + общее время.
         card(ui, skin.tokens(), "Steam Web API и общее время", |ui| {
             ui.label("API key:");
@@ -3645,6 +4065,7 @@ impl TrackerApp {
                 Игры без часов с пометкой ⊗ в Steam не найдены.",
             );
         });
+        }
     }
 
     fn ui_alarms(&mut self, ui: &mut egui::Ui) {
@@ -3655,7 +4076,9 @@ impl TrackerApp {
             ui,
             "Время любого будильника (в т.ч. неактивного) меняется кнопкой «Изменить» в любой момент.",
         );
+        section_tabs(ui, &[("Список", "Смотрите ближайшие сигналы и меняйте их."), ("Новый", "Задайте время, дни повтора, ссылку или звук.")], &mut self.state.alarms_sub);
 
+        if self.state.alarms_sub == 0 {
         // --- Список будильников: все кнопки действий всегда на месте ---
         // Отзывчивая таблица: ширины колонок — доли ширины окна, длинные
         // значения режутся многоточием (полные — в ховере). При сужении окна
@@ -3728,6 +4151,7 @@ impl TrackerApp {
             });
         });
         });
+        } else {
         card(ui, skin.tokens(), "Новый будильник", |ui| {
         ui.horizontal(|ui| {
             ui.label("Час:");
@@ -3813,6 +4237,9 @@ impl TrackerApp {
         });
         });
 
+        }
+
+        if self.state.alarms_sub == 0 {
         // --- Аналоговые часы активного будильника: НИЖЕ списка,
         // --- чтобы таблица и все кнопки действий всегда оставались на месте.
         let enabled: Vec<AlarmRow> = self.state.alarms.iter().filter(|a| a.enabled).cloned().collect();
@@ -3862,6 +4289,7 @@ impl TrackerApp {
             }
         });
     }
+        }
     }
 
     /// Галочки дней недели Пн..Вс + пресеты «Будни»/«Выходные»/«Ежедневно»/«Разовый».
@@ -3894,11 +4322,20 @@ impl TrackerApp {
         // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
         let skin = self.theme.current().clone();
         page_title(ui, skin.tokens(), "Таймер обратного отсчёта");
+        section_tabs(ui, &[("Таймер", "Запускайте отсчёт и меняйте его звук и быстрые значения."), ("Секундомер", "Засекайте время, отмечайте круги и настраивайте отдельное окошко.")], &mut self.state.timer_sub);
+        if self.state.timer_sub == 0 {
         card(ui, skin.tokens(), "Таймер", |ui| {
+        // T-17: пресеты — из конфига, а не из захардкоженного массива.
+        // Тот же список показывает развёрнутый оверлей секундомера.
+        let presets = self.state.cfg_handle.timer_presets.clone();
         ui.horizontal_wrapped(|ui| {
-            for (label, secs) in [("1 мин", 60u64), ("5 мин", 300), ("10 мин", 600), ("15 мин", 900), ("30 мин", 1800), ("1 час", 3600)] {
-                if ui.button(label).clicked() {
-                    self.start_timer(secs);
+            for min in presets {
+                if ui
+                    .button(timer_preset_label(min))
+                    .on_hover_text(format!("Запустить таймер на {min} мин"))
+                    .clicked()
+                {
+                    self.start_timer(min as u64 * 60);
                 }
             }
         });
@@ -3914,6 +4351,63 @@ impl TrackerApp {
                 self.state.sound.stop();
             }
         });
+        // ---------- Правка пресетов (T-17) ----------
+        // Полноценный редактор живёт здесь, а не в оверлее: там у окна
+        // WS_EX_NOACTIVATE нет клавиатуры, цифры с клавиатуры не набрать.
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Пресеты:");
+            ui.label(
+                egui::RichText::new("быстрый запуск — здесь и в развёрнутом оверлее секундомера")
+                    .small()
+                    .weak(),
+            );
+        });
+        let mut edited = self.state.cfg_handle.timer_presets.clone();
+        let mut remove: Option<usize> = None;
+        let mut settle = false;
+        ui.horizontal_wrapped(|ui| {
+            for (i, min) in edited.iter_mut().enumerate() {
+                let r = ui.add_sized(
+                    [76.0, 0.0],
+                    egui::DragValue::new(min)
+                        .range(TIMER_PRESET_MIN..=TIMER_PRESET_MAX)
+                        .suffix(" мин"),
+                );
+                if r.drag_stopped() || r.lost_focus() {
+                    settle = true;
+                }
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Убрать пресет")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Добавить:");
+            time_field(ui, &mut self.state.timer_min, 1440);
+            self.state.timer_min = self.state.timer_min.max(1);
+            if ui.button("+ В пресеты").clicked() {
+                edited.push(self.state.timer_min as u32);
+                settle = true;
+            }
+        });
+        if settle {
+            if let Some(i) = remove {
+                if i < edited.len() {
+                    edited.remove(i);
+                }
+            }
+            self.state.cfg_handle.timer_presets = sanitize_timer_presets(&edited);
+        } else if edited != self.state.cfg_handle.timer_presets {
+            // Правка идёт прямо сейчас: значение уже зажато range, но список
+            // НЕ сортируем и не дедуплицируем — иначе поле уезжает из-под
+            // курсора. Порядок наведём, когда правка закончится.
+            self.state.cfg_handle.timer_presets = edited;
+        }
         ui.horizontal_wrapped(|ui| {
             // Ширина полей — доля строки (как в будильниках): блок не
             // разъезжается на широком мониторе и не ломается на узком.
@@ -3968,6 +4462,7 @@ impl TrackerApp {
             ui.label("Нет активного таймера");
         }
         });
+        } else {
 
         // ---------- Секундомер ----------
         card(ui, skin.tokens(), "Секундомер", |ui| {
@@ -4029,10 +4524,12 @@ impl TrackerApp {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("Круги: {} / 99", self.state.stopwatch_laps.len()));
                 // Явные стрелки прокрутки (колесо мыши тоже работает).
-                if ui.small_button("▲").clicked() {
+                // ⏶/⏷ U+23F6/23F7 — треугольники из emoji-icon-font: глифов
+                // ▲/▼ в пропорциональном семействе egui нет.
+                if ui.small_button("⏶").clicked() {
                     self.state.laps_scroll = (self.state.laps_scroll - 60.0).max(0.0);
                 }
-                if ui.small_button("▼").clicked() {
+                if ui.small_button("⏷").clicked() {
                     self.state.laps_scroll += 60.0;
                 }
             });
@@ -4064,49 +4561,14 @@ impl TrackerApp {
             self.state.laps_scroll = laps_out.state.offset.y;
         }
         });
+        }
     }
 
     fn ui_shortcuts(&mut self, ui: &mut egui::Ui) {
         // Локальный Arc: замыкания ниже берут &mut self, напрямую через self.theme было бы пересечение заимствований.
         let skin = self.theme.current().clone();
         page_title(ui, skin.tokens(), "Параметры");
-        page_note(ui, "Масштаб интерфейса, авто-трекинг и горячие клавиши.");
-        card(ui, skin.tokens(), "Масштаб интерфейса", |ui| {
-        ui.label("Ползунок применяется после отпускания, шаги — кнопками −/+, сброс — 100%.");
-        ui.horizontal_wrapped(|ui| {
-            if ui.small_button("100%").clicked() {
-                self.commit_scale(BASE_SCALE);
-            }
-            // Слева меньше, справа больше: [−][ползунок][+].
-            if ui.small_button("−").clicked() {
-                self.commit_scale(self.state.cfg_handle.ui_scale - 0.05);
-            }
-            let committed = self.state.cfg_handle.ui_scale.clamp(0.8, 2.0);
-            let mut draft = self.state.scale_draft.unwrap_or(committed);
-            let resp = ui.add(
-                egui::Slider::new(&mut draft, 0.8..=2.0)
-                    .fixed_decimals(2)
-                    .show_value(false),
-            );
-            if resp.changed() {
-                self.state.scale_draft = Some(draft);
-                if !resp.dragged() {
-                    // Изменение не перетаскиванием (клавиатура) —
-                    // дискретный шаг, применяем сразу.
-                    self.commit_scale(draft);
-                }
-            }
-            if resp.drag_stopped() {
-                self.commit_scale(draft);
-            }
-            if ui.small_button("+").clicked() {
-                self.commit_scale(self.state.cfg_handle.ui_scale + 0.05);
-            }
-            let shown = self.state.scale_draft.unwrap_or(committed);
-            ui.label(format!("{}%", (shown / BASE_SCALE * 100.0).round() as i32))
-                .on_hover_text("100% = базовый масштаб (бывшие 130%)");
-        });
-        });
+        page_note(ui, "Авто-трекинг и горячие клавиши. Быстрые параметры находятся справа.");
         // Обновления: частота, автоматическая проверка, «ставить молча».
         card(ui, skin.tokens(), "Обновления", |ui| {
             // Черновики живут в AppState, а не в локальном клоне: клон
@@ -4233,7 +4695,6 @@ impl TrackerApp {
             ui.add(egui::Slider::new(&mut c.grace_secs, 2..=120).text("Пауза до завершения сессии (сек)"));
             ui.add(egui::Slider::new(&mut c.confirm_hits, 1..=10).text("Подтверждений для старта"));
             ui.add(egui::Slider::new(&mut c.day_start_hour, 0..=23).text("Начало игровых суток (час)"));
-            ui.checkbox(&mut c.auto_scan_enabled, "Автосканирование каждый час");
             if ui.button("Применить").clicked() {
                 if let Ok(mut g) = self.state.cfg.write() {
                     *g = c.clone();
@@ -4317,24 +4778,7 @@ impl TrackerApp {
     }
 
     fn ui_about(&mut self, ui: &mut egui::Ui) {
-        // Подразделы сверху: О программе | Документация | Журнал | Клавиши.
-        // Ряд и разделитель — на общей вертикали с карточками (page_row),
-        // иначе переключатель подразделов торчал левее их заголовков.
-        page_row(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (i, label) in [
-                    (0u8, "О программе"),
-                    (1, "Документация"),
-                    (2, "Журнал изменений"),
-                    (3, "Горячие клавиши"),
-                ] {
-                    if ui.selectable_label(self.state.about_sub == i, label).clicked() {
-                        self.state.about_sub = i;
-                    }
-                }
-            });
-        });
-        page_rule(ui);
+        section_tabs(ui, &[("О программе", "Версия приложения и обновления."), ("Документация", "Справка по возможностям."), ("Журнал", "Что изменилось в выпусках."), ("Горячие клавиши", "Список быстрых команд.")], &mut self.state.about_sub);
         egui::ScrollArea::vertical().show(ui, |ui| {
             match self.state.about_sub {
                 0 => self.about_program(ui),
@@ -5015,6 +5459,17 @@ fn detect_day_preset(days: &[bool; 7]) -> Option<DayPreset> {
     None
 }
 
+/// Подпись пресета таймера: минуты → «15м», «1ч», «1ч30м». Компактно, потому
+/// что в развёрнутом оверлее под все пресеты отведена одна строка.
+fn timer_preset_label(min: u32) -> String {
+    let (h, m) = (min / 60, min % 60);
+    match (h, m) {
+        (0, m) => format!("{m}м"),
+        (h, 0) => format!("{h}ч"),
+        (h, m) => format!("{h}ч{m}м"),
+    }
+}
+
 /// Поле времени с жёстким лимитом: ручной ввод больше max невозможен
 /// (значение режется каждый кадр), ширина фиксирована — окно не разъезжается.
 /// Часы: max=23 (24:00 не бывает — это уже 00:00 следующего дня).
@@ -5185,8 +5640,15 @@ pub const PAGE_MARGIN_MIN: f32 = 8.0;
 pub const PAGE_MARGIN_MAX: f32 = 60.0;
 
 /// Поля страницы разделов для окна шириной w: одинаковые слева и справа.
+/// Формула живёт в `PageMargin::for_width` (ui/layout/spec.rs) — здесь
+/// только обёртка: две копии формулы уже расходились молча (H1).
 pub fn page_margin(w: f32) -> f32 {
-    (w * PAGE_MARGIN_PCT).clamp(PAGE_MARGIN_MIN, PAGE_MARGIN_MAX)
+    crate::ui::layout::spec::PageMargin {
+        percent: PAGE_MARGIN_PCT,
+        min: PAGE_MARGIN_MIN,
+        max: PAGE_MARGIN_MAX,
+    }
+    .for_width(w)
 }
 
 /// Отступ строк уровня раздела (заголовок, пояснение, разделитель, переключатель
@@ -5241,6 +5703,29 @@ fn page_rule(ui: &mut egui::Ui) {
     page_row(ui, |ui| {
         ui.separator();
     });
+}
+
+/// Вкладки подразделов: короткие названия, пояснение при наведении и простая
+/// подсказка под строкой. Индекс хранится между кадрами в AppState.
+fn section_tabs(ui: &mut egui::Ui, tabs: &[(&str, &str)], selected: &mut u8) {
+    if tabs.is_empty() {
+        return;
+    }
+    *selected = (*selected as usize).min(tabs.len() - 1) as u8;
+    page_row(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (index, (label, tip)) in tabs.iter().enumerate() {
+                let response = ui.selectable_label(*selected as usize == index, *label);
+                if response.on_hover_text(*tip).clicked() {
+                    *selected = index as u8;
+                }
+            }
+        });
+    });
+    page_row(ui, |ui| {
+        ui.label(egui::RichText::new(tabs[*selected as usize].1).small().weak());
+    });
+    page_rule(ui);
 }
 
 /// Карточка раздела в web-стиле: скруглённая панель с заголовком-акцентом
@@ -5582,23 +6067,77 @@ fn clamp_overlay_pos(p: [f32; 2], work: (i32, i32, i32, i32), size: (i32, i32)) 
 /// поэтому окно идёт строго за курсором 1:1 без лагов, двоения и залипаний:
 /// никаких покадровых команд и шторма перерисовок. Вне Windows — запасной
 /// вариант с накоплением дельт (см. accumulate_drag_pos).
+///
+/// MT-1: OS-move стартует НЕ на нажатие, а после сдвига курсора дальше
+/// DRAG_THRESHOLD_PX. Раньше `drag_started_by` (кадр нажатия) сразу уводил
+/// мышь в модальный OS-move, и кнопки оверлеев никогда не получали release:
+/// clicked() не срабатывал. Теперь клик без движения доходит до кнопок,
+/// а потягивание по-прежнему таскает окно.
+///
+/// T-16: жест считаем по СЫРОМУ состоянию указателя (`primary_pressed` /
+/// `primary_down` / `latest_pos`), а не через `Sense::drag`. У оверлеев стоит
+/// WS_EX_NOACTIVATE (T-14) — фокус в окно не приходит, и egui на первом жесте
+/// не отдаёт `drag_started`/`dragged`: первый драг пропадал, окно ехало
+/// только со второй попытки. События ввода от фокуса не зависят, поэтому
+/// первый же жест работает сразу. `Sense::drag` фону больше не нужен — он
+/// регистрируется как hover-виджет (кнопки рисуются позже и лежат выше).
+pub const DRAG_THRESHOLD_PX: f32 = 3.0;
+
 fn viewport_drag(
     ui: &mut egui::Ui,
     _vp_id: egui::ViewportId,
     drag_id: egui::Id,
     last_cmd: &mut Option<egui::Pos2>,
+    press_origin: &mut Option<egui::Pos2>,
     title: &str,
 ) {
-    let bg = ui.interact(ui.max_rect(), drag_id, egui::Sense::drag());
-    if bg.drag_started_by(egui::PointerButton::Primary) {
+    // Фон остаётся зарегистрированным виджетом (кнопки и дальше лежат выше
+    // него в hit-test), но drag-sense ему больше не нужен: жест считаем сами,
+    // см. T-16 выше. Заодно уходит риск «залипшего» dragged_id, если release
+    // потеряется в модальном цикле OS-move.
+    let bg_rect = ui.max_rect();
+    let _bg = ui.interact(bg_rect, drag_id, egui::Sense::hover());
+
+    // Сырое состояние указателя: у каждого viewport свой InputState, поэтому
+    // сюда попадают только события этого окна и от фокуса они не зависят.
+    let (pressed, down, latest, origin) = ui.ctx().input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.latest_pos(),
+            i.pointer.press_origin(),
+        )
+    });
+
+    if pressed {
+        // Только запоминаем точку нажатия — OS-move ниже, по порогу.
+        // Нажатие должно попасть в фон, а не в невидимую рамку ресайза.
+        let pos = origin.or(latest);
+        *press_origin = pos.filter(|p| bg_rect.contains(*p));
         *last_cmd = None;
-        #[cfg(windows)]
-        native_window_drag(title);
     }
-    #[cfg(not(windows))]
-    {
-        let delta = bg.drag_delta();
-        if delta != egui::Vec2::ZERO {
+
+    if !down {
+        // Кнопку отпустили (или жест не наш) — состояние жеста сброшено.
+        *press_origin = None;
+        *last_cmd = None;
+    } else {
+        // Суммарный сдвиг от точки нажатия (не покадровая дельта: медленное
+        // ведение < 3px/кадр тоже должно схватываться).
+        let moved_far = match (*press_origin, latest) {
+            (Some(o), Some(p)) => p.distance(o) > DRAG_THRESHOLD_PX,
+            _ => false,
+        };
+        #[cfg(windows)]
+        if moved_far {
+            // Однократно за жест: после старта OS-move владеет мышью,
+            // повторный старт не нужен.
+            *press_origin = None;
+            native_window_drag(title);
+        }
+        #[cfg(not(windows))]
+        if moved_far {
+            let delta = ui.ctx().input(|i| i.pointer.delta());
             let ctx = ui.ctx().clone();
             let outer_min = ctx
                 .input(|i| i.viewport().outer_rect)
@@ -5607,14 +6146,11 @@ fn viewport_drag(
             let next = accumulate_drag_pos(*last_cmd, outer_min, delta);
             let next = egui::Pos2::new(next.x.round(), next.y.round());
             if *last_cmd != Some(next) {
-                ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::OuterPosition(next));
+                ctx.send_viewport_cmd_to(_vp_id, egui::ViewportCommand::OuterPosition(next));
                 *last_cmd = Some(next);
             }
-            ctx.request_repaint_after_for(Duration::from_millis(16), vp_id);
+            ctx.request_repaint_after_for(Duration::from_millis(16), _vp_id);
         }
-    }
-    if bg.drag_stopped() {
-        *last_cmd = None;
     }
 }
 
@@ -5821,9 +6357,15 @@ fn overlay_window_style(base: i32) -> i32 {
 fn ensure_thickframe(title: &str) {
     use std::cell::RefCell;
     use winapi::um::winuser::{
-        FindWindowW, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        FindWindowW, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
+    // WS_EX_NOACTIVATE: окно никогда не забирает фокус, но получает клики.
+    // Лечит T-14: без него первое нажатие по неактивному borderless-окну
+    // Windows съедает на активацию (кнопкам нужен второй клик).
+    // winit 0.29 `with_active(false)` НЕ ставит этот стиль (только
+    // MARKER_ACTIVATE при создании), поэтому правим напрямую WinAPI.
+    const WS_EX_NOACTIVATE: i32 = 0x0800_0000;
     thread_local! {
         /// Заголовки окон, стиль которых уже выправлен.
         static PATCHED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -5840,8 +6382,18 @@ fn ensure_thickframe(title: &str) {
         }
         let st = GetWindowLongW(hwnd, GWL_STYLE);
         let want = overlay_window_style(st);
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let want_ex = ex | WS_EX_NOACTIVATE;
+        let mut changed = false;
         if want != st {
             SetWindowLongW(hwnd, GWL_STYLE, want);
+            changed = true;
+        }
+        if want_ex != ex {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, want_ex);
+            changed = true;
+        }
+        if changed {
             // SWP_FRAMECHANGED обязателен: без него новый стиль не
             // применяется до следующего изменения размера.
             SetWindowPos(
@@ -6548,7 +7100,7 @@ mod tests {
                 );
                 assert!(
                     cx >= m.0 && cy >= m.1 && cx + w <= m.2 && cy + h <= m.3,
-                    "позиция {idx} на {m:?} → ({cx},{cy}) мимо экрана"
+                    "позиция {idx} на {m:?} › ({cx},{cy}) мимо экрана"
                 );
             }
         }
@@ -6796,7 +7348,7 @@ mod tests {
                         ui.add_space(10.0);
                         // Строка 4: чипы в обоих состояниях.
                         ui.horizontal(|ui| {
-                            for (label, on) in [("PIN", false), ("PIN", true), ("⤢", false), ("⤡", true)] {
+                            for (label, on) in [("PIN", false), ("PIN", true), ("⛶", false), ("⛶", true)] {
                                 let vis = DefaultSkin::default().egui_style().visuals;
                                 let sel = vis.selection.bg_fill;
                                 let accent = egui::Color32::from_rgb(0x66, 0xC0, 0xF4);
@@ -6950,27 +7502,21 @@ mod tests {
     }
 
     #[test]
-    fn update_button_uses_yellow_accent() {
+    fn update_button_uses_blue_accent() {
         let skin = DefaultSkin::default();
-        // Требование: жёлтая окантовка и жёлтая стрелка. Проверяем именно
-        // жёлтость (в канале R и G много, в B мало), а не «тёплый цвет»:
-        // иначе кнопка однажды станет оранжевой и это не заметят.
+        // Пилюля использует назначенный акцент, а стрелка контрастирует с фоном.
         for (name, p) in [
             ("покой", update_notice_paint(skin.tokens(), false, false)),
             ("наведение", update_notice_paint(skin.tokens(), true, false)),
             ("нажата", update_notice_paint(skin.tokens(), true, true)),
         ] {
-            let is_yellow = |c: egui::Color32| {
-                c.r() > 180 && c.g() > 130 && c.b() < 120 && c.r() > c.b() + 100
-            };
-            assert!(is_yellow(p.border), "{name}: окантовка не жёлтая: {:?}", p.border);
-            assert!(is_yellow(p.arrow), "{name}: стрелка не жёлтая: {:?}", p.arrow);
-            // Внутренняя подсветка обязана быть — она и создаёт «свечение».
-            assert!(
-                p.glow.a() >= 20,
-                "{name}: нет подсветки изнутри (альфа {})",
-                p.glow.a()
-            );
+            assert_eq!(p.border, skin.tokens().palette.accent.dim, "{name}");
+            assert_eq!(p.arrow, skin.tokens().palette.text.on_accent, "{name}");
+            if name == "покой" {
+                assert_eq!(p.glow.a(), 0, "idle state should stay quiet");
+            } else {
+                assert!(p.glow.a() >= 20, "hover feedback should be visible");
+            }
         }
     }
 
@@ -6990,39 +7536,28 @@ mod tests {
             relative_luminance(down.bg) < relative_luminance(rest.bg),
             "нажатие должно быть темнее покоя"
         );
-        assert!(down.pressed, "нажатие не отмечено");
-        assert!(!rest.pressed, "в покое нажатия быть не должно");
         // Три состояния попарно различны.
         assert_ne!(rest.bg, over.bg);
         assert_ne!(over.bg, down.bg);
-        // Стрелка на нажатии притухает, но остаётся жёлтой и различимой.
-        assert_ne!(rest.arrow, down.arrow, "стрелка не реагирует на нажатие");
-        assert!(down.arrow.r() > 150, "стрелка на нажатии погасла: {:?}", down.arrow);
+        // Текст/иконка остаются контрастными во всех состояниях.
+        assert!(contrast_ratio(down.arrow, down.bg) >= 3.0);
     }
 
     #[test]
     fn update_button_elements_are_readable() {
         let skin = DefaultSkin::default();
-        // Стрелка и окантовка — графические элементы, для них достаточно
-        // 3:1 (WCAG 1.4.11), но текста-подписи рядом нет, поэтому держим
-        // 3:1 и не ниже.
+        // Иконка и текст должны оставаться читаемыми на синем фоне.
         const MIN: f32 = 3.0;
         for (name, p) in [
             ("покой", update_notice_paint(skin.tokens(), false, false)),
             ("наведение", update_notice_paint(skin.tokens(), true, false)),
             ("нажата", update_notice_paint(skin.tokens(), true, true)),
         ] {
-            // Стрелка лежит на фоне, в который подмешан жёлтый.
+            // Текст и иконка должны читаться на синем фоне кнопки.
             let arrow_cr = contrast_ratio(p.arrow, p.bg);
             assert!(
                 arrow_cr >= MIN,
                 "{name}: стрелка на фоне {arrow_cr:.2} < {MIN}"
-            );
-            // Окантовка должна отличаться от фона — иначе кнопки не видно.
-            let border_cr = contrast_ratio(p.border, p.bg);
-            assert!(
-                border_cr >= MIN,
-                "{name}: окантовка на фоне {border_cr:.2} < {MIN}"
             );
         }
         println!(
@@ -7035,8 +7570,7 @@ mod tests {
 
     #[test]
     fn update_button_appears_only_when_version_known() {
-        // Кнопка показывается, только если версия реально найдена: иначе
-        // висит жёлтый треугольник, а скачивать нечего.
+        // Кнопка показывается, только если версия реально найдена.
         assert!(should_show_update_notice(Some("0.9.1")));
         assert!(!should_show_update_notice(None));
         assert!(!should_show_update_notice(Some("")));
@@ -7050,10 +7584,9 @@ mod tests {
     }
 
     #[test]
-    fn update_button_fits_top_right_corner() {
-        // Кнопка не должна быть больше доступной полосы и не должна
-        // вылезать за правое поле страницы.
-        assert!(UPDATE_BTN <= 64.0, "кнопка слишком крупная: {UPDATE_BTN}");
+    fn update_button_pill_fits_topbar() {
+        // Компактная пилюля должна помещаться рядом с заголовком окна.
+        assert!(UPDATE_BTN <= 160.0, "пилюля слишком широкая: {UPDATE_BTN}");
         assert!(UPDATE_BTN >= 28.0, "кнопка слишком мелкая: {UPDATE_BTN}");
         // На самом узком допустимом окне (минимум 720pt) кнопка и поля
         // должны помещаться.
@@ -7066,9 +7599,8 @@ mod tests {
     }
 
     #[test]
-    fn update_button_is_in_top_right_corner() {
-        // Кнопка должна быть прижата к правому краю и стоять в верхней
-        // строке, а не где попало. Ширину задаём явно: в headless
+    fn update_button_slot_stays_inside_topbar_row() {
+        // Размер слота для пилюли помещается в верхнюю строку. Ширину задаём явно: в headless
         // set_max_width не уменьшает available_width.
         let win_w = 900.0_f32;
         let ctx = egui::Context::default();
@@ -7086,11 +7618,11 @@ mod tests {
                         ui.allocate_ui_at_rect(r, |ui| {
                             let w = ui.available_width();
                             ui.allocate_ui_with_layout(
-                                egui::vec2(w, UPDATE_BTN),
+                                egui::vec2(w, UPDATE_BTN_HEIGHT),
                                 egui::Layout::right_to_left(egui::Align::Min),
                                 |ui| {
                                     let (br, _) = ui.allocate_exact_size(
-                                        egui::vec2(UPDATE_BTN, UPDATE_BTN),
+                                        egui::vec2(UPDATE_BTN, UPDATE_BTN_HEIGHT),
                                         egui::Sense::hover(),
                                     );
                                     btn = br;
@@ -7116,13 +7648,12 @@ mod tests {
         assert_eq!(btn_rect.min.y, 0.0, "кнопка не в верхней строке: {:?}", btn_rect);
         // Размеры — как объявлено.
         assert_eq!(btn_rect.width(), UPDATE_BTN);
-        assert_eq!(btn_rect.height(), UPDATE_BTN);
+        assert_eq!(btn_rect.height(), UPDATE_BTN_HEIGHT);
         // Под кнопкой остаётся место под контент.
-        assert!(content_y >= UPDATE_BTN, "контент начинается выше кнопки: {content_y}");
+        assert!(content_y >= UPDATE_BTN_HEIGHT, "контент начинается выше кнопки: {content_y}");
     }
 
-    /// Превью кнопки обновления: все состояния рядом, чтобы увидеть
-    /// жёлтую окантовку, подсветку изнутри и стрелку.
+    /// Превью кнопки обновления: все состояния рядом.
     ///
     /// `cargo test update_button_preview_png -- --ignored --nocapture`
     /// → `target/update_button_preview.png`
@@ -7161,7 +7692,7 @@ mod tests {
                                 ui.vertical(|ui| {
                                     let p = update_notice_paint(skin.tokens(), hov, dn);
                                     let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(UPDATE_BTN, UPDATE_BTN),
+                                        egui::vec2(UPDATE_BTN, UPDATE_BTN_HEIGHT),
                                         egui::Sense::hover(),
                                     );
                                     let rounding = egui::Rounding::same(UPDATE_BTN_ROUND);
@@ -7350,6 +7881,52 @@ mod tests {
         assert!(wide > content, "широкое окно должно вмещать таблицу целиком");
     }
 
+    /// Каждый символ, которым интерфейс пишет текст, обязан иметь глиф в
+    /// ПРОПОРЦИОНАЛЬНОМ семействе шрифтов egui.
+    ///
+    /// Ловушка, из-за которой в UI появлялись пустые квадраты: `Hack`
+    /// подключён только к `FontFamily::Monospace`. Пропорциональное
+    /// семейство — это Ubuntu-Light → NotoEmoji-Regular → emoji-icon-font.
+    /// Символ, который есть в Hack и нет ни в одном из этих трёх, в подписи
+    /// рисуется пустым квадратом, а в моноширинном тексте — нормально.
+    /// Именно так вели себя `●` U+25CF, `◌` U+25CC, `→` U+2192, `←` U+2190,
+    /// `↑` U+2191, `↓` U+2193, `▲` U+25B2, `▼` U+25BC, `⤢` U+2922 и
+    /// `⤡` U+2921. В интерфейсе их больше нет.
+    ///
+    /// Добавили в подпись новый символ — впишите его в `SYMBOLS`.
+    #[test]
+    fn ui_text_symbols_have_glyphs_in_the_proportional_font() {
+        // Ровно те символы, что встречаются в строковых литералах app.rs.
+        const SYMBOLS: &str = "©«±·»×Σ–—•…›№↖↗↘↙−≈≥⊗⏶⏷⛶➡⬅⬆⬇";
+        let ctx = egui::Context::default();
+        let font = egui::FontId::proportional(14.0);
+        let mut missing: Vec<String> = Vec::new();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                for c in SYMBOLS.chars() {
+                    if !ctx.fonts(|f| f.has_glyph(&font, c)) {
+                        missing.push(format!("{c} U+{:04X}", c as u32));
+                    }
+                }
+            },
+        );
+        assert!(
+            missing.is_empty(),
+            "нет глифа в пропорциональном шрифте: {}. Такой символ есть \
+             только в Hack (Monospace), и в подписи он станет пустым \
+             квадратом. Возьмите глиф из Ubuntu-Light / NotoEmoji / \
+             emoji-icon-font либо нарисуйте вектор (см. widgets::status_dot).",
+            missing.join(", ")
+        );
+    }
+
     #[test]
     fn changelog_has_no_future_dates() {
         // Дата релиза не может быть в будущем: запись в журнале значит
@@ -7382,11 +7959,14 @@ mod tests {
         // Он не должен указывать на несуществующую дату: с номером сборки из
         // будущего манифест и надпись на экране расходятся.
         let b = BUILD;
-        assert_eq!(b.len(), 8, "BUILD должен быть в формате YYYYMMDD: {b}");
-        assert!(b.chars().all(|c| c.is_ascii_digit()), "BUILD не цифры: {b}");
-        let year: i32 = b[0..4].parse().unwrap();
-        let month: u32 = b[4..6].parse().unwrap();
-        let day: u32 = b[6..8].parse().unwrap();
+        let parts: Vec<&str> = b.split('.').collect();
+        assert_eq!(parts.len(), 3, "BUILD должен быть в формате DD.MM.YYYY: {b}");
+        assert!(parts[0].len() == 2 && parts[1].len() == 2 && parts[2].len() == 4
+            && parts.iter().all(|part| part.chars().all(|c| c.is_ascii_digit())),
+            "BUILD должен содержать дату DD.MM.YYYY: {b}");
+        let day: u32 = parts[0].parse().unwrap();
+        let month: u32 = parts[1].parse().unwrap();
+        let year: i32 = parts[2].parse().unwrap();
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
             .unwrap_or_else(|| panic!("BUILD={b} не существует как дата"));
         let today = chrono::Local::now().date_naive();
@@ -7655,12 +8235,80 @@ mod tests {
     fn page_margin_symmetric_and_bounded() {
         // 5% на обычном окне.
         assert!((page_margin(960.0) - 48.0).abs() < 0.01);
-        // 6K: 5% съело бы 288 точек — ограничиваем 60.
-        assert_eq!(page_margin(5760.0), 60.0);
-        // Узкое окно: минимум 8.
+        // 6K: 5% съело бы 288 точек — ограничиваем 60, затем выравниваем
+        // по сетке 8pt: ближайший шаг к 60 — это 64.
+        assert_eq!(page_margin(5760.0), 64.0);
+        // Узкое окно: минимум 8 (уже кратен сетке).
         assert_eq!(page_margin(120.0), 8.0);
         // Поля слева и справа одинаковые по определению функции.
         assert_eq!(page_margin(1920.0), page_margin(1920.0));
+    }
+
+    #[test]
+    fn debug_grid_draws_unit_and_block_lines() {
+        // Оверлей проверяется без окна: egui отдаёт нарисованные фигуры
+        // в FullOutput, поэтому геометрию сетки видно прямо в тесте.
+        use crate::ui::theme::Skin;
+        let skin = crate::ui::theme::default::DefaultSkin::default();
+        let tokens = skin.tokens();
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+        let out = ctx.run(input, |ctx| {
+            paint_debug_grid(ctx, tokens.grid, tokens.palette.accent.primary)
+        });
+
+        let mut v: Vec<(f32, u8)> = Vec::new(); // (координата, альфа)
+        let mut h: Vec<(f32, u8)> = Vec::new();
+        for cs in &out.shapes {
+            let egui::Shape::LineSegment { points, stroke } = &cs.shape else {
+                continue;
+            };
+            let egui::epaint::ColorMode::Solid(color) = &stroke.color else {
+                continue;
+            };
+            assert_eq!(stroke.width, 1.0, "толщина линии сетки");
+            if (points[0].x - points[1].x).abs() < 0.001 {
+                v.push((points[0].x, color.a()));
+            } else {
+                h.push((points[0].y, color.a()));
+            }
+        }
+        // Сетка идёт от края окна: 1920/8 + 1 и 1080/8 + 1 линий.
+        assert_eq!(v.len(), 241, "вертикальных линий 8pt");
+        assert_eq!(h.len(), 136, "горизонтальных линий 8pt");
+        // Крупная линия — каждая восьмая (64pt): альфа 80 против 20.
+        assert_eq!(v.iter().filter(|(_, a)| *a == 80).count(), 31, "линий 64pt по X");
+        assert_eq!(h.iter().filter(|(_, a)| *a == 80).count(), 17, "линий 64pt по Y");
+        // Каждая линия стоит ровно на шаге сетки от края окна.
+        for (x, _) in &v {
+            assert_eq!(x % 8.0, 0.0, "вертикальная линия не на сетке: {x}");
+        }
+        for (y, _) in &h {
+            assert_eq!(y % 8.0, 0.0, "горизонтальная линия не на сетке: {y}");
+        }
+    }
+
+    #[test]
+    fn debug_grid_ignores_broken_tokens() {
+        // Нулевой шаг не должен превращаться в бесконечный цикл:
+        // функция обязана просто ничего не рисовать.
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1080.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            let broken = crate::ui::theme::tokens::Grid { unit: 0.0, block: 64.0 };
+            paint_debug_grid(ctx, broken, egui::Color32::WHITE);
+        });
+        assert!(
+            out.shapes.is_empty(),
+            "при нулевом шаге сетка не должна рисоваться"
+        );
     }
 
     #[test]
@@ -8203,7 +8851,7 @@ mod tests {
                     // Полоска целиком внутри рабочей области одного экрана.
                     assert!(
                         cx >= m.0 && cy >= m.1 && cx + w <= m.2 && cy + h <= m.3,
-                        "конфигурация {mons:?}: позиция {idx} на {m:?} → ({cx},{cy}) не видна"
+                        "конфигурация {mons:?}: позиция {idx} на {m:?} › ({cx},{cy}) не видна"
                     );
                     // И верхний левый угол попадает внутрь экрана (не в пустоту
                     // между мониторами).
@@ -8212,7 +8860,7 @@ mod tests {
                     });
                     assert!(
                         on_screen,
-                        "конфигурация {mons:?}: позиция {idx} → ({cx},{cy}) вне всех экранов"
+                        "конфигурация {mons:?}: позиция {idx} › ({cx},{cy}) вне всех экранов"
                     );
                 }
             }
@@ -8318,5 +8966,16 @@ mod tests {
         let s = format_lap_line(12, Duration::from_millis(34200), Duration::from_millis(131500));
         assert_eq!(s, "К12 · 00:34.200 · Σ02:11.500");
         assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn timer_preset_labels_are_compact() {
+        // T-17: подписи пресетов в оверлее — короткие, одна строка на все.
+        assert_eq!(timer_preset_label(1), "1м");
+        assert_eq!(timer_preset_label(15), "15м");
+        assert_eq!(timer_preset_label(59), "59м");
+        assert_eq!(timer_preset_label(60), "1ч");
+        assert_eq!(timer_preset_label(90), "1ч30м");
+        assert_eq!(timer_preset_label(1440), "24ч");
     }
 }

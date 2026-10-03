@@ -33,6 +33,11 @@ $PrevDir = Join-Path (Get-Location) 'dist\old'
 # Без -Archive скрипт только пересобирает манифест (после make-setup).
 
 if ($args -contains '-Archive') {
+    $fresh = Join-Path (Get-Location) 'target\release\game-session-tracker.exe'
+    if (-not (Test-Path $fresh)) {
+        throw "Нет релизной сборки: $fresh (сначала cargo build --release)"
+    }
+    $freshHash = (Get-FileHash $fresh -Algorithm SHA256).Hash
     if (Test-Path 'TraySession.exe') {
         $oldVer = 'без-версии'
         if (Test-Path 'update_manifest.json') {
@@ -42,15 +47,27 @@ if ($args -contains '-Archive') {
         }
         New-Item -ItemType Directory -Force -Path $PrevDir | Out-Null
         $dest = Join-Path $PrevDir ("TraySession_$oldVer.exe")
-        Copy-Item 'TraySession.exe' $dest -Force
-        Write-Host "Прошлая сборка сохранена: $dest"
+        # ARC-1: в корне уже может лежать СВЕЖАЯ сборка (её кладут до
+        # вызова скрипта) — тогда копия из корня это не «прошлая сборка»,
+        # а новая под старым именем. Надёжный источник прошлой сборки —
+        # git (релизные бинарники коммитятся, HEAD ещё указывает на
+        # прошлый релиз). Повторный прогон идемпотентен.
+        $rootHash = (Get-FileHash 'TraySession.exe' -Algorithm SHA256).Hash
+        if ($rootHash -ne $freshHash) {
+            Copy-Item 'TraySession.exe' $dest -Force
+            Write-Host "Прошлая сборка сохранена из корня: $dest"
+        } else {
+            cmd /c "git show HEAD:TraySession.exe > ""$dest""" 2>$null
+            if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) {
+                Write-Host "Прошлая сборка взята из git (HEAD:TraySession.exe): $dest"
+            } else {
+                if (Test-Path $dest) { Remove-Item $dest -Force }
+                Write-Warning "git недоступен и корень уже перезаписан — архив пропущен: $dest"
+            }
+        }
     }
     # Копируем свежую сборку сами: иначе манифест соберётся по старому
     # файлу, который остался в корне от прошлого раза.
-    $fresh = Join-Path (Get-Location) 'target\release\game-session-tracker.exe'
-    if (-not (Test-Path $fresh)) {
-        throw "Нет релизной сборки: $fresh (сначала cargo build --release)"
-    }
     Copy-Item $fresh (Join-Path (Get-Location) 'TraySession.exe') -Force
     # Деактиватор — тот же файл, он узнаёт себя по имени.
     Copy-Item $fresh (Join-Path (Get-Location) '_uninstall.exe') -Force
@@ -66,7 +83,7 @@ if ($Cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
     throw 'Не нашёл version в Cargo.toml'
 }
 $Version = $Matches[1]
-$Build = (Get-Date -Format 'yyyyMMdd')
+$Build = (Get-Date -Format 'dd.MM.yyyy')
 
 $entries = @()
 foreach ($f in $Files) {

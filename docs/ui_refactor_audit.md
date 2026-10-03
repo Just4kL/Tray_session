@@ -1,5 +1,8 @@
 # Аудит presentation-слоя перед модульным UI
 
+> **Status: ARCHIVED (2026-10-02).** Historical audit of UI refactor
+> phases 1.0-1.2. For current state see docs/HANDOFF.md and docs/tasks.md.
+
 Снято на этапе 3.0 (коммит расщепления `TrackerApp` → `AppState`).
 Источник — grep по `src/app.rs`. Цель — точный объём для фаз 1, 2, 5.
 

@@ -3,8 +3,8 @@
 > Точка входа для любой AI-сессии. Читать ПЕРВОЙ. Обновлять в конце каждого шага.
 > Если противоречит коду — верить коду, но обновить файл.
 
-Последнее обновление: 2026-10-02
-Обновил: агент-сессия — стабильный релиз 0.7.35 (EN-changelog), бриф — этим коммитом
+Последнее обновление: 2026-10-03
+Обновил: релиз 0.7.36 — интерфейс разделов и фоновые обновления; уведомление об обновлении размещено в рабочей области.
 
 ## Проект
 
@@ -18,19 +18,20 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `ui/phase-1-theme`
-- HEAD: `93de75a` (release: 0.7.35 binaries + manifest; docs-коммит — HEAD)
-- Тесты: 171 зелёный
-- В 0.7.35 входит скелет H1-шаг-1 (`src/ui/layout/`: spec + presets, dead code под `#[allow(dead_code)]` TODO) — engine в шаге 2.
+- HEAD: `3129a07` (код; docs-коммит — HEAD)
+- Тесты: 176 зелёных
+- H1 layout engine подключён полностью (nav/status/center через engine).
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
 - Тег отката: `pre-ui-refactor` (`a48813d`)
 
 ## В работе
 
-Stable 0.7.35 собран локально (updater pipeline, диалог, токены темы,
-скелет H1-шаг-1 как dead code). В работе: H1 шаг 2 (engine.rs).
-Очередь: H1 шаг 2 → подключение engine (шаг 3) → MT-2/3/4. Публикация
-0.7.35 — отдельным шагом, не в этой сессии.
+Stable 0.7.35 собран локально (updater pipeline, диалог, токены темы).
+Внепланово, по добру пользователя: H1-центр через engine (1c5c94a),
+звуки Beep/Bell + сброс в оверлее (0fccbf7), C4/ARC-1/UPD-2 (539eb0d),
+диалог выхода T-1 (bd9ea3d), фильтр процессов + версии (3129a07).
+В работе: M1, визуальная часть сделана; связать кнопку с реестром действий после M3. Очередь — ниже, полный бэклог в `docs/tasks.md`.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -87,6 +88,11 @@ Stable 0.7.35 собран локально (updater pipeline, диалог, т�
 | `e67ed19` | chore: bump to 0.7.35 | `Cargo.toml`, `Cargo.lock`, `src/app.rs` |
 | `f79a0f3` | docs: CHANGELOG for 0.7.35 (English from this version onward) | `CHANGELOG.md`, `src/app.rs` (in-app журнал) |
 | `93de75a` | release: 0.7.35 binaries + manifest | `TraySession.exe`, `update_manifest.json` (+changelog) |
+| `3a0e5ff`–`1c5c94a` | H1: spec/presets/engine + nav/status/center через engine | `src/ui/layout/*`, `src/app.rs` |
+| `0fccbf7` | fix(T-4/T-12): тона Beep/Bell, сброс в оверлее | `src/sound.rs`, `src/app.rs`, `Cargo.toml` |
+| `539eb0d` | fix(C4/ARC-1/UPD-2): позиция окна, архив из git, чистка | `src/config.rs`, `src/app.rs`, `src/main.rs`, `tools/make-manifest.ps1` |
+| `bd9ea3d` | feat(T-1): диалог выхода по крестику | `src/app.rs`, `src/app_state.rs` |
+| `3129a07` | fix(T-13/AU-2/C16): denylist процессов, версии, оффер | `src/detector.rs`, `src/update.rs`, `src/app.rs` |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
@@ -99,13 +105,12 @@ debug-сборки: 12 секунд полёт нормальный; число 
 Единый бэклог: `docs/tasks.md` (чек-лист со статусами `[ ]/[~]/[x]`, датами,
 приоритетами; закрытые — в архиве внизу файла). Полная очередь — там.
 
-1. **H1 шаг 2** — `engine.rs`: `build_window()` поверх spec + presets.
-2. **H1 шаг 3** — подключение engine в `update()` вместо прямых панелей.
-3. **MT-2/3/4** — мини-трей и тултипы после engine.
-4. **Фаза 3** — вынос `ui_*` в `views/*` (L2).
+1. **T-5/T-6/T-7** — таймеры и действия будильников (MEDIUM).
+2. **T-8/T-11** — Параметры и хоткеи (MEDIUM/LOW).
+3. **Фаза 3** — вынос `ui_*` в `views/*` (L2).
    Порядок: about → shortcuts → timer → alarms → games → sessions.
-5. **Фаза 4** — реестр действий для кнопок (M3).
-6. **TODO:** нативные уведомления через WinRT (L1; сейчас fallback на PowerShell,
+4. **Фаза 4** — реестр действий для кнопок (M3).
+5. **TODO:** нативные уведомления через WinRT (L1; сейчас fallback на PowerShell,
    заголовок «Windows PowerShell», нет иконки).
 
 ## Ключевые решения (не переобсуждать)

@@ -1,6 +1,6 @@
 [package]
 name = "game-session-tracker"
-version = "0.7.35"
+version = "0.7.36"
 publish = false
 edition = "2021"
 description = "Game Session Tracker — авто-подсчёт времени игр с GPU-гейтом (Rust/egui)"
@@ -26,7 +26,7 @@ tray-icon = "0.20"
 arboard = "3"
 nvml-wrapper = "0.11"
 winreg = "0.52"
-winapi = { version = "0.3", features = ["winuser", "mmsystem", "synchapi", "errhandlingapi", "winerror", "processthreadsapi", "winnt", "winbase", "handleapi"] }
+winapi = { version = "0.3", features = ["winuser", "mmsystem", "synchapi", "errhandlingapi", "winerror", "processthreadsapi", "winnt", "winbase", "handleapi", "utilapiset"] }
 # Иконки разделов рисуются вектором (nav_icon_shapes), растровые PNG и крейт
 # `image` больше не нужны.
 

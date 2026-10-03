@@ -40,6 +40,10 @@ impl Default for DarkSkin {
                     caption: 11.0,
                     heading: 15.0,
                 },
+                grid: Grid {
+                    unit: 8.0,
+                    block: 64.0,
+                },
                 palette: Palette {
                     bg: BgPalette {
                         surface:        Color32::from_rgb(0x1B, 0x28, 0x38),

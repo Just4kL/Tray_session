@@ -18,6 +18,33 @@ fn default_opacity100() -> f32 { 100.0 }
 fn default_strip_pos() -> u8 { 7 }
 fn default_alarm_h() -> i32 { 8 }
 fn default_timer_min() -> i32 { 10 }
+/// Пресеты таймера по умолчанию (минуты): 1/5/10/15/30/60 — тот же набор,
+/// что исторически был на вкладке «Таймер».
+fn default_timer_presets() -> Vec<u32> { vec![1, 5, 10, 15, 30, 60] }
+/// Границы одного пресета таймера в минутах (как у `timer_min`).
+pub const TIMER_PRESET_MIN: u32 = 1;
+pub const TIMER_PRESET_MAX: u32 = 1440;
+/// Сколько пресетов максимум: больше не помещается в строку оверлея.
+pub const TIMER_PRESETS_MAX: usize = 12;
+
+/// Привести список пресетов к рабочему виду: зажать каждый в 1..=1440,
+/// отсортировать по возрастанию, убрать дубли и обрезать до `TIMER_PRESETS_MAX`.
+/// Пустой список заменяется умолчанием: без пресетов пропадает быстрый запуск
+/// таймера и в оверлее, и на вкладке.
+pub fn sanitize_timer_presets(raw: &[u32]) -> Vec<u32> {
+    let mut v: Vec<u32> = raw
+        .iter()
+        .map(|m| (*m).clamp(TIMER_PRESET_MIN, TIMER_PRESET_MAX))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v.truncate(TIMER_PRESETS_MAX);
+    if v.is_empty() {
+        default_timer_presets()
+    } else {
+        v
+    }
+}
 fn default_last_tab() -> String { "sessions".to_string() }
 fn default_cols4() -> [bool; 4] { [true; 4] }
 /// Как часто проверять обновления: 0 — каждый час (по умолчанию).
@@ -67,6 +94,10 @@ pub struct AppConfig {
     pub stopwatch_pos: Option<[f32; 2]>,
     #[serde(default)]
     pub strip_pos_manual: Option<[f32; 2]>,
+    /// Позиция главного окна (C4): запоминается при перемещении,
+    /// восстанавливается при старте через ViewportBuilder::with_position.
+    #[serde(default)]
+    pub main_window_pos: Option<[f32; 2]>,
     // --- Состояние интерфейса (автозапоминание всех изменений пользователя) ---
     /// Видимость колонок таблицы сессий: №, %, запускал, сессий.
     #[serde(default = "default_cols4")]
@@ -96,9 +127,19 @@ pub struct AppConfig {
     pub alarm_days: [bool; 7],
     #[serde(default = "default_timer_min")]
     pub timer_min: i32,
+    /// Пресеты быстрого запуска таймера (минуты). Показываются на вкладке
+    /// «Таймер» и в развёрнутом оверлее секундомера. Порядок — по возрастанию;
+    /// дубли и выход за 1..=1440 отсекаются при загрузке (T-17).
+    #[serde(default = "default_timer_presets")]
+    pub timer_presets: Vec<u32>,
     /// Последняя открытая вкладка.
     #[serde(default = "default_last_tab")]
     pub last_tab: String,
+    /// Отладочная сетка раскладки (8pt/64pt) поверх окна. По умолчанию
+    /// выключена: это инструмент проверки выравнивания зон, а не режим
+    /// работы, и в обычной работе он только мешает читать интерфейс.
+    #[serde(default)]
+    pub debug_grid: bool,
     // --- Обновления ---
     /// Как часто проверять свежие сборки: 0 — каждый час, 1 — ежедневно,
     /// 2 — раз в неделю, 3 — вручную (код хранится числом, чтобы старые
@@ -149,6 +190,7 @@ impl Default for AppConfig {
             steam_synced: false,
             stopwatch_pos: None,
             strip_pos_manual: None,
+            main_window_pos: None,
             show_cols: [true; 4],
             show_analog: true,
             strip_open: false,
@@ -162,7 +204,9 @@ impl Default for AppConfig {
             alarm_m: 0,
             alarm_days: [false; 7],
             timer_min: 10,
+            timer_presets: default_timer_presets(),
             last_tab: "sessions".to_string(),
+            debug_grid: false,
             update_freq: default_update_freq(),
             update_auto: default_update_auto(),
             update_silent: false,
@@ -302,8 +346,22 @@ impl AppConfig {
                         if let Some(n) = v.get("timer_min").and_then(|x| x.as_i64()) {
                             cfg.timer_min = (n as i32).clamp(1, 1440);
                         }
+                        // Пресеты таймера (T-17). Ключа может не быть в старом
+                        // config.json — тогда остаётся умолчание. Мусор в
+                        // массиве не должен доезжать до UI: чистим сразу.
+                        if let Some(a) = v.get("timer_presets").and_then(|x| x.as_array()) {
+                            let raw: Vec<u32> = a
+                                .iter()
+                                .filter_map(|x| x.as_u64())
+                                .map(|n| n.min(TIMER_PRESET_MAX as u64) as u32)
+                                .collect();
+                            cfg.timer_presets = sanitize_timer_presets(&raw);
+                        }
                         if let Some(s) = v.get("last_tab").and_then(|x| x.as_str()) {
                             cfg.last_tab = s.to_string();
+                        }
+                        if let Some(b) = v.get("debug_grid").and_then(|x| x.as_bool()) {
+                            cfg.debug_grid = b;
                         }
                         // Настройки обновлений. Раньше они вообще не читались
                         // при загрузке: человек выбирал частоту или канал,
@@ -372,7 +430,9 @@ impl AppConfig {
             "alarm_m": self.alarm_m,
             "alarm_days": self.alarm_days,
             "timer_min": self.timer_min,
+            "timer_presets": self.timer_presets,
             "last_tab": self.last_tab,
+            "debug_grid": self.debug_grid,
             // Настройки обновлений. Их не было в списке: человек менял
             // частоту или канал, нажимал «Сохранить», а файл их не содержал
             // — при перезапуске всё возвращалось к умолчанию без всякого
@@ -467,4 +527,89 @@ pub fn format_duration(total_secs: i64) -> String {
     let m = (s % 3600) / 60;
     let sec = s % 60;
     format!("{h} ч : {m} м : {sec} с")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_presets_default_is_the_historical_set() {
+        assert_eq!(default_timer_presets(), vec![1, 5, 10, 15, 30, 60]);
+        assert_eq!(AppConfig::default().timer_presets, vec![1, 5, 10, 15, 30, 60]);
+    }
+
+    #[test]
+    fn sanitize_timer_presets_sorts_dedups_and_clamps() {
+        // Порядок не важен — приводим к возрастанию.
+        assert_eq!(sanitize_timer_presets(&[30, 1, 10]), vec![1, 10, 30]);
+        // Дубли схлопываются.
+        assert_eq!(sanitize_timer_presets(&[5, 5, 1, 5]), vec![1, 5]);
+        // Ноль и перебор зажимаются в 1..=1440.
+        assert_eq!(sanitize_timer_presets(&[0, 5000]), vec![1, 1440]);
+        // Пустой список — не «нет пресетов», а умолчание.
+        assert_eq!(sanitize_timer_presets(&[]), default_timer_presets());
+        // Хвост сверх лимита отрезается (после сортировки — самые крупные).
+        let many: Vec<u32> = (1..=20).collect();
+        assert_eq!(sanitize_timer_presets(&many).len(), TIMER_PRESETS_MAX);
+    }
+
+    #[test]
+    fn timer_presets_survive_a_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("gst_cfg_presets_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let cfg = AppConfig {
+            timer_presets: vec![2, 45, 90],
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+        assert_eq!(AppConfig::load_from(&path).timer_presets, vec![2, 45, 90]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_or_broken_timer_presets_fall_back_to_default() {
+        let dir = std::env::temp_dir().join(format!("gst_cfg_bad_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        // Ключа нет вовсе — умолчание (старый config.json не ломается).
+        let p1 = dir.join("a.json");
+        fs::write(&p1, "{\"timer_min\": 7}").unwrap();
+        assert_eq!(
+            AppConfig::load_from(&p1).timer_presets,
+            default_timer_presets()
+        );
+        // Ключ есть, но валидных чисел в нём нет — тоже умолчание.
+        let p2 = dir.join("b.json");
+        fs::write(&p2, "{\"timer_presets\": [\"abc\", null, -5]}").unwrap();
+        assert_eq!(
+            AppConfig::load_from(&p2).timer_presets,
+            default_timer_presets()
+        );
+        // Смешанный массив: валидные числа берём, мусор игнорируем.
+        let p3 = dir.join("c.json");
+        fs::write(&p3, "{\"timer_presets\": [15, \"x\", 5]}").unwrap();
+        assert_eq!(AppConfig::load_from(&p3).timer_presets, vec![5, 15]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_grid_defaults_off_and_survives_a_roundtrip() {
+        // По умолчанию сетка выключена: это отладка, а не режим работы.
+        assert!(!AppConfig::default().debug_grid);
+        let dir = std::env::temp_dir().join(format!("gst_cfg_grid_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        let cfg = AppConfig { debug_grid: true, ..Default::default() };
+        cfg.save_to(&path);
+        assert!(AppConfig::load_from(&path).debug_grid, "флаг не пережил save/load");
+        let _ = fs::remove_dir_all(&dir);
+        // Старый config.json без ключа не должен включать сетку.
+        let dir2 = std::env::temp_dir().join(format!("gst_cfg_grid_old_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir2);
+        let old = dir2.join("config.json");
+        fs::write(&old, "{\"timer_min\": 7}").unwrap();
+        assert!(!AppConfig::load_from(&old).debug_grid, "старый конфиг включил сетку");
+        let _ = fs::remove_dir_all(&dir2);
+    }
 }

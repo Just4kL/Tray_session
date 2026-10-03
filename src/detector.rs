@@ -285,6 +285,25 @@ pub fn scan_steam_games_via_api(api_key: &str, steam_id: &str, steam_path: Optio
 
 // ---------- Windows registry ----------
 
+/// T-13: заведомо не игра по имени/издателю (рантаймы, редисты,
+/// лаунчеры, установщики). Чистая функция — тестируется без реестра.
+/// Вход уже в lowercase.
+fn is_known_not_game(name_l: &str, pub_l: &str) -> bool {
+    const DENY_KW: &[&str] = &[
+        ".net",
+        "visual c++",
+        "desktop runtime",
+        "windows runtime",
+        "gog galaxy",
+        "installer",
+        "prerequisites",
+        "redistributable",
+        "modpack",
+        "модпак",
+    ];
+    DENY_KW.iter().any(|k| name_l.contains(k) || pub_l.contains(k))
+}
+
 #[cfg(windows)]
 pub fn scan_windows_games() -> Vec<TrackedGame> {
     use winreg::enums::*;
@@ -333,6 +352,11 @@ pub fn scan_windows_games() -> Vec<TrackedGame> {
                 let pub_l = publisher.to_lowercase();
                 let loc_l = install_loc.to_lowercase();
                 let name_l = display_name.to_lowercase();
+                // T-13: сначала отсекаем неигровое, потом разрешаем игровое.
+                // Ручное добавление фильтр не затрагивает.
+                if is_known_not_game(&name_l, &pub_l) {
+                    continue;
+                }
                 let mut is_game = publisher_kw.iter().any(|k| pub_l.contains(k));
                 if !is_game {
                     is_game = install_kw.iter().any(|k| loc_l.contains(k));
@@ -444,6 +468,35 @@ pub fn build_match_maps(games: &[TrackedGame]) -> (HashMap<String, TrackedGame>,
         by_file.entry(g.file_name()).or_default().push(g.clone());
     }
     (by_path, by_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_known_not_game;
+
+    #[test]
+    fn runtimes_and_launchers_are_not_games() {
+        // Кейсы из T-13 (тестировщик, 2026-10-03).
+        for (name, publ) in [
+            ("microsoft .net core runtime", "microsoft corporation"),
+            ("microsoft visual c++ 2015-2022", "microsoft corporation"),
+            ("microsoft windows desktop runtime", "microsoft corporation"),
+            ("gog galaxy", "gog.com"),
+            ("installer", "paradox interactive"),
+            ("launcher prerequisites (x64)", "microsoft corporation"),
+            ("модпак сборки", "vasya"),
+        ] {
+            assert!(is_known_not_game(name, publ), "{name} / {publ} не отсеян");
+        }
+        // А настоящие игры фильтр не задевает.
+        for (name, publ) in [
+            ("elden ring", "bandai namco"),
+            ("minecraft", "mojang"),
+            ("half-life 2", "valve"),
+        ] {
+            assert!(!is_known_not_game(name, publ), "{name} ошибочно отсеян");
+        }
+    }
 }
 
 #[cfg(test)]
