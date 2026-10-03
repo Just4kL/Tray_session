@@ -5744,6 +5744,14 @@ fn clamp_overlay_pos(p: [f32; 2], work: (i32, i32, i32, i32), size: (i32, i32)) 
 /// мышь в модальный OS-move, и кнопки оверлеев никогда не получали release:
 /// clicked() не срабатывал. Теперь клик без движения доходит до кнопок,
 /// а потягивание по-прежнему таскает окно.
+///
+/// T-16: жест считаем по СЫРОМУ состоянию указателя (`primary_pressed` /
+/// `primary_down` / `latest_pos`), а не через `Sense::drag`. У оверлеев стоит
+/// WS_EX_NOACTIVATE (T-14) — фокус в окно не приходит, и egui на первом жесте
+/// не отдаёт `drag_started`/`dragged`: первый драг пропадал, окно ехало
+/// только со второй попытки. События ввода от фокуса не зависят, поэтому
+/// первый же жест работает сразу. `Sense::drag` фону больше не нужен — он
+/// регистрируется как hover-виджет (кнопки рисуются позже и лежат выше).
 pub const DRAG_THRESHOLD_PX: f32 = 3.0;
 
 fn viewport_drag(
@@ -5754,35 +5762,53 @@ fn viewport_drag(
     press_origin: &mut Option<egui::Pos2>,
     title: &str,
 ) {
-    let bg = ui.interact(ui.max_rect(), drag_id, egui::Sense::drag());
-    if bg.drag_started_by(egui::PointerButton::Primary) {
+    // Фон остаётся зарегистрированным виджетом (кнопки и дальше лежат выше
+    // него в hit-test), но drag-sense ему больше не нужен: жест считаем сами,
+    // см. T-16 выше. Заодно уходит риск «залипшего» dragged_id, если release
+    // потеряется в модальном цикле OS-move.
+    let bg_rect = ui.max_rect();
+    let _bg = ui.interact(bg_rect, drag_id, egui::Sense::hover());
+
+    // Сырое состояние указателя: у каждого viewport свой InputState, поэтому
+    // сюда попадают только события этого окна и от фокуса они не зависят.
+    let (pressed, down, latest, origin) = ui.ctx().input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.latest_pos(),
+            i.pointer.press_origin(),
+        )
+    });
+
+    if pressed {
         // Только запоминаем точку нажатия — OS-move ниже, по порогу.
-        *press_origin = ui.ctx().input(|i| i.pointer.press_origin());
+        // Нажатие должно попасть в фон, а не в невидимую рамку ресайза.
+        let pos = origin.or(latest);
+        *press_origin = pos.filter(|p| bg_rect.contains(*p));
         *last_cmd = None;
     }
-    // Суммарный сдвиг от точки нажатия (не покадровая дельта: медленное
-    // ведение < 3px/кадр тоже должно схватываться). Однократно за жест:
-    // после старта OS-move владеет мышью, повторный старт не нужен.
-    let moved_far = match (
-        *press_origin,
-        ui.ctx().input(|i| i.pointer.interact_pos()),
-    ) {
-        (Some(o), Some(p)) => p.distance(o) > DRAG_THRESHOLD_PX,
-        _ => false,
-    };
-    if moved_far
-        && ui
-            .ctx()
-            .input(|i| i.pointer.button_down(egui::PointerButton::Primary))
-    {
+
+    if !down {
+        // Кнопку отпустили (или жест не наш) — состояние жеста сброшено.
         *press_origin = None;
+        *last_cmd = None;
+    } else {
+        // Суммарный сдвиг от точки нажатия (не покадровая дельта: медленное
+        // ведение < 3px/кадр тоже должно схватываться).
+        let moved_far = match (*press_origin, latest) {
+            (Some(o), Some(p)) => p.distance(o) > DRAG_THRESHOLD_PX,
+            _ => false,
+        };
         #[cfg(windows)]
-        native_window_drag(title);
-    }
-    #[cfg(not(windows))]
-    {
-        let delta = bg.drag_delta();
-        if delta != egui::Vec2::ZERO {
+        if moved_far {
+            // Однократно за жест: после старта OS-move владеет мышью,
+            // повторный старт не нужен.
+            *press_origin = None;
+            native_window_drag(title);
+        }
+        #[cfg(not(windows))]
+        if moved_far {
+            let delta = ui.ctx().input(|i| i.pointer.delta());
             let ctx = ui.ctx().clone();
             let outer_min = ctx
                 .input(|i| i.viewport().outer_rect)
@@ -5791,15 +5817,11 @@ fn viewport_drag(
             let next = accumulate_drag_pos(*last_cmd, outer_min, delta);
             let next = egui::Pos2::new(next.x.round(), next.y.round());
             if *last_cmd != Some(next) {
-                ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::OuterPosition(next));
+                ctx.send_viewport_cmd_to(_vp_id, egui::ViewportCommand::OuterPosition(next));
                 *last_cmd = Some(next);
             }
-            ctx.request_repaint_after_for(Duration::from_millis(16), vp_id);
+            ctx.request_repaint_after_for(Duration::from_millis(16), _vp_id);
         }
-    }
-    if bg.drag_stopped() {
-        *last_cmd = None;
-        *press_origin = None;
     }
 }
 
