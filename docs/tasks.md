@@ -1,5 +1,5 @@
 # Tasks — Tray Session
-_Последнее обновление: 2026-10-03, HEAD eda6148_
+_Последнее обновление: 2026-10-03, HEAD e34d4a5_
 _Связанное: docs/agent_brief.md, docs/ui_refactor_audit.md, docs/bugs.md_
 
 ## CRITICAL
@@ -167,7 +167,7 @@ update_report.json ok=true, updated=[TraySession.exe], юзерские файл
 ## HIGH
 
 ### H1 — LayoutSpec + engine.rs
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (spec 3a0e5ff, engine be6cc89/04da94e, nav c93298e, status 5f8bd00, center 1c5c94a)
 **Приоритет:** HIGH
 **Файлы:** src/ui/layout/ (новый: spec.rs, presets.rs, engine.rs)
 **Описание:** панели не привязаны к screen_rect(), блоки и кнопки плывут.
@@ -204,6 +204,7 @@ resizable; единый engine::build_window(ctx, spec, skin, state).
 3. Зафиксировать результат в DOC-2.
 
 ### ARC-1 - make-manifest.ps1 -Archive архивирует НЕ ту сборку (HIGH)
+**Статус:** [x] закрыт (фикс скрипта: архив из git при перезаписанном корне; dist/old вычищен)
 **Что:** копирует текущий TraySession.exe (уже новой версии) в
 dist/old/TraySession_<версия_из_старого_манифеста>.exe. В итоге
 в архиве новый бинарник под именем старой версии.
@@ -212,7 +213,6 @@ dist/old/TraySession_<версия_из_старого_манифеста>.exe. 
 **Фикс:** либо архивировать до cargo build, либо брать старый exe
 из git (git show <prev-tag>:TraySession.exe).
 **Обнаружено:** 2026-10-01.
-**Статус:** [ ] открыт
 **Приоритет:** HIGH
 **Файлы:** tools/make-manifest.ps1
 
@@ -247,14 +247,14 @@ comfyui-update-view.png.
 (фаза 4 рефакторинга). Добавление кнопки = скин + регистрация.
 
 ### C4 — позиция главного окна
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (main_window_pos в config + with_position)
 **Файлы:** src/main.rs, src/config.rs (AppConfig)
 **Описание:** main window при каждом запуске появляется в случайном месте.
 **Фикс:** поле main_window_pos в AppConfig + ViewportBuilder::with_position
 в main.rs.
 
 ### AU-2 — нет сравнения версий
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (is_newer_version + classify_offer)
 **Файлы:** src/update.rs (plan_update, update.rs:521)
 **Описание:** plan_update сравнивает только sha256. Программа
 «обновляется» на ту же версию с разными хешами.
@@ -276,7 +276,7 @@ comfyui-update-view.png.
 
 ### C16 — Нет защиты от «обновления на ту же версию»
 (бывший C15, переименован 2026-10-01 — ID C15 отдан багу перезапуска)
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (SameVersionWarn в classify_offer)
 **Создано:** 2026-10-01
 **Приоритет:** MEDIUM
 **Файлы:** src/update.rs (plan_update), src/app.rs (блок обновлений)
@@ -433,11 +433,11 @@ beta-канала. Переименовать в ui-refactor или удалит
 ToastNotificationManager (для C6b).
 
 ### UPD-2 - Cleanup update_tmp при старте (LOW)
+**Статус:** [x] закрыт (cleanup_stale_updater_leftovers в main при свободном mutex)
 **Что:** updater оставляет артефакты, если был выполнен в
 нестандартном CWD (dist/old/). При следующем старте должен чистить
 свой update_tmp/ (и по возможности — в program_dir()).
 **Обнаружено:** 2026-10-02.
-**Статус:** [ ] открыт
 **Приоритет:** LOW
 **Заметки:** leftover-артефакт dist/old/update_tmp/ от 01.10 (предыдущий
 тест, когда exe запускался из dist/old/) — вычищен вручную 2026-10-02.
@@ -497,7 +497,7 @@ installer + перегенерированный update_manifest.json. gh Releas
 Записано как есть; дубли с существующими задачами помечены связями.
 
 ### T-1 — Крестик главного окна: диалог завершения (HIGH)
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (draw_close_dialog: завершить/свернуть/отмена)
 Сейчас: крестик = «свернуть в трей» (без вопроса).
 Хочется: диалог «Вы точно хотите завершить программу?» с кнопками
 «Завершить» / «Свернуть в трей» / «Отмена». Или настройка в Параметрах.
@@ -523,7 +523,7 @@ installer + перегенерированный update_manifest.json. gh Releas
 запасной вариант, если порога окажется недостаточно.
 
 ### T-4 — Будильник: Beep/Bell играют один звук (MEDIUM)
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (детерминированные тона 880/523 Гц; таймер уважает выбор)
 Кнопка выбора звука не меняет звук.
 Замечание по layout (2026-10-03): конфигуратор будильников — сверху,
 список будильников — под блоком конфигуратора.
@@ -560,11 +560,11 @@ installer + перегенерированный update_manifest.json. gh Releas
 Сейчас разбросаны, поместить в одну вкладку.
 
 ### T-12 — Секундомер: сброс в плавающем окне (LOW)
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (кнопка «Сброс» в оверлее)
 Кнопка сброса секундомера в оверлее.
 
 ### T-13 — Игры под наблюдением: фильтр неигровых процессов (MEDIUM)
-**Статус:** [ ] открыт
+**Статус:** [x] закрыт (is_known_not_game denylist до allowlist)
 **Обнаружено:** 2026-10-03 (тестировщик)
 В список отслеживаемых попадают не игры: Microsoft .NET Core Runtime,
 Microsoft Visual C++, GOG GALAXY, Installer, модпаки, Microsoft Windows
@@ -603,6 +603,16 @@ Desktop Runtime, Launcher Prerequisites (x64) и т.п.
 | T-3 stopwatch clicks (= MT-1) | 2026-10-03 | 807b84d |
 | MT-2 minimap layout | merged into H1 | — |
 | MT-3 9-point positioning | merged into H1 | — |
+| T-4 alarm sound distinct tones | 2026-10-03 | — |
+| T-12 stopwatch reset in overlay | 2026-10-03 | — |
+| T-13 process denylist | 2026-10-03 | — |
+| T-1 close dialog | 2026-10-03 | — |
+| C4 main window pos | 2026-10-03 | — |
+| ARC-1 manifest archive from git | 2026-10-03 | — |
+| UPD-2 updater leftovers cleanup | 2026-10-03 | — |
+| AU-2 version compare | 2026-10-03 | — |
+| C16 same-version warn | 2026-10-03 | — |
+| H1 layout engine (spec+nav/status/center) | 2026-10-03 | — |
 
 ## Правила гигиены
 
