@@ -3120,8 +3120,13 @@ impl eframe::App for TrackerApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let inner_w = (ui.available_width() - m * 2.0).max(80.0);
+        // H1-шаг-4b: центр строит engine::build_center из LayoutSpec
+        // (поля m — рамкой движка). Контент дословно тот же, кроме строки
+        // UPDATE: раньше она тянулась на всю ширину окна, теперь
+        // прижата к сетке контента (ровно под заголовками разделов).
+        let center_spec = crate::ui::layout::presets::default_layout();
+        crate::ui::layout::engine::build_center(ctx, &center_spec, &mut |ui| {
+            let inner_w = ui.available_width().max(80.0);
             // Кнопка-уведомление об обновлении — правый верхний угол.
             // Живёт ВНЕ прокрутки, поэтому не уезжает вниз при листании,
             // и стоит в отдельной строке, а не поверх текста: так ничего
@@ -3150,30 +3155,26 @@ impl eframe::App for TrackerApp {
                 );
                 ui.add_space(4.0);
             }
-            ui.horizontal_top(|ui| {
-                ui.add_space(m);
-                ui.vertical(|ui| {
-                    ui.set_min_width(inner_w);
-                    ui.set_max_width(inner_w);
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            // Ширина фиксируется ДО содержимого: иначе egui
-                            // берёт её по самой широкой строке, и блоки
-                            // разделов разъезжаются по ширине.
-                            ui.set_min_width(inner_w);
-                            ui.set_max_width(inner_w);
-                            match self.state.tab {
-                                Tab::Sessions => self.ui_sessions(ui),
-                                Tab::Games => self.ui_games(ui),
-                                Tab::Alarms => self.ui_alarms(ui),
-                                Tab::Timer => self.ui_timer(ui),
-                                Tab::Shortcuts => self.ui_shortcuts(ui),
-                                Tab::About => self.ui_about(ui),
-                            }
-                        });
-                });
-                ui.add_space(m);
+            ui.vertical(|ui| {
+                ui.set_min_width(inner_w);
+                ui.set_max_width(inner_w);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Ширина фиксируется ДО содержимого: иначе egui
+                        // берёт её по самой широкой строке, и блоки
+                        // разделов разъезжаются по ширине.
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        match self.state.tab {
+                            Tab::Sessions => self.ui_sessions(ui),
+                            Tab::Games => self.ui_games(ui),
+                            Tab::Alarms => self.ui_alarms(ui),
+                            Tab::Timer => self.ui_timer(ui),
+                            Tab::Shortcuts => self.ui_shortcuts(ui),
+                            Tab::About => self.ui_about(ui),
+                        }
+                    });
             });
         });
 
