@@ -14,11 +14,12 @@ Repo: F:\Programms\Tray Session python\game-session-tracker
 
 ## Where we are now
 
-- **Stable**: 0.7.36 (Tray-session; GitHub Release v0.7.36 — Latest)
+- **Stable**: 0.7.37 (Tray-session; GitHub Release v0.7.37 — Latest)
 - **Beta**: 0.7.33-beta.8 (app-Tray_session branch)
-- **Working branch**: Tray-session, published tag v0.7.36
-- **Tests**: 193 passed, 7 ignored; clippy completes with existing warnings
-- **Last major**: UI refresh, monitor-aware scaling, background GPU/session refresh
+- **Working branch**: beta (same commit as Tray-session after the 0.7.37 merge)
+- **Tests**: 191 passed, 7 ignored; clippy completes with existing warnings
+- **Last major**: navigation icons from the icon set, uninstaller confirmation
+  window, H1 status/center wired through the layout engine
 
 ## Repo structure (essentials)
 
@@ -54,8 +55,8 @@ H1 (layout engine) — priority 1:
 - [x] step 2: engine.rs (build_window)
 - [x] step 3a: split into build_nav/status/center
 - [x] step 3b: wire build_nav into app.rs
-- [ ] **step 4a: wire build_status**
-- [ ] **step 4b: wire build_center**
+- [x] **step 4a: wire build_status**
+- [x] **step 4b: wire build_center**
 - [ ] step 5: remove old panel code, skin.layout_spec
 - [ ] step 6: fix MT-2/MT-3/MT-4/UPD-5 (minimap layout, 9-point
   positioning, tooltip overlap, button contrast)
@@ -63,6 +64,7 @@ H1 (layout engine) — priority 1:
 
 After H1:
 - [x] Publish stable 0.7.36 (branch, tag, GitHub Release and installer)
+- [x] Publish stable 0.7.37 (branch, tag, GitHub Release and installer)
 - [ ] fix AU-2 (version compare, not sha256)
 - [ ] fix C1-B (overlay position at start)
 - [ ] fix UPD-3/4

@@ -16,7 +16,7 @@ pub const APP_NAME: &str = "Tray Session";
 /// Базовый масштаб интерфейса: бывший 130% теперь считается за 100%.
 /// Слайдер показывает проценты относительно этой базы.
 pub const BASE_SCALE: f32 = 1.3;
-pub const VERSION: &str = "0.7.36";
+pub const VERSION: &str = "0.7.37";
 // Дата сборки (DD.MM.YYYY). Генерируется build.rs при каждой сборке,
 // руками не правится (раньше забывался при бампе версии).
 include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
@@ -64,6 +64,12 @@ impl<T: Send + 'static> BackgroundWorker<T> {
 }
 
 const CHANGELOG: &[(&str, &str, &[&str])] = &[
+    ("0.7.37", "2026-10-03", &[
+        "New: Navigation icons and the app logo come from the icon set (assets/icons).",
+        "Fix: Uninstaller confirms deletion in a window and names the program folder and the session export.",
+        "Fix: Status bar keeps the same page margin as section blocks.",
+        "Changed: Main window is listed in the taskbar again.",
+    ]),
     ("0.7.36", "2026-10-03", &[
         "New: Clearer section tabs, quick settings, button tips, and a persistent status bar.",
         "Fix: UI scale follows each monitor's native DPI instead of resetting it every frame.",

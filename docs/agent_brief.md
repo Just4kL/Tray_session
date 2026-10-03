@@ -4,7 +4,7 @@
 > Если противоречит коду — верить коду, но обновить файл.
 
 Последнее обновление: 2026-10-03
-Обновил: релиз 0.7.36 — интерфейс разделов и фоновые обновления; уведомление об обновлении размещено в рабочей области.
+Обновил: релиз 0.7.37 — иконки навигации и значок окна из набора `assets/icons`, подтверждение удаления окном, поля строки статуса из LayoutSpec.
 
 ## Проект
 
@@ -17,9 +17,9 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## Текущее состояние
 
-- Ветка: `Tray-session`
-- Stable release: `v0.7.36` (опубликован на GitHub)
-- Тесты: 193 зелёных, 7 пропущено
+- Ветка: `beta` (и `Tray-session` — тот же коммит после релиза 0.7.37)
+- Stable release: `v0.7.37` (опубликован на GitHub)
+- Тесты: 191 зелёных, 7 пропущено
 - H1 layout engine подключён полностью (nav/status/center через engine).
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
@@ -27,11 +27,9 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## В работе
 
-Кандидат stable 0.7.36 собран локально; манифест и установщик готовы.
-Внепланово, по добру пользователя: H1-центр через engine (1c5c94a),
-звуки Beep/Bell + сброс в оверлее (0fccbf7), C4/ARC-1/UPD-2 (539eb0d),
-диалог выхода T-1 (bd9ea3d), фильтр процессов + версии (3129a07).
-M1: кнопка обновления компактная, ActionSpec-интеграция остаётся после M3. Публикация 0.7.36 ждёт GitHub Release.
+0.7.37 опубликован: тег `v0.7.37`, GitHub Release, установщик и манифест.
+Ветка `beta` синхронизирована с `Tray-session` — обе на одном коммите.
+M1: кнопка обновления компактная, ActionSpec-интеграция остаётся после M3.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -95,6 +93,13 @@ M1: кнопка обновления компактная, ActionSpec-инте�
 | `3129a07` | fix(T-13/AU-2/C16): denylist процессов, версии, оффер | `src/detector.rs`, `src/update.rs`, `src/app.rs` |
 | `f08718d` | release: prepare 0.7.36 stable | UI, DPI/background fixes, build date, binaries and manifest |
 | `91c248d` | merge UI branch into Tray-session | stable candidate 0.7.36 |
+| `d6cb2e1` | feat: иконки навигации и значок окна из набора `assets/icons` | `assets/icons/*`, `src/app.rs`, `src/main.rs` |
+| `bd635d6` | fix(uninstall): подтверждение удаления окном MessageBox | `src/uninstall.rs` |
+| `1a23a91` | fix(h1): отступ строки статуса берётся из LayoutSpec | `src/app.rs`, `src/ui/layout/engine.rs`, `src/ui/layout/spec.rs` |
+| `c1e9750` | test: app_icon_shape под значок из `assets/icons` | `src/main.rs` |
+| `c970b38` | fix: окно снова показывается в панели задач | `src/main.rs` |
+| `174b4b6` | merge Tray-session в beta (синхронизация перед релизом) | — |
+| `v0.7.37` | release: prepare 0.7.37 stable — бамп, changelog, сборки, манифест | `Cargo.toml`, `Cargo.lock`, `src/app.rs`, `CHANGELOG.md`, `docs/*`, `TraySession.exe`, `Tray_session_setup.exe`, `update_manifest.json` |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`

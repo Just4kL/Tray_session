@@ -1,15 +1,15 @@
 {
-    "version":  "0.7.36",
+    "version":  "0.7.37",
     "build":  "03.10.2026",
     "files":  [
                   {
                       "name":  "TraySession.exe",
-                      "sha256":  "57dd95b79190929332af74c17a9fc4d762169ed9a9b1fb3c76ef67455b2c2431"
+                      "sha256":  "b3a7e65927d413db87eeec65fad906a210f3f8412f54c2bb97b63313ea79bdd4"
                   },
                   {
                       "name":  "Tray_session_setup.exe",
-                      "sha256":  "7204fa217fd8a3701fce15d8c5ee41c8c1e99aba00abbae8e3de6482e902fb98"
+                      "sha256":  "3ceb7822ebe2a75211e2842a0bff25d0cf5846ae8d93f645efd0c4037076b150"
                   }
               ],
-    "changelog":  "### Summary\nClearer navigation and settings, plus smoother background refreshes.\n\n### Fixed\n- UI scaling now follows each monitor\u0027s native DPI\n- GPU checks and session totals refresh in the background\n- Main window uses the native Windows title bar for move and maximize\n\n### New\n- Section tabs, button tips, quick settings, and a persistent status bar"
+    "changelog":  "### Summary\r\nRefreshed navigation icons, a real confirmation window in the uninstaller,\r\nand layout polish.\r\n\r\n### New\r\n- Navigation icons and the app logo come from the icon set in `assets/icons`\r\n\r\n### Fixed\r\n- Uninstaller asks for confirmation in a window instead of the console, and\r\n  names the program folder and the session export before deleting\r\n- Status bar keeps the same page margin as section blocks (H1 layout)\r\n\r\n### Changed\r\n- Main window is listed in the taskbar again"
 }

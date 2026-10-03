@@ -3,6 +3,23 @@
 Краткая история релизов. Полная — в приложении («О программе» →
 «Журнал изменений»).
 
+## [0.7.37] - 2026-10-03
+
+### Summary
+Refreshed navigation icons, a real confirmation window in the uninstaller,
+and layout polish.
+
+### New
+- Navigation icons and the app logo come from the icon set in `assets/icons`
+
+### Fixed
+- Uninstaller asks for confirmation in a window instead of the console, and
+  names the program folder and the session export before deleting
+- Status bar keeps the same page margin as section blocks (H1 layout)
+
+### Changed
+- Main window is listed in the taskbar again
+
 ## [0.7.36] - 2026-10-03
 
 ### Summary
