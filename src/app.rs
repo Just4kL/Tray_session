@@ -2141,6 +2141,10 @@ impl TrackerApp {
                 if ui.small_button("Круг").clicked() {
                     self.stopwatch_lap();
                 }
+                // T-12: сброс прямо в оверлее (раньше только на вкладке).
+                if ui.small_button("Сброс").clicked() {
+                    self.stopwatch_reset();
+                }
             });
             // Развёрнутое окошко: снизу таймер обратного отсчёта — тот же,
             // что на вкладке «Таймер» (одна сущность, два места показа).
@@ -2827,7 +2831,7 @@ impl TrackerApp {
                         }
                     } else if let Some(s) = &a.standard_sound {
                         if !s.is_empty() && s != "Нет" {
-                            self.state.sound.play_standard(&s.to_lowercase().replace("beep", "beep"), 180);
+                            self.state.sound.play_standard(&s.to_lowercase(), 180);
                         }
                     }
                     self.state.alarm_dialog = Some(a.clone());
@@ -2855,8 +2859,10 @@ impl TrackerApp {
                         SoundPlayer::play_file(&ff);
                     }
                 } else if let Some(ss) = s {
+                    // T-4: таймер играл всегда "beep" вне зависимости от
+                    // выбора — теперь уважаем настройку, как будильник.
                     if !ss.is_empty() && ss != "Нет" {
-                        self.state.sound.play_standard("beep", 180);
+                        self.state.sound.play_standard(&ss.to_lowercase(), 180);
                     }
                 }
                 self.state.timer_dialog = true;

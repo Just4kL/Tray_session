@@ -20,7 +20,7 @@ impl SoundPlayer {
         self.stop_flag.store(true, Ordering::SeqCst);
     }
 
-    fn spawn_beep(&mut self, kind: win_beep::Kind, secs: u64) {
+    fn spawn_beep(&mut self, freq_hz: u32, tone_ms: u64, secs: u64) {
         self.stop();
         let flag = Arc::new(AtomicBool::new(false));
         self.stop_flag = flag.clone();
@@ -31,7 +31,7 @@ impl SoundPlayer {
                 if flag.load(Ordering::SeqCst) {
                     break;
                 }
-                win_beep::beep(kind);
+                win_beep::tone(freq_hz, tone_ms);
                 for _ in 0..20 {
                     if flag.load(Ordering::SeqCst) {
                         return;
@@ -42,10 +42,13 @@ impl SoundPlayer {
         }));
     }
 
+    /// T-4: Beep и Bell — гарантированно разные тона (частота задана
+    /// явно). Раньше оба шли через MessageBeep, который на многих
+    /// системах маппится на один и тот же wav.
     pub fn play_standard(&mut self, name: &str, secs: u64) {
         match name {
-            "bell" => self.spawn_beep(win_beep::Kind::Asterisk, secs),
-            _ => self.spawn_beep(win_beep::Kind::Exclamation, secs),
+            "bell" => self.spawn_beep(523, 400, secs),
+            _ => self.spawn_beep(880, 250, secs),
         }
     }
 
@@ -59,30 +62,20 @@ impl SoundPlayer {
 
 #[cfg(windows)]
 mod win_beep {
-    #[derive(Clone, Copy)]
-    pub enum Kind {
-        Exclamation,
-        Asterisk,
-    }
-    pub fn beep(kind: Kind) {
-        use winapi::um::winuser::{MessageBeep, MB_ICONASTERISK, MB_ICONEXCLAMATION};
+    /// Один тон заданной частоты/длительности. Детерминированно отличается
+    /// от других тонов (в отличие от MessageBeep, зависящего от настроек ОС).
+    pub fn tone(freq_hz: u32, dur_ms: u64) {
+        use winapi::um::utilapiset::Beep;
         unsafe {
-            match kind {
-                Kind::Exclamation => { MessageBeep(MB_ICONEXCLAMATION); }
-                Kind::Asterisk => { MessageBeep(MB_ICONASTERISK); }
-            }
+            Beep(freq_hz, dur_ms.min(u32::MAX as u64) as u32);
         }
     }
 }
 
 #[cfg(not(windows))]
 mod win_beep {
-    #[derive(Clone, Copy)]
-    pub enum Kind {
-        Exclamation,
-        Asterisk,
-    }
-    pub fn beep(_kind: Kind) {
+    pub fn tone(_freq_hz: u32, dur_ms: u64) {
         print!("\x07");
+        std::thread::sleep(std::time::Duration::from_millis(dur_ms.min(2000)));
     }
 }
