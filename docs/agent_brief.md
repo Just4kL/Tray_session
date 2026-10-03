@@ -18,7 +18,7 @@ Python-версия (pythonProject) — эталон для дымовых те�
 ## Текущее состояние
 
 - Ветка: `Tray-session`
-- HEAD: merge коммит `91c248d` (кандидат 0.7.36)
+- Stable release: `v0.7.36` (опубликован на GitHub)
 - Тесты: 193 зелёных, 7 пропущено
 - H1 layout engine подключён полностью (nav/status/center через engine).
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)

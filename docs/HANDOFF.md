@@ -14,9 +14,9 @@ Repo: F:\Programms\Tray Session python\game-session-tracker
 
 ## Where we are now
 
-- **Stable candidate**: 0.7.36 (merged into Tray-session; publication pending)
+- **Stable**: 0.7.36 (Tray-session; GitHub Release v0.7.36 — Latest)
 - **Beta**: 0.7.33-beta.8 (app-Tray_session branch)
-- **Working branch**: Tray-session, merge commit 91c248d (0.7.36 candidate)
+- **Working branch**: Tray-session, published tag v0.7.36
 - **Tests**: 193 passed, 7 ignored; clippy completes with existing warnings
 - **Last major**: UI refresh, monitor-aware scaling, background GPU/session refresh
 
@@ -62,7 +62,7 @@ H1 (layout engine) — priority 1:
 - [ ] step 7: test 800x600 → 4K × 2 skins
 
 After H1:
-- [x] Merge UI branch for 0.7.36; publish commit and tag after approval/auth
+- [x] Publish stable 0.7.36 (branch, tag, GitHub Release and installer)
 - [ ] fix AU-2 (version compare, not sha256)
 - [ ] fix C1-B (overlay position at start)
 - [ ] fix UPD-3/4
