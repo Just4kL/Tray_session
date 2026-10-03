@@ -2384,7 +2384,13 @@ impl TrackerApp {
     }
 
     /// Поставить полоску на позицию (первым кадром вьюпорта через флаг).
+    /// T-15: сбрасываем ручную позицию — иначе snap_strip_now веткой 1
+    /// ставит окно обратно на старое ручное место и пресет игнорируется.
+    /// Следующий кадр draw_session_strip запомнит уже новую позицию.
+    /// Drag пишет strip_pos_manual напрямую, не через snap_strip, —
+    /// его поведение не меняется.
     fn snap_strip(&mut self) {
+        self.state.cfg_handle.strip_pos_manual = None;
         self.state.strip_snap_pending = true;
     }
 
