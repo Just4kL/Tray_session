@@ -1141,6 +1141,8 @@ pub struct TrackerApp {
     /// (переключатель скинов), пока висит `None`.
     #[allow(dead_code)] // TODO(phase-1.4): читать при смене скина в update()
     last_skin_id: Option<&'static str>,
+    /// Последнее применённое значение пользовательского масштаба.
+    last_applied_scale: Option<f32>,
 }
 
 impl TrackerApp {
@@ -1294,6 +1296,7 @@ impl TrackerApp {
                 crate::ui::theme::default::DefaultSkin::default(),
             )),
             last_skin_id: None,
+            last_applied_scale: None,
         };
         app.refresh_agg();
         app.refresh_alarms();
@@ -3181,15 +3184,17 @@ impl eframe::App for TrackerApp {
         // spacing/animation_time остаются дефолтными. Переход на полную
         // замену стиля — фаза 1.4, одним коммитом (см. roadmap в аудите).
         ctx.set_visuals(self.theme.current().egui_style().visuals);
-        // Пользовательский масштаб — zoom относительно нативного DPI монитора.
-        // BASE_SCALE сохраняет прежний смысл 100%: без дополнительного zoom.
-        let native_ppp = ctx
-            .input(|i| i.viewport().native_pixels_per_point)
-            .unwrap_or(1.0);
-        let target_ppp = native_ppp
-            * (self.state.cfg_handle.ui_scale.clamp(0.8, 2.0) / BASE_SCALE);
-        if (ctx.pixels_per_point() - target_ppp).abs() > 0.01 {
-            ctx.set_pixels_per_point(target_ppp);
+        let ui_scale = self.state.cfg_handle.ui_scale.clamp(0.8, 2.0);
+        if self.last_applied_scale != Some(ui_scale) {
+            // Пользовательский масштаб — zoom относительно нативного DPI.
+            // BASE_SCALE сохраняет прежний смысл 100%: без дополнительного zoom.
+            if let Some(native_ppp) = ctx.input(|i| i.viewport().native_pixels_per_point) {
+                let target_ppp = native_ppp * (ui_scale / BASE_SCALE);
+                if (ctx.pixels_per_point() - target_ppp).abs() > 0.01 {
+                    ctx.set_pixels_per_point(target_ppp);
+                }
+            }
+            self.last_applied_scale = Some(ui_scale);
         }
 
         // Левая панель навигации (компактно, как в PC Manager):
