@@ -206,6 +206,8 @@ pub struct AppState {
     pub started_at: Instant,
     pub last_autoscan: Instant,
     pub quit_requested: bool,
+    /// Открыт ли диалог подтверждения выхода по крестику (T-1).
+    pub close_dialog: bool,
     pub gpu_usable_cache: bool,
     pub gpu_util_cache: u32,
     pub last_gpu_check: Instant,

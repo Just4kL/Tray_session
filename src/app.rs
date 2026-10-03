@@ -1227,6 +1227,7 @@ impl TrackerApp {
                 started_at: Instant::now(),
                 last_autoscan: Instant::now(),
                 quit_requested: false,
+                close_dialog: false,
                 gpu_usable_cache: false,
                 gpu_util_cache: 0,
                 last_gpu_check: Instant::now() - Duration::from_secs(99),
@@ -2791,15 +2792,61 @@ impl TrackerApp {
                 AppCmd::StripOpacity(d) => self.apply_strip_opacity_delta(d),
             }
         }
-        // Скрытие в трей вместо закрытия
+        // Крестик: спрашиваем явно (T-1), молча в трей больше не уходим.
+        // quit_requested (выход из трея/апдейтер) идёт мимо диалога.
         if ctx.input(|i| i.viewport().close_requested()) && !self.state.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            // Minimized(true), а не Visible(false): при Visible(false) eframe
-            // перестаёт звать update(), poll_appcmd не крутится, AppCmd::Show
-            // из трея не обрабатывается. Минимизированное окно остаётся
-            // живым для event loop. with_taskbar(false) (main.rs:437)
-            // скрывает его из панели задач — визуально это «трей».
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.state.close_dialog = true;
+        }
+    }
+
+    /// Диалог «Вы точно хотите завершить программу?» (T-1).
+    /// «Завершить» — выход, «Свернуть в трей» — старое поведение
+    /// (Minimized, окно живо для event loop), «Отмена» — просто закрыть.
+    fn draw_close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.state.close_dialog {
+            return;
+        }
+        let mut action: Option<u8> = None;
+        egui::Window::new("Завершить программу?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Сессии продолжат записываться в трее только если свернуть.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Завершить").clicked() {
+                        action = Some(0);
+                    }
+                    if ui.button("Свернуть в трей").clicked() {
+                        action = Some(1);
+                    }
+                    if ui.button("Отмена").clicked() {
+                        action = Some(2);
+                    }
+                });
+            });
+        match action {
+            Some(0) => {
+                self.state.close_dialog = false;
+                // quit_requested снимает CancelClose-ветку выше —
+                // следующее Close реально завершит цикл.
+                self.state.quit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(1) => {
+                self.state.close_dialog = false;
+                // Minimized(true), а не Visible(false): при Visible(false)
+                // eframe перестаёт звать update(), poll_appcmd не крутится,
+                // AppCmd::Show из трея не обрабатывается.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            _ => {
+                if action.is_some() {
+                    self.state.close_dialog = false;
+                }
+            }
         }
     }
 
@@ -3267,6 +3314,8 @@ impl eframe::App for TrackerApp {
 
         // Модальный диалог подтверждения обновления — поверх всего.
         self.draw_update_dialog(ctx);
+        // Диалог выхода по крестику (T-1).
+        self.draw_close_dialog(ctx);
 
         // C4: запоминаем позицию главного окна (восстановим при старте).
         // Свёрнутое не пишем: его outer_rect — место сворачивания, а не выбор.
