@@ -1,6 +1,6 @@
 # Tray Session — Handoff
 
-_Last update: 2026-10-02, by Muse Spark 1.3 Free_
+_Last update: 2026-10-03_
 _Next agent: Claude Opus 5.5_
 
 ## Project
@@ -14,12 +14,11 @@ Repo: F:\Programms\Tray Session python\game-session-tracker
 
 ## Where we are now
 
-- **Stable**: 0.7.35 (Tray-session branch, GitHub release v0.7.35 — Latest)
+- **Stable candidate**: 0.7.36 (merged into Tray-session; publication pending)
 - **Beta**: 0.7.33-beta.8 (app-Tray_session branch)
-- **Working branch**: ui/phase-1-theme, HEAD c93298e (3 commits ahead of origin)
-- **Tests**: 174 passed, clippy 63 baseline
-- **Last major**: updater rewrite end-to-end works + H1 layout engine
-  (step 3b — build_nav wired)
+- **Working branch**: Tray-session, merge commit 91c248d (0.7.36 candidate)
+- **Tests**: 193 passed, 7 ignored; clippy completes with existing warnings
+- **Last major**: UI refresh, monitor-aware scaling, background GPU/session refresh
 
 ## Repo structure (essentials)
 
@@ -63,7 +62,7 @@ H1 (layout engine) — priority 1:
 - [ ] step 7: test 800x600 → 4K × 2 skins
 
 After H1:
-- [ ] Publish 0.7.36 (stable) after merging the verified UI branch
+- [x] Merge UI branch for 0.7.36; publish commit and tag after approval/auth
 - [ ] fix AU-2 (version compare, not sha256)
 - [ ] fix C1-B (overlay position at start)
 - [ ] fix UPD-3/4

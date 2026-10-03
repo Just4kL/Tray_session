@@ -17,9 +17,9 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## Текущее состояние
 
-- Ветка: `ui/phase-1-theme`
-- HEAD: `3129a07` (код; docs-коммит — HEAD)
-- Тесты: 176 зелёных
+- Ветка: `Tray-session`
+- HEAD: merge коммит `91c248d` (кандидат 0.7.36)
+- Тесты: 193 зелёных, 7 пропущено
 - H1 layout engine подключён полностью (nav/status/center через engine).
 - Clippy `': error'` = 41 (pre-existing долг проекта, не наш; база была 42)
 - Дерево: чистое
@@ -27,11 +27,11 @@ Python-версия (pythonProject) — эталон для дымовых те�
 
 ## В работе
 
-Stable 0.7.35 собран локально (updater pipeline, диалог, токены темы).
+Кандидат stable 0.7.36 собран локально; манифест и установщик готовы.
 Внепланово, по добру пользователя: H1-центр через engine (1c5c94a),
 звуки Beep/Bell + сброс в оверлее (0fccbf7), C4/ARC-1/UPD-2 (539eb0d),
 диалог выхода T-1 (bd9ea3d), фильтр процессов + версии (3129a07).
-В работе: M1, визуальная часть сделана; связать кнопку с реестром действий после M3. Очередь — ниже, полный бэклог в `docs/tasks.md`.
+M1: кнопка обновления компактная, ActionSpec-интеграция остаётся после M3. Публикация 0.7.36 ждёт GitHub Release.
 
 **Побочный эффект фикса RAM (ожидаемый, зафиксирован):** RAM-fallback гейт
 стал строже. До фикса он пропускал всё (баг), после — работает как задумано.
@@ -93,6 +93,8 @@ Stable 0.7.35 собран локально (updater pipeline, диалог, т�
 | `539eb0d` | fix(C4/ARC-1/UPD-2): позиция окна, архив из git, чистка | `src/config.rs`, `src/app.rs`, `src/main.rs`, `tools/make-manifest.ps1` |
 | `bd9ea3d` | feat(T-1): диалог выхода по крестику | `src/app.rs`, `src/app_state.rs` |
 | `3129a07` | fix(T-13/AU-2/C16): denylist процессов, версии, оффер | `src/detector.rs`, `src/update.rs`, `src/app.rs` |
+| `f08718d` | release: prepare 0.7.36 stable | UI, DPI/background fixes, build date, binaries and manifest |
+| `91c248d` | merge UI branch into Tray-session | stable candidate 0.7.36 |
 Детали RAM-фикса (факт, не план): хелпер `bytes_to_mb` добавлен в `gpu.rs`,
 `vram_mb` **не тронута побайтово** (делегирования нет — было ограничение
 «не менять формулу»). Тест — `gpu::tests::memory_bytes_to_mb_is_1024_based`
