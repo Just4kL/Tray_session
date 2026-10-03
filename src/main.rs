@@ -525,9 +525,6 @@ fn cleanup_stale_updater_leftovers() {}
     }
     let options = eframe::NativeOptions {
         viewport: builder
-            // Скрываем из taskbar: сворачивание = «уход в трей», не должно
-            // оставлять кнопку в панели задач.
-            .with_taskbar(false)
             // Та же иконка, что в трее: в заголовке окна была системная
             // картинка по умолчанию, и программа не выглядела «своей».
             .with_icon(egui::IconData {
