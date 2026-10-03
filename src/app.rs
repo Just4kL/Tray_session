@@ -5853,9 +5853,15 @@ fn overlay_window_style(base: i32) -> i32 {
 fn ensure_thickframe(title: &str) {
     use std::cell::RefCell;
     use winapi::um::winuser::{
-        FindWindowW, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        FindWindowW, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
+    // WS_EX_NOACTIVATE: окно никогда не забирает фокус, но получает клики.
+    // Лечит T-14: без него первое нажатие по неактивному borderless-окну
+    // Windows съедает на активацию (кнопкам нужен второй клик).
+    // winit 0.29 `with_active(false)` НЕ ставит этот стиль (только
+    // MARKER_ACTIVATE при создании), поэтому правим напрямую WinAPI.
+    const WS_EX_NOACTIVATE: i32 = 0x0800_0000;
     thread_local! {
         /// Заголовки окон, стиль которых уже выправлен.
         static PATCHED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -5872,8 +5878,18 @@ fn ensure_thickframe(title: &str) {
         }
         let st = GetWindowLongW(hwnd, GWL_STYLE);
         let want = overlay_window_style(st);
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let want_ex = ex | WS_EX_NOACTIVATE;
+        let mut changed = false;
         if want != st {
             SetWindowLongW(hwnd, GWL_STYLE, want);
+            changed = true;
+        }
+        if want_ex != ex {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, want_ex);
+            changed = true;
+        }
+        if changed {
             // SWP_FRAMECHANGED обязателен: без него новый стиль не
             // применяется до следующего изменения размера.
             SetWindowPos(
