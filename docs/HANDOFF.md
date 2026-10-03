@@ -63,7 +63,7 @@ H1 (layout engine) — priority 1:
 - [ ] step 7: test 800x600 → 4K × 2 skins
 
 After H1:
-- [ ] release 0.7.36 (stable) + 0.7.33-beta.9 (beta)
+- [ ] Publish 0.7.36 (stable) after merging the verified UI branch
 - [ ] fix AU-2 (version compare, not sha256)
 - [ ] fix C1-B (overlay position at start)
 - [ ] fix UPD-3/4

@@ -151,7 +151,7 @@ pub fn is_safe_rel_name(name: &str) -> bool {
 pub struct Manifest {
     /// Версия сборки, для которой сделан манифест.
     pub version: String,
-    /// Сборка (дата) в формате YYYYMMDD.
+    /// Дата сборки в формате DD.MM.YYYY.
     #[serde(default)]
     pub build: String,
     /// Файлы, которые изменились: имя и новый хеш (SHA-256).

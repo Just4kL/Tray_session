@@ -83,7 +83,7 @@ if ($Cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
     throw 'Не нашёл version в Cargo.toml'
 }
 $Version = $Matches[1]
-$Build = (Get-Date -Format 'yyyyMMdd')
+$Build = (Get-Date -Format 'dd.MM.yyyy')
 
 $entries = @()
 foreach ($f in $Files) {

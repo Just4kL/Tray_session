@@ -814,11 +814,11 @@ fn offer_classification_drives_update_button() {
 fn manifest_changelog_defaults_to_none() {
     // Старые манифесты поля не имеют — диалог показывает fallback,
     // а не падает на разборе.
-    let m = Manifest::parse(r#"{"version": "0.7.0", "build": "20260928", "files": []}"#).unwrap();
+    let m = Manifest::parse(r#"{"version": "0.7.0", "build": "28.09.2026", "files": []}"#).unwrap();
     assert_eq!(m.changelog, None);
     // С полем — разбирается как есть (многострочный текст целиком).
     let m = Manifest::parse(
-        "{\"version\": \"0.8.0\", \"build\": \"20261002\", \"files\": [], \
+        "{\"version\": \"0.8.0\", \"build\": \"02.10.2026\", \"files\": [], \
          \"changelog\": \"Fix: кнопки\"}",
     )
     .unwrap();

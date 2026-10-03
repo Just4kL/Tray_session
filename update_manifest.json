@@ -1,15 +1,15 @@
 {
-  "version": "0.7.35",
-  "build": "20261002",
-  "files": [
-    {
-      "name": "TraySession.exe",
-      "sha256": "e88ab6fb71bbc1cce05ae13306966ec9b58628ee2a9c243622793cc2436f3399"
-    },
-    {
-      "name": "Tray_session_setup.exe",
-      "sha256": "ad7e6505fcc2e89322abc44ee6ba3cdddc1aefc8f719ac6dc1067c321cad0bf3"
-    }
-  ],
-  "changelog": "### Summary\nUnder the hood, the update module was rewritten from scratch: the\napplication now reliably performs updates via manual or silent mode,\nwith a confirmation dialog and rollback on failure. The UI theme\nsystem (color tokens) has also been refactored.\n\n### Fixed\n- Update module: retried download, atomic file replace, rollback on failure\n- Restart after update: new process spawns correctly with --updated flag\n- Updater mutex race that caused \"already running\" false errors\n- Single-instance: launching twice now focuses the existing window\n- Build date: generated automatically via build.r…"
+    "version":  "0.7.36",
+    "build":  "03.10.2026",
+    "files":  [
+                  {
+                      "name":  "TraySession.exe",
+                      "sha256":  "57dd95b79190929332af74c17a9fc4d762169ed9a9b1fb3c76ef67455b2c2431"
+                  },
+                  {
+                      "name":  "Tray_session_setup.exe",
+                      "sha256":  "7204fa217fd8a3701fce15d8c5ee41c8c1e99aba00abbae8e3de6482e902fb98"
+                  }
+              ],
+    "changelog":  "### Summary\nClearer navigation and settings, plus smoother background refreshes.\n\n### Fixed\n- UI scaling now follows each monitor\u0027s native DPI\n- GPU checks and session totals refresh in the background\n- Main window uses the native Windows title bar for move and maximize\n\n### New\n- Section tabs, button tips, quick settings, and a persistent status bar"
 }
