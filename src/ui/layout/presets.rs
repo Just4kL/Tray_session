@@ -5,21 +5,38 @@
 
 use super::spec::{grid, LayoutSpec, PageMargin, SideZone, Zone};
 
-/// Раскладка как сейчас: навигация 88pt фикс, статус 24pt фикс,
-/// центр flex, поля 5% с клампом 8..60.
+/// Основная оболочка: сеточная шапка, навигация слева, конфигуратор
+/// справа, рабочая зона и статусная строка снизу.
 #[allow(dead_code)] // TODO(H1-step-2): потребитель — engine::build_window
 pub fn default_layout() -> LayoutSpec {
     // H1: размеры зон — в единицах сетки темы (1u = 8pt), а не в
     // «магических» поинтах: nav 11u = 88pt, status 3u = 24pt.
     let g = grid();
     let nav_w = g.u(11.0);
+    let config_w = g.b(4.0);
+    let titlebar_h = g.u(5.0);
     let status_h = g.u(3.0);
     LayoutSpec {
+        titlebar: Zone {
+            min_h: titlebar_h,
+            max_h: titlebar_h,
+            sticky: true,
+            collapse_below: None,
+        },
         nav: SideZone {
             default_w: nav_w,
             min_w: nav_w,
             max_w: nav_w,
             resizable: false,
+            collapse_below: None,
+        },
+        configurator: SideZone {
+            default_w: config_w,
+            min_w: g.b(3.0),
+            max_w: g.b(6.0),
+            resizable: true,
+            // Секция содержит единственные быстрые контролы масштаба,
+            // сканирования и сетки — на минимальной ширине окна не скрываем.
             collapse_below: None,
         },
         status: Zone {
@@ -53,7 +70,9 @@ mod tests {
         // - TopBottomPanel::bottom("status").exact_height(24.0)
         // - page_margin: percent 0.05, clamp 8..60
         let spec = default_layout();
+        assert_eq!(spec.titlebar.min_h, 40.0, "titlebar height");
         assert_eq!(spec.nav.default_w, 88.0, "nav width");
+        assert_eq!(spec.configurator.default_w, 256.0, "configurator width");
         assert_eq!(spec.status.min_h, 24.0, "status height");
         assert_eq!(spec.status.max_h, 24.0, "status height");
         assert!(!spec.nav.resizable, "nav resizable");

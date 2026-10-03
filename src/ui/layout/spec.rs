@@ -22,8 +22,12 @@ pub fn grid() -> Grid {
 #[allow(dead_code)] // TODO(H1-step-2): потребитель — engine::build_window
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutSpec {
+    /// Пользовательская верхняя панель окна.
+    pub titlebar: Zone,
     /// Левая панель навигации.
     pub nav: SideZone,
+    /// Правая контекстная панель настройки.
+    pub configurator: SideZone,
     /// Нижняя строка статуса.
     pub status: Zone,
     /// Центральная область с вкладками.
@@ -145,9 +149,13 @@ mod tests {
         let g = grid();
         let spec = crate::ui::layout::presets::default_layout();
         let points = [
+            ("titlebar.min_h", spec.titlebar.min_h),
             ("nav.default_w", spec.nav.default_w),
             ("nav.min_w", spec.nav.min_w),
             ("nav.max_w", spec.nav.max_w),
+            ("configurator.default_w", spec.configurator.default_w),
+            ("configurator.min_w", spec.configurator.min_w),
+            ("configurator.max_w", spec.configurator.max_w),
             ("status.min_h", spec.status.min_h),
             ("status.max_h", spec.status.max_h),
             ("center.min_h", spec.center.min_h),

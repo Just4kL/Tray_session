@@ -10,7 +10,9 @@ use super::spec::LayoutSpec;
 /// (пропущенные при collapse зоны не вызываются).
 #[allow(dead_code)] // TODO(H1-step-3): потребитель — update() в app.rs
 pub struct WindowCallbacks<'a> {
+    pub titlebar: Box<dyn FnMut(&mut egui::Ui) + 'a>,
     pub nav: Box<dyn FnMut(&mut egui::Ui) + 'a>,
+    pub configurator: Box<dyn FnMut(&mut egui::Ui) + 'a>,
     pub status: Box<dyn FnMut(&mut egui::Ui) + 'a>,
     pub center: Box<dyn FnMut(&mut egui::Ui) + 'a>,
 }
@@ -21,9 +23,37 @@ pub struct WindowCallbacks<'a> {
 /// (шаг 3b+ подключает зоны по одной).
 #[allow(dead_code)] // TODO(H1-step-3): потребитель — update() в app.rs
 pub fn build_window(ctx: &egui::Context, spec: &LayoutSpec, mut cb: WindowCallbacks<'_>) {
+    build_titlebar(ctx, spec, &mut cb.titlebar);
     build_nav(ctx, spec, &mut cb.nav);
+    build_configurator(ctx, spec, &mut cb.configurator);
     build_status(ctx, spec, &mut cb.status);
     build_center(ctx, spec, &mut cb.center);
+}
+
+/// Верхняя пользовательская строка заголовка.
+pub fn build_titlebar(ctx: &egui::Context, spec: &LayoutSpec, cb: &mut dyn FnMut(&mut egui::Ui)) {
+    egui::TopBottomPanel::top("titlebar")
+        .resizable(false)
+        .exact_height(spec.titlebar.min_h)
+        .show(ctx, |ui| cb(ui));
+}
+
+/// Правая панель быстрых настроек. Автоматически скрывается на узком окне.
+pub fn build_configurator(ctx: &egui::Context, spec: &LayoutSpec, cb: &mut dyn FnMut(&mut egui::Ui)) {
+    let sz = &spec.configurator;
+    if sz.collapse_below.is_some_and(|limit| ctx.screen_rect().width() < limit) {
+        return;
+    }
+    let default_width = if ctx.screen_rect().width() < 840.0 {
+        sz.min_w
+    } else {
+        sz.default_w
+    };
+    egui::SidePanel::right("configurator")
+        .resizable(sz.resizable)
+        .default_width(default_width)
+        .width_range(sz.min_w..=sz.max_w)
+        .show(ctx, |ui| cb(ui));
 }
 
 /// Левая панель навигации. Пропускается при collapse.
@@ -114,7 +144,9 @@ mod tests {
 
     fn noop_callbacks() -> WindowCallbacks<'static> {
         WindowCallbacks {
+            titlebar: Box::new(|_| {}),
             nav: Box::new(|_| {}),
+            configurator: Box::new(|_| {}),
             status: Box::new(|_| {}),
             center: Box::new(|_| {}),
         }
@@ -154,7 +186,9 @@ mod tests {
                 ctx,
                 &spec,
                 WindowCallbacks {
+                    titlebar: Box::new(|_| {}),
                     nav: Box::new(move |_| *n.lock().unwrap() = true),
+                    configurator: Box::new(|_| {}),
                     status: Box::new(move |_| *s.lock().unwrap() = true),
                     center: Box::new(move |_| *c.lock().unwrap() = true),
                 },

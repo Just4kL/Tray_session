@@ -109,6 +109,7 @@ pub struct BorderPalette {
 pub struct SemanticPalette {
     pub ok:        Color32,
     pub warn:      Color32,
+    #[allow(dead_code)] // Update notice now uses the blue accent (M1).
     pub warn_soft: Color32,
     #[allow(dead_code)] // TODO(фаза 2): потребитель err пока не переведён на токены
     pub err:       Color32,

@@ -300,6 +300,10 @@ pub struct AppState {
     pub last_tooltip: Instant,
     /// Подраздел «О программе» (0–3).
     pub about_sub: u8,
+    /// Выбранные вкладки разделов с подразделами.
+    pub games_sub: u8,
+    pub alarms_sub: u8,
+    pub timer_sub: u8,
     /// Последний сохранённый в файл слепок конфига (для автоперсиста).
     pub last_saved: AppConfig,
     /// Вкладка прошлого кадра: при переходе на Сессии/Будильники обновляем данные.

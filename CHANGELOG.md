@@ -3,6 +3,19 @@
 Краткая история релизов. Полная — в приложении («О программе» →
 «Журнал изменений»).
 
+## [0.7.36] - 2026-10-03
+
+### Summary
+Clearer navigation and settings, plus smoother background refreshes.
+
+### Fixed
+- UI scaling now follows each monitor's native DPI
+- GPU checks and session totals refresh in the background
+- Main window uses the native Windows title bar for move and maximize
+
+### New
+- Section tabs, button tips, quick settings, and a persistent status bar
+
 ## [0.7.35] - 2026-10-02
 
 ### Summary
