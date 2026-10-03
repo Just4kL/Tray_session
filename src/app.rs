@@ -3176,8 +3176,16 @@ impl eframe::App for TrackerApp {
         // spacing/animation_time остаются дефолтными. Переход на полную
         // замену стиля — фаза 1.4, одним коммитом (см. roadmap в аудите).
         ctx.set_visuals(self.theme.current().egui_style().visuals);
-        // Масштаб интерфейса (читаемость на больших мониторах)
-        ctx.set_pixels_per_point(self.state.cfg_handle.ui_scale.clamp(0.8, 2.0));
+        // Пользовательский масштаб — zoom относительно нативного DPI монитора.
+        // BASE_SCALE сохраняет прежний смысл 100%: без дополнительного zoom.
+        let native_ppp = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0);
+        let target_ppp = native_ppp
+            * (self.state.cfg_handle.ui_scale.clamp(0.8, 2.0) / BASE_SCALE);
+        if (ctx.pixels_per_point() - target_ppp).abs() > 0.01 {
+            ctx.set_pixels_per_point(target_ppp);
+        }
 
         // Левая панель навигации (компактно, как в PC Manager):
         // иконка + подпись, три состояния (неактивна / наведение / активна).
