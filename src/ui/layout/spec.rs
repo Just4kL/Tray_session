@@ -76,8 +76,8 @@ pub struct PageMargin {
 
 impl PageMargin {
     /// Поле для ширины окна `w`: доля ширины с клампом, затем выравнивание
-    /// по сетке темы. Это ЕДИНСТВЕННАЯ реализация формулы — `page_margin()`
-    /// в app.rs делегирует сюда, поэтому пресет и прод не разъедутся.
+    /// по сетке темы. Навигация, строка статуса и центр используют одну
+    /// реализацию, поэтому их поля совпадают.
     #[allow(dead_code)] // TODO(H1-step-2): потребитель — engine::build_window
     pub fn for_width(self, w: f32) -> f32 {
         let m = (w * self.percent).clamp(self.min, self.max);
@@ -108,8 +108,7 @@ mod tests {
 
     #[test]
     fn page_margin_formula_matches_app_rs() {
-        // for_width — единственная реализация формулы; page_margin()
-        // в app.rs делегирует сюда, поэтому разъехаться они не могут.
+        // Все зоны используют одну формулу из LayoutSpec.
         let m = PageMargin { percent: 0.05, min: 8.0, max: 60.0 };
         assert_eq!(m.for_width(960.0), 48.0);
         assert_eq!(m.for_width(80.0), 8.0);

@@ -3108,19 +3108,13 @@ impl eframe::App for TrackerApp {
         // ширины окна), поэтому блоки всех разделов выровнены по одной
         // ширине при любом разрешении монитора. Поля живут ВНЕ прокрутки —
         // при прокрутке вниз отступы не уезжают вместе с содержимым.
-        let m = page_margin(ctx.available_rect().width());
         // Строка статуса — постоянно внизу (и с тем же отступом, что блоки
         // разделов), чтобы сообщения не прыгали после содержимого карточек.
         // H1-шаг-4a: панель строит engine::build_status из LayoutSpec.
-        // Отклонение от «дословного контента»: engine не принимает frame,
-        // поэтому панель получает дефолтный Frame::side_top_panel с левым
-        // полем 8.0 (было 0.0). Компенсируем внутри: add_space(m - 8),
-        // итог тот же отступ m, попиксельно как раньше. Шаг 5 перенесёт
-        // frame в spec/engine и уберёт компенсацию.
+        // Отступ по сетке применяет движок — он совпадает с полем центра.
         let status_spec = crate::ui::layout::presets::default_layout();
         crate::ui::layout::engine::build_status(ctx, &status_spec, &mut |ui| {
             ui.horizontal(|ui| {
-                ui.add_space((m - 8.0).max(0.0));
                 if !self.state.status_msg.is_empty() {
                     ui.colored_label(
                         self.theme.current().tokens().palette.semantic.attention,
@@ -5387,15 +5381,19 @@ pub const CARD_GAP_BOTTOM: f32 = 10.0;
 /// 5% с каждой стороны: блоки всех разделов выравниваются по одной ширине
 /// и не липнут к границам окна. На разных мониторах (1920×1080 и 6–8K)
 /// поле масштабируется вместе с окном, поэтому вёрстка не «едет».
+#[cfg(test)]
 pub const PAGE_MARGIN_PCT: f32 = 0.05;
 /// Границы поля: не меньше 8 и не больше 60 точек — на 4K 5% съедали бы
 /// по 100 точек с каждой стороны, на 720p были бы крошечными.
+#[cfg(test)]
 pub const PAGE_MARGIN_MIN: f32 = 8.0;
+#[cfg(test)]
 pub const PAGE_MARGIN_MAX: f32 = 60.0;
 
 /// Поля страницы разделов для окна шириной w: одинаковые слева и справа.
 /// Формула живёт в `PageMargin::for_width` (ui/layout/spec.rs) — здесь
 /// только обёртка: две копии формулы уже расходились молча (H1).
+#[cfg(test)]
 pub fn page_margin(w: f32) -> f32 {
     crate::ui::layout::spec::PageMargin {
         percent: PAGE_MARGIN_PCT,

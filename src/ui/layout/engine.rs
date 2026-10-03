@@ -1,8 +1,7 @@
 //! Движок раскладки главного окна (H1, шаг 2).
 //!
 //! Строит панели из `LayoutSpec`, контент рисуют замыкания вызывающего:
-//! движок не знает про вкладки, кнопки и данные. К `update()` НЕ подключён
-//! (шаг 3) — поведение UI не меняется.
+//! движок не знает про вкладки, кнопки и данные.
 
 use super::spec::LayoutSpec;
 
@@ -71,9 +70,14 @@ pub fn build_status(
         return;
     }
     let sz = &spec.status;
+    let margin = spec.page_margin.for_width(ctx.available_rect().width());
+    let mut frame = egui::Frame::side_top_panel(&ctx.style());
+    frame.inner_margin.left = margin;
+    frame.inner_margin.right = margin;
     egui::TopBottomPanel::bottom("status")
         .resizable(false)
         .exact_height(sz.min_h)
+        .frame(frame)
         .show(ctx, |ui| cb(ui));
 }
 
