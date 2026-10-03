@@ -1415,15 +1415,40 @@ impl TrackerApp {
                                 plan.preserved.join(", ")
                             )
                         };
-                        UpdateInfo {
-                            msg: format!(
-                                "{}\nБудет скачано и заменено: {}.{keep}\nОбновление ставится отдельным фоновым процессом во временную папку рядом с программой.",
-                                m.describe(),
-                                names.join(", ")
-                            ),
-                            // Нашли обновление — показываем кнопку в углу.
-                            new_version: Some(m.version),
-                            changelog: m.changelog,
+                        // AU-2/C16: решает версия, а не хеш. Ту же или более
+                        // старую не предлагаем; ту же при других файлах —
+                        // с предупреждением.
+                        match crate::update::classify_offer(
+                            VERSION,
+                            &m.version,
+                            !plan.to_download.is_empty(),
+                        ) {
+                            crate::update::OfferKind::SameVersionWarn => UpdateInfo {
+                                msg: format!(
+                                    "Файлы отличаются, но версия та же ({}). Обновить?",
+                                    m.version
+                                ),
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
+                            crate::update::OfferKind::Offer => UpdateInfo {
+                                msg: format!(
+                                    "{}\nБудет скачано и заменено: {}.{keep}\nОбновление ставится отдельным фоновым процессом во временную папку рядом с программой.",
+                                    m.describe(),
+                                    names.join(", ")
+                                ),
+                                // Нашли обновление — показываем кнопку в углу.
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
+                            crate::update::OfferKind::None => UpdateInfo {
+                                msg: format!(
+                                    "Установлена версия {}, новее в канале нет.",
+                                    VERSION
+                                ),
+                                new_version: None,
+                                changelog: None,
+                            },
                         }
                     }
                 }
@@ -1611,11 +1636,26 @@ impl TrackerApp {
                         // Тихий режим больше НЕ ставит молча с выходом:
                         // показываем тот же диалог, но с автоотсчётом.
                         // Решение принимает poll update_rx (там виден silent
-                        // из настроек), сюда только прокидываем версию.
-                        UpdateInfo {
-                            msg: m.describe(),
-                            new_version: Some(m.version),
-                            changelog: m.changelog,
+                        // из настроек), сюда только прокидываем версию —
+                        // тоже через classify_offer (AU-2/C16).
+                        match crate::update::classify_offer(
+                            crate::app::VERSION,
+                            &m.version,
+                            true,
+                        ) {
+                            crate::update::OfferKind::None => UpdateInfo {
+                                msg: format!(
+                                    "Проверено: установлена версия {}, новее нет.",
+                                    crate::app::VERSION
+                                ),
+                                new_version: None,
+                                changelog: None,
+                            },
+                            _ => UpdateInfo {
+                                msg: m.describe(),
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
                         }
                     } else if plan.to_download.is_empty() {
                         UpdateInfo {
@@ -1625,14 +1665,28 @@ impl TrackerApp {
                         }
                     } else {
                         // Нашли, но молча ставить не разрешено — показываем
-                        // кнопку в углу.
-                        UpdateInfo {
-                            msg: format!(
-                                "Доступно обновление до {}. Нажмите жёлтую кнопку со стрелкой в правом верхнем углу, чтобы поставить.",
-                                m.version
-                            ),
-                            new_version: Some(m.version),
-                            changelog: m.changelog,
+                        // кнопку в углу. Версию тоже сверяем (AU-2/C16).
+                        match crate::update::classify_offer(
+                            crate::app::VERSION,
+                            &m.version,
+                            true,
+                        ) {
+                            crate::update::OfferKind::None => UpdateInfo {
+                                msg: format!(
+                                    "Проверено: установлена версия {}, новее нет.",
+                                    crate::app::VERSION
+                                ),
+                                new_version: None,
+                                changelog: None,
+                            },
+                            _ => UpdateInfo {
+                                msg: format!(
+                                    "Доступно обновление до {}. Нажмите жёлтую кнопку со стрелкой в правом верхнем углу, чтобы поставить.",
+                                    m.version
+                                ),
+                                new_version: Some(m.version),
+                                changelog: m.changelog,
+                            },
                         }
                     }
                 }

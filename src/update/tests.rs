@@ -773,6 +773,44 @@ fn channel_has_a_readable_name() {
 }
 
 #[test]
+fn version_compare_handles_numeric_and_prerelease() {
+    // AU-2: решает версия, а не хеш. Числа — как числа (beta.10 > beta.2),
+    // stable новее pre-release того же ядра.
+    assert!(is_newer_version("0.7.33-beta.2", "0.7.33-beta.3"));
+    assert!(is_newer_version("0.7.32", "0.7.35"));
+    assert!(is_newer_version("0.7.33-beta.2", "0.7.33-beta.10"));
+    assert!(is_newer_version("0.7.33-beta.9", "0.7.33"));
+    assert!(!is_newer_version("0.7.33-beta.3", "0.7.33-beta.3"));
+    assert!(!is_newer_version("0.7.35", "0.7.32"));
+    assert!(!is_newer_version("0.7.35", "0.7.35"));
+}
+
+#[test]
+fn offer_classification_drives_update_button() {
+    use super::OfferKind;
+    // Есть новее + изменения — предлагаем.
+    assert_eq!(
+        classify_offer("0.7.33-beta.7", "0.7.33-beta.8", true),
+        OfferKind::Offer
+    );
+    // Та же версия, но файлы другие — предупреждаем (C16).
+    assert_eq!(
+        classify_offer("0.7.33-beta.8", "0.7.33-beta.8", true),
+        OfferKind::SameVersionWarn
+    );
+    // Изменений нет — молчим в любом случае.
+    assert_eq!(
+        classify_offer("0.7.33-beta.7", "0.7.33-beta.8", false),
+        OfferKind::None
+    );
+    // Манифест старее — молчим.
+    assert_eq!(
+        classify_offer("0.7.35", "0.7.32", true),
+        OfferKind::None
+    );
+}
+
+#[test]
 fn manifest_changelog_defaults_to_none() {
     // Старые манифесты поля не имеют — диалог показывает fallback,
     // а не падает на разборе.

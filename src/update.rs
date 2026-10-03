@@ -509,6 +509,69 @@ impl Default for Sha256 {
 // Что нужно скачать
 // ---------------------------------------------------------------------------
 
+/// Сравнение версий вида `0.7.35` / `0.7.33-beta.2` (AU-2/C16).
+/// Числовые компоненты сравниваются как числа (beta.10 > beta.2),
+/// stable новее любого pre-release того же ядра.
+fn split_version(v: &str) -> (Vec<u64>, Option<(String, u64)>) {
+    let v = v.trim();
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (v, None),
+    };
+    let nums = core.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+    let pre = pre.map(|p| match p.split_once('.') {
+        Some((t, n)) => (t.to_ascii_lowercase(), n.parse::<u64>().unwrap_or(0)),
+        None => (p.to_ascii_lowercase(), 0),
+    });
+    (nums, pre)
+}
+
+/// True, если `other` новее `current`. План сверяет хеши, а решает —
+/// версия: иначе программа «обновляется» на ту же сборку (AU-2).
+pub fn is_newer_version(current: &str, other: &str) -> bool {
+    use std::cmp::Ordering;
+    let (mut a, ap) = split_version(current);
+    let (mut b, bp) = split_version(other);
+    let n = a.len().max(b.len());
+    a.resize(n, 0);
+    b.resize(n, 0);
+    match b.cmp(&a) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => match (ap, bp) {
+            (None, None) => false,
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+            (Some((at, an)), Some((bt, bn))) => (bt, bn) > (at, an),
+        },
+    }
+}
+
+/// Исход проверки для UI: предлагать / молчать / предупредить (C16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferKind {
+    /// Изменений нет или манифест не новее — молчим.
+    None,
+    /// Есть версия новее — предлагаем.
+    Offer,
+    /// Та же версия, но файлы отличаются — предупреждаем и предлагаем.
+    SameVersionWarn,
+}
+
+/// Классификация предложения (чистая функция, тестируется).
+pub fn classify_offer(current: &str, manifest_version: &str, has_changes: bool) -> OfferKind {
+    if !has_changes {
+        return OfferKind::None;
+    }
+    if is_newer_version(current, manifest_version) {
+        OfferKind::Offer
+    } else if !is_newer_version(manifest_version, current) {
+        OfferKind::SameVersionWarn
+    } else {
+        OfferKind::None
+    }
+}
+
 /// План обновления: какие файлы качать, а какие уже совпадают.
 ///
 /// `to_download` — файлы, которых на диске нет или хеш не совпал.
